@@ -410,6 +410,8 @@ A case study that only describes what works is incomplete. The following limitat
 
 **Small models have a real reasoning ceiling.** 1.5 billion parameter models, even when coordinated, cannot match the raw reasoning depth of frontier-scale models on novel multi-step problems outside the system's specialized domains. LatticeD compensates through structure on tasks within its design scope. It does not claim to compete with frontier models on open-ended reasoning challenges.
 
+**Belief graph and memory contamination is recoverable, not preventable.** The Fact Extractor agent is itself a language model — meaning it can occasionally extract incorrect facts from a session that contained a flawed response. Over time, contaminated entries can bleed into future queries via belief retrieval or semantic memory. LatticeD treats this as a recoverable failure mode rather than one to fully prevent: the framework exposes explicit forget operations for both belief graph entries (per-row and bulk) and conversation threads (including their semantic memory vectors). Memory is editable user-owned state, not opaque model behavior. This is rare in the field — most AI products treat their memory as a black box.
+
 These limitations are not failures. They are the boundary of what has been built so far, which makes them the agenda for what gets built next.
 
 ---
@@ -516,7 +518,43 @@ When pre-context produces no classification, a secondary post-context check scan
 
 ---
 
-### B. Regression-Safe Testing with bypass_cache Mode
+### B. Frequency Normalization — Two-Pass Tight-Window Detection
+
+The label-aware parser in `_extract_financial_entities` classifies each dollar amount as income or expense based on surrounding keywords. A subsequent issue surfaced when prompts contained mixed cadences: a user might say *"I earn $60,000 per year and my rent is $1,500 a month."* Without frequency normalization, both figures are treated as monthly — producing a $58,500 net surplus instead of the correct $3,500.
+
+The first attempted fix used the same segment-bounded window as label detection: 80 characters of context per amount, capped by the previous dollar amount. For income classification this works well. For frequency detection it fails. Consider the position arithmetic in the example above: the phrase *"per year"* ends 16 characters before `$1,500` begins. With an 80-character pre-context window for frequency, *"per year"* falls inside `$1,500`'s window and gets misattributed — so `$1,500` is incorrectly divided by 12 alongside `$60,000`.
+
+The fix is structural. Frequency markers cluster very tightly to the amount they describe, much tighter than label keywords. The parser now uses two distinct windows:
+
+- **Post-context window of 30 characters**, bounded by the start of the next dollar amount. This is checked first because the dominant English form is `"$X per year"` — the cadence sits immediately after the amount.
+- **Pre-context window of 15 characters**, bounded by the end of the previous dollar amount. This is checked only as a fallback, covering less common forms like `"yearly $X"`.
+
+Both windows return `None` when no match is found, falling back to a default of monthly. The post-first ordering correctly attributes cadence in the failing case: `$60,000` matches "per year" in its post-window (annual, ÷12), and `$1,500` matches "a month" in its post-window (monthly, ×1). The previous bug — `"per year"` bleeding into `$1,500`'s pre-context — is structurally prevented because `$1,500`'s 15-character pre-window starts 24 characters before the amount, which is past the end of `"per year"` at position 23.
+
+**Measurable outcome:** The eval harness `tc_annual_income` test (`$60,000/year + $1,500 rent`) and `tc_annual_income_with_house_goal` test (the exact user-reported bug scenario: `$56,000/year + $1,300 rent + house goal`) both pass at 100%. The harness explicitly checks that the buggy intermediate values ($54,700, $35,555) do not appear in the output — preventing silent regression.
+
+---
+
+### C. Memory Hygiene — Belief Graph and Thread Forget Operations
+
+LatticeD's Fact Extractor agent reviews completed conversations and extracts verifiable facts into the belief graph for future retrieval. Because the extractor is itself a language model, it can occasionally extract incorrect facts from sessions that contained flawed responses. Without intervention, these contaminated entries decay slowly over the 45-day half-life but can pollute responses in the meantime.
+
+LatticeD treats memory contamination as a recoverable failure mode rather than one to fully prevent. The framework exposes explicit forget operations at three levels of granularity:
+
+- `DELETE /api/beliefs/{id}` — Removes a single belief entry by ID. Used for surgical cleanup when one specific contaminated fact is identified.
+- `DELETE /api/beliefs?confirm=true` — Bulk-deletes every belief graph entry. The `confirm` query parameter is required to prevent accidental wipes from a single misdirected DELETE request.
+- `DELETE /api/threads/{thread_id}` — Removes a complete conversation thread, including both the interaction ledger rows AND the corresponding semantic memory vectors stored in ChromaDB. Required because semantic recall can pull contaminated content even after the visible thread is gone.
+- `DELETE /api/threads?confirm=true` — Bulk-deletes every thread plus its memory vectors. Designed for dev workflows like recording demos or running the eval harness on a known-clean state.
+
+All four endpoints log structured audit entries: `[forget_belief] Purged id=42 — 'fact text...'` and `[forget_all_threads] Purged ALL threads — 17 ledger rows, 43 memory vectors.`
+
+The UI surfaces these as two-step confirmation buttons in the Beliefs and Threads views. The two-click pattern (initial click reveals a red `Confirm Forget` button alongside `Cancel`) prevents accidental clicks while keeping the operation faster than a modal dialog.
+
+This capability is rare in production AI systems. Most products treat their memory layer as opaque model state, neither inspectable nor editable. LatticeD exposes memory as user-owned editable data — consistent with the privacy-first deployment philosophy described in Section 6A.
+
+---
+
+### D. Regression-Safe Testing with bypass_cache Mode
 
 LatticeD's semantic cache is production-grade: near-identical prompts return cached verified responses at under 100ms with a 0.98 cosine similarity threshold. This creates a testing problem. If a test run populates the cache with a correct response, every subsequent test run for the same prompt hits the cache — returning correct content but never exercising the pipeline. Node visit checks (e.g., "did math_engine run?") fail because the cache path does not invoke any pipeline nodes.
 
@@ -528,7 +566,7 @@ This design also prevents the cache from being polluted by test data. Without th
 
 ---
 
-### C. Stack Reference
+### E. Stack Reference
 
 | Component | Technology | Version / Detail |
 |---|---|---|
@@ -545,7 +583,7 @@ This design also prevents the cache from being polluted by test data. Without th
 
 ---
 
-### D. Eval Harness Coverage
+### F. Eval Harness Coverage
 
 | Test | Prompt type | Key assertions | Result |
 |---|---|---|---|
@@ -556,8 +594,10 @@ This design also prevents the cache from being polluted by test data. Without th
 | `tc_cache_hit` | Cache round-trip | Round 1 correct, Round 2 <100ms | ✅ PASS |
 | `tc_goal_house` | Goal-aware allocation (65%) | Savings $3,575 not default $2,750 | ✅ PASS |
 | `tc_goal_debt` | Goal-aware allocation (60%) | Savings $2,520 not default $2,100 | ✅ PASS |
+| `tc_annual_income` | Annual → monthly normalization | $60k/yr → $5k/mo, net $3,500 | ✅ PASS |
+| `tc_annual_income_with_house_goal` | Annual income + house goal interaction | $56k/yr + $1,300 rent → $4,667/mo income, $2,188 savings @ 65% | ✅ PASS |
 
-All 7 tests pass. All financial figures verified to the cent. All node visits confirmed. Cache hit latency confirmed under 100ms.
+All 9 tests pass. All financial figures verified to the cent. All node visits confirmed. Cache hit latency confirmed under 100ms. The harness explicitly checks that buggy intermediate values from regression scenarios do not appear in the output.
 
 ---
 

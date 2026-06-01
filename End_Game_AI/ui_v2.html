@@ -1,0 +1,1358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LatticeD — Sovereign Multi-Agent Framework</title>
+
+<!-- Hanken Grotesk — matches tecklifeinnovation.com -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:ital,wght@0,300..900;1,300..900&display=swap" rel="stylesheet">
+
+<!-- Tailwind CDN — no build step required -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- React 18 + Babel via CDN -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          ink:    '#0a0a0a',   // background
+          paper:  '#f5f1ea',   // foreground text
+          slate:  '#1a1a1a',   // panel background
+          line:   '#26262a',   // borders
+          mute:   '#8a8a8a',   // muted text
+          accent: '#d4b86a',   // executive amber/gold accent
+          ok:     '#7dd3a8',   // success
+          warn:   '#f5b56b',   // warning
+          err:    '#f08080',   // error
+        },
+        fontFamily: {
+          sans:  ['"Hanken Grotesk"', 'system-ui', 'sans-serif'],
+          mono:  ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'monospace'],
+        },
+      }
+    }
+  }
+</script>
+
+<style>
+  html, body {
+    background: #0a0a0a;
+    color: #f5f1ea;
+    font-family: 'Hanken Grotesk', sans-serif;
+    font-weight: 400;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  /* numbered section label — directly inspired by tecklifeinnovation.com */
+  .section-number {
+    font-family: 'Hanken Grotesk', sans-serif;
+    font-weight: 600;
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #d4b86a;
+  }
+  .accent-italic { font-style: italic; color: #d4b86a; font-weight: 500; }
+
+  /* custom scrollbar */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #0a0a0a; }
+  ::-webkit-scrollbar-thumb { background: #26262a; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3a3a3e; }
+
+  /* node pulse animation */
+  @keyframes nodePulse {
+    0%   { box-shadow: 0 0 0 0 rgba(212, 184, 106, 0.6); }
+    70%  { box-shadow: 0 0 0 12px rgba(212, 184, 106, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(212, 184, 106, 0); }
+  }
+  .node-active {
+    background: #d4b86a !important;
+    color: #0a0a0a !important;
+    animation: nodePulse 1.4s ease-out infinite;
+  }
+  .node-done {
+    background: #1a1a1a;
+    color: #7dd3a8;
+    border-color: #7dd3a8 !important;
+  }
+
+  /* typing indicator */
+  @keyframes blink { 0%,80%,100% { opacity: 0.2; } 40% { opacity: 1; } }
+  .typing span { animation: blink 1.4s infinite both; }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+
+  /* smooth view transitions */
+  .view-fade { animation: fadeIn 0.3s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ─── API helper ──────────────────────────────────────────────────────────────
+const API_BASE = window.location.origin;
+
+function useApi(apiKey) {
+  return useCallback(async (path, options = {}) => {
+    const headers = { 'x-api-key': apiKey, ...(options.headers || {}) };
+    const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`${res.status}: ${text || res.statusText}`);
+    }
+    return res.json();
+  }, [apiKey]);
+}
+
+// ─── Pipeline node graph (matches build_graph() in End_Game_AI.py) ───────────
+const PIPELINE_NODES = [
+  { id: 'intent_classifier', label: 'Intent Router',         layer: 0, agent: 'intent_router' },
+  { id: 'fast_fanout',       label: 'Fast Fan-out',          layer: 1, agent: 'router' },
+  { id: 'deep_fanout',       label: 'Deep Fan-out',          layer: 1, agent: 'router' },
+  { id: 'memory_retrieval',  label: 'Memory',                layer: 2, agent: 'memory' },
+  { id: 'belief_retrieval',  label: 'Beliefs',               layer: 2, agent: 'belief' },
+  { id: 'grounding',         label: 'Grounding',             layer: 2, agent: 'grounding' },
+  { id: 'document_ingestion',label: 'Docs',                  layer: 2, agent: 'docs' },
+  { id: 'perception_barrier',label: 'Perception Barrier',    layer: 3, agent: 'sync' },
+  { id: 'fast_core',         label: 'Fast Mentor',           layer: 4, agent: 'fast_mentor' },
+  { id: 'life_coach',        label: 'Life Coach',            layer: 4, agent: 'life_coach' },
+  { id: 'math_engine',       label: 'Math Engine',           layer: 4, agent: 'deterministic' },
+  { id: 'sovereign_core',    label: 'Quant Architect',       layer: 5, agent: 'quant_architect' },
+  { id: 'agency',            label: 'Agency (Tools)',        layer: 6, agent: 'agency' },
+  { id: 'auditor',           label: 'Auditor',               layer: 6, agent: 'factual_auditor' },
+  { id: 'guardian',          label: 'Guardian',              layer: 7, agent: 'system_guardian' },
+  { id: 'synthesis',         label: 'Synthesis',             layer: 8, agent: 'executive_arbiter' },
+  { id: 'loyalty_scorer',    label: 'Loyalty Scorer',        layer: 9, agent: 'loyalty' },
+  { id: 'artifact_writer',   label: 'Artifact Writer',       layer: 10, agent: 'archive' },
+];
+
+// ─── Components ──────────────────────────────────────────────────────────────
+
+function LoginScreen({ onConnect }) {
+  const [apiKey, setApiKey] = useState('local_dev_secret_123');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const tryConnect = async () => {
+    setBusy(true);
+    setErr('');
+    try {
+      const res = await fetch(`${API_BASE}/api/health`, { headers: { 'x-api-key': apiKey } });
+      if (!res.ok) throw new Error(`Server returned ${res.status} — check your API key`);
+      const data = await res.json();
+      onConnect(apiKey, data);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <div className="w-full max-w-md">
+        <div className="mb-12 text-center">
+          <div className="section-number mb-3">00 — Connect</div>
+          <h1 className="text-5xl font-bold tracking-tight mb-3">LatticeD</h1>
+          <p className="text-mute text-sm">A self-correcting multi-agent framework.</p>
+          <p className="text-mute text-xs mt-1">Built for <span className="accent-italic">private, personal AI.</span></p>
+        </div>
+        <div className="bg-slate border border-line rounded-sm p-6">
+          <label className="block text-xs uppercase tracking-widest text-mute mb-2">
+            API Key
+          </label>
+          <input
+            type="password"
+            value={apiKey}
+            onChange={e => setApiKey(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && tryConnect()}
+            className="w-full bg-ink border border-line p-3 text-paper text-sm font-mono focus:border-accent focus:outline-none"
+            placeholder="Enter EARL_SECRET"
+            autoFocus
+          />
+          {err && <div className="text-err text-xs mt-3">{err}</div>}
+          <button
+            onClick={tryConnect}
+            disabled={busy || !apiKey}
+            className="w-full mt-4 bg-accent text-ink font-bold py-3 px-4 hover:bg-paper transition disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {busy ? 'Connecting…' : 'Connect to Lattice'}
+          </button>
+          <div className="text-mute text-[10px] mt-4 leading-relaxed">
+            The default <code className="text-accent">local_dev_secret_123</code> is intentionally public.
+            Change <code className="text-accent">EARL_SECRET</code> before exposing this service beyond localhost.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ view, setView, onLogout, isMobile }) {
+  const items = [
+    { id: 'chat',     label: 'Chat',      num: '01' },
+    { id: 'threads',  label: 'Threads',   num: '02' },
+    { id: 'beliefs',  label: 'Beliefs',   num: '03' },
+    { id: 'docs',     label: 'Documents', num: '04' },
+    { id: 'settings', label: 'Settings',  num: '05' },
+  ];
+
+  if (isMobile) {
+    return (
+      <nav className="fixed bottom-0 left-0 right-0 bg-slate border-t border-line z-40 flex">
+        {items.map(item => (
+          <button
+            key={item.id}
+            onClick={() => setView(item.id)}
+            className={`flex-1 py-3 text-[10px] uppercase tracking-widest font-semibold ${
+              view === item.id ? 'text-accent' : 'text-mute'
+            }`}
+          >
+            <div className="text-[9px] opacity-60">{item.num}</div>
+            <div>{item.label}</div>
+          </button>
+        ))}
+      </nav>
+    );
+  }
+
+  return (
+    <aside className="w-56 bg-slate border-r border-line flex flex-col">
+      <div className="p-6 border-b border-line">
+        <div className="section-number">LatticeD</div>
+        <div className="text-xs text-mute mt-1">v1.0</div>
+      </div>
+      <nav className="flex-1 py-4">
+        {items.map(item => (
+          <button
+            key={item.id}
+            onClick={() => setView(item.id)}
+            className={`w-full text-left px-6 py-3 flex items-center gap-3 transition ${
+              view === item.id
+                ? 'bg-ink text-paper border-l-2 border-accent'
+                : 'text-mute hover:text-paper hover:bg-ink/50 border-l-2 border-transparent'
+            }`}
+          >
+            <span className="text-[10px] opacity-60 font-mono">{item.num}</span>
+            <span className="text-sm font-medium">{item.label}</span>
+          </button>
+        ))}
+      </nav>
+      <div className="p-4 border-t border-line">
+        <button
+          onClick={onLogout}
+          className="w-full text-left text-xs text-mute hover:text-err transition"
+        >
+          ← Disconnect
+        </button>
+      </div>
+    </aside>
+  );
+}
+
+// ─── Pipeline Visualization ──────────────────────────────────────────────────
+function PipelineViz({ activeNodes, doneNodes }) {
+  const layers = useMemo(() => {
+    const grouped = {};
+    PIPELINE_NODES.forEach(n => {
+      grouped[n.layer] = grouped[n.layer] || [];
+      grouped[n.layer].push(n);
+    });
+    return Object.keys(grouped).sort((a,b)=>+a-+b).map(k => grouped[k]);
+  }, []);
+
+  return (
+    <div className="bg-slate border border-line p-4 rounded-sm">
+      <div className="section-number mb-3">PIPELINE</div>
+      <div className="space-y-2">
+        {layers.map((layer, i) => (
+          <div key={i} className="flex flex-wrap gap-1.5 justify-center">
+            {layer.map(node => {
+              const isActive = activeNodes.has(node.id);
+              const isDone = doneNodes.has(node.id);
+              const cls = isActive ? 'node-active' : isDone ? 'node-done' : 'bg-ink text-mute border-line';
+              return (
+                <div
+                  key={node.id}
+                  className={`text-[10px] px-2 py-1 border rounded-sm font-medium transition-all ${cls}`}
+                  title={node.agent}
+                >
+                  {node.label}
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Chat View ───────────────────────────────────────────────────────────────
+function ChatView({ apiKey, currentThread, setCurrentThread, onReconnect }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [activeNodes, setActiveNodes] = useState(new Set());
+  const [doneNodes, setDoneNodes] = useState(new Set());
+  const [showBeliefs, setShowBeliefs] = useState(false);
+  const [beliefsPeek, setBeliefsPeek] = useState([]);
+  const [beliefsLoading, setBeliefsLoading] = useState(false);
+  const [reconnectMsg, setReconnectMsg] = useState('');
+  const [bypassCache, setBypassCache] = useState(false);
+  const [copyMsg, setCopyMsg] = useState('');
+  const scrollRef = useRef(null);
+  const abortRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages]);
+
+  // ── Toolbar actions ────────────────────────────────────────────────────────
+  const stopRun = () => {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+    setBusy(false);
+    setActiveNodes(new Set());
+    setMessages(m => [...m, { role: 'system', content: '⏹ Pipeline stopped by user.', ts: Date.now() }]);
+  };
+
+  const clearScreen = () => {
+    setMessages([]);
+    setActiveNodes(new Set());
+    setDoneNodes(new Set());
+  };
+
+  const refreshThread = async () => {
+    if (!currentThread) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/threads/${currentThread}/history`, {
+        headers: { 'x-api-key': apiKey }
+      });
+      if (!res.ok) throw new Error(`${res.status}`);
+      const data = await res.json();
+      const restored = [];
+      data.messages.forEach(m => {
+        restored.push({ role: 'user', content: m.user_input, ts: m.epoch * 1000 });
+        if (m.response) restored.push({ role: 'assistant', content: m.response, ts: m.epoch * 1000 });
+      });
+      setMessages(restored);
+    } catch (e) {
+      setMessages(m => [...m, { role: 'error', content: `Refresh failed: ${e.message}`, ts: Date.now() }]);
+    }
+  };
+
+  const peekBeliefs = async () => {
+    setShowBeliefs(true);
+    setBeliefsLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/beliefs`, { headers: { 'x-api-key': apiKey } });
+      if (!res.ok) throw new Error(`${res.status}`);
+      const data = await res.json();
+      setBeliefsPeek(data.beliefs.slice(0, 10));
+    } catch (e) {
+      setBeliefsPeek([]);
+    } finally {
+      setBeliefsLoading(false);
+    }
+  };
+
+  const reconnect = async () => {
+    setReconnectMsg('Reconnecting…');
+    try {
+      const res = await fetch(`${API_BASE}/api/health`, { headers: { 'x-api-key': apiKey } });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      const data = await res.json();
+      onReconnect && onReconnect(data);
+      setReconnectMsg(`✓ Reconnected — chroma ${data.chroma ? '✓' : '✗'}, tavily ${data.tavily ? '✓' : '✗'}`);
+      setTimeout(() => setReconnectMsg(''), 4000);
+    } catch (e) {
+      setReconnectMsg(`✗ ${e.message}`);
+      setTimeout(() => setReconnectMsg(''), 6000);
+    }
+  };
+
+  const newThread = () => {
+    const fresh = `ui_${Date.now().toString(36)}`;
+    setCurrentThread(fresh);
+    setMessages([]);
+    setActiveNodes(new Set());
+    setDoneNodes(new Set());
+    setMessages([{ role: 'system', content: `🆕 New thread started — ${fresh}. No prior memory or beliefs from earlier conversations will be pulled.`, ts: Date.now() }]);
+  };
+
+  const copyLastResponse = async () => {
+    const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
+    if (!lastAssistant) {
+      setCopyMsg('Nothing to copy yet.');
+      setTimeout(() => setCopyMsg(''), 2500);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(lastAssistant.content);
+      setCopyMsg('✓ Copied last response to clipboard');
+      setTimeout(() => setCopyMsg(''), 2500);
+    } catch (e) {
+      setCopyMsg(`✗ Copy failed: ${e.message}`);
+      setTimeout(() => setCopyMsg(''), 4000);
+    }
+  };
+
+  const send = async () => {
+    if (!input.trim() || busy) return;
+    const prompt = input.trim();
+    setInput('');
+    setMessages(m => [...m, { role: 'user', content: prompt, ts: Date.now() }]);
+    setBusy(true);
+    setActiveNodes(new Set());
+    setDoneNodes(new Set());
+
+    const threadId = currentThread || `ui_${Date.now().toString(36)}`;
+    if (!currentThread) setCurrentThread(threadId);
+
+    const url = `${API_BASE}/api/evolve?prompt=${encodeURIComponent(prompt)}&thread_id=${encodeURIComponent(threadId)}&path=auto${bypassCache ? '&bypass_cache=1' : ''}`;
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const res = await fetch(url, {
+        headers: { 'x-api-key': apiKey, 'Accept': 'text/event-stream' },
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`Pipeline returned ${res.status}`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let lastActive = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        buf = buf.replace(/\r\n/g, '\n');
+        while (buf.includes('\n\n')) {
+          const idx = buf.indexOf('\n\n');
+          const event = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const line of event.split('\n')) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const ev = JSON.parse(line.slice(6));
+              if (ev.node) {
+                if (lastActive) {
+                  setActiveNodes(prev => { const n = new Set(prev); n.delete(lastActive); return n; });
+                  setDoneNodes(prev => new Set(prev).add(lastActive));
+                }
+                lastActive = ev.node;
+                setActiveNodes(prev => new Set(prev).add(ev.node));
+              }
+              if (ev.phase === 'Final') {
+                if (lastActive) {
+                  setActiveNodes(prev => { const n = new Set(prev); n.delete(lastActive); return n; });
+                  setDoneNodes(prev => new Set(prev).add(lastActive));
+                }
+                setMessages(m => [...m, {
+                  role: 'assistant',
+                  content: ev.content || '(empty)',
+                  ts: Date.now(),
+                  cached: ev.cached || false,
+                }]);
+              }
+            } catch (e) { /* malformed event — skip */ }
+          }
+        }
+      }
+    } catch (e) {
+      // Silent on user-initiated abort — stopRun() already wrote the message
+      if (e.name !== 'AbortError') {
+        setMessages(m => [...m, { role: 'error', content: `Pipeline error: ${e.message}`, ts: Date.now() }]);
+      }
+    } finally {
+      abortRef.current = null;
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="view-fade h-full flex flex-col lg:flex-row gap-4 p-4 lg:p-8">
+      {/* Conversation panel */}
+      <div className="flex-1 flex flex-col min-h-0">
+        <div className="mb-4">
+          <div className="section-number">01 — Chat</div>
+          <h2 className="text-2xl font-bold mt-1">
+            Ask the lattice <span className="accent-italic">anything.</span>
+          </h2>
+          {currentThread && (
+            <div className="text-xs text-mute mt-1 font-mono">thread: {currentThread}</div>
+          )}
+        </div>
+        <div ref={scrollRef} className="flex-1 overflow-y-auto bg-slate border border-line p-4 lg:p-6 mb-4 min-h-[300px]">
+          {messages.length === 0 && (
+            <div className="text-center text-mute text-sm py-12">
+              <div className="text-4xl mb-3 opacity-30">◇</div>
+              No messages yet. Type a prompt below.
+            </div>
+          )}
+          {messages.map((m, i) => (
+            <div key={i} className={`mb-6 ${m.role === 'user' ? 'text-paper' : ''}`}>
+              <div className={`text-[10px] uppercase tracking-widest mb-1 ${
+                m.role === 'user' ? 'text-accent' : m.role === 'error' ? 'text-err' : 'text-mute'
+              }`}>
+                {m.role === 'user' ? 'You' : m.role === 'error' ? 'Error' : 'Lattice'}
+                {m.cached && <span className="ml-2 text-ok">⚡ cached</span>}
+              </div>
+              <div className={`whitespace-pre-wrap text-sm leading-relaxed ${
+                m.role === 'error' ? 'text-err' : 'text-paper'
+              }`}>
+                {m.content}
+              </div>
+            </div>
+          ))}
+          {busy && (
+            <div className="text-mute text-xs typing">
+              processing<span>.</span><span>.</span><span>.</span>
+            </div>
+          )}
+        </div>
+        {/* Input row */}
+        <div className="flex gap-2">
+          <input
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), send())}
+            disabled={busy}
+            placeholder={busy ? 'Pipeline running…' : 'Type your prompt and press Enter'}
+            className="flex-1 bg-slate border border-line p-3 text-paper text-sm focus:border-accent focus:outline-none disabled:opacity-50"
+          />
+          <button
+            onClick={send}
+            disabled={busy || !input.trim()}
+            className="bg-accent text-ink font-bold px-6 hover:bg-paper transition disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Send
+          </button>
+        </div>
+
+        {/* Toolbar box — labeled action buttons next to the input/Send row */}
+        <div className="mt-3 bg-slate border border-line rounded-sm p-3">
+          <div className="section-number mb-2">Controls</div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={newThread}
+              disabled={busy}
+              className="flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Start a fresh thread (no memory or beliefs from prior conversations)"
+            >
+              <span className="text-base leading-none">＋</span> New Thread
+            </button>
+            <button
+              onClick={stopRun}
+              disabled={!busy}
+              className="flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-err hover:text-err transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-line disabled:hover:text-paper"
+              title="Abort the current pipeline run"
+            >
+              <span className="text-base leading-none">■</span> Stop
+            </button>
+            <button
+              onClick={refreshThread}
+              disabled={busy || !currentThread}
+              className="flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-line disabled:hover:text-paper"
+              title="Reload this thread's history from the database"
+            >
+              <span className="text-base leading-none">↻</span> Refresh
+            </button>
+            <button
+              onClick={peekBeliefs}
+              disabled={busy}
+              className="flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Show what the lattice currently knows about you"
+            >
+              <span className="text-base leading-none">◐</span> Beliefs
+            </button>
+            <button
+              onClick={() => setBypassCache(v => !v)}
+              disabled={busy}
+              className={`flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider border transition disabled:opacity-30 disabled:cursor-not-allowed ${
+                bypassCache
+                  ? 'bg-accent text-ink border-accent'
+                  : 'bg-ink text-paper border-line hover:border-accent hover:text-accent'
+              }`}
+              title="Toggle: bypass semantic cache on the next query — forces a full pipeline run"
+            >
+              <span className="text-base leading-none">⚡</span> Force Fresh {bypassCache ? '• ON' : ''}
+            </button>
+            <button
+              onClick={copyLastResponse}
+              disabled={busy || !messages.some(m => m.role === 'assistant')}
+              className="flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-line disabled:hover:text-paper"
+              title="Copy the most recent lattice response to your clipboard"
+            >
+              <span className="text-base leading-none">⧉</span> Copy
+            </button>
+            <button
+              onClick={clearScreen}
+              disabled={busy || messages.length === 0}
+              className="flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-warn hover:text-warn transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-line disabled:hover:text-paper"
+              title="Clear the chat screen (does not delete from database)"
+            >
+              <span className="text-base leading-none">✕</span> Clear
+            </button>
+            <button
+              onClick={reconnect}
+              disabled={busy}
+              className="flex items-center gap-2 px-3 py-2 text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Re-check server health without logging out"
+            >
+              <span className="text-base leading-none">⟲</span> Reconnect
+            </button>
+          </div>
+          {(reconnectMsg || copyMsg) && (
+            <div className="text-[11px] text-mute mt-2 font-mono">{copyMsg || reconnectMsg}</div>
+          )}
+        </div>
+      </div>
+
+      {/* Pipeline panel — desktop only at first, becomes a slide-up sheet on mobile in future */}
+      <div className="lg:w-80 flex-shrink-0">
+        <PipelineViz activeNodes={activeNodes} doneNodes={doneNodes} />
+      </div>
+
+      {/* Beliefs Peek Drawer — slides in from right when triggered */}
+      {showBeliefs && (
+        <div
+          onClick={() => setShowBeliefs(false)}
+          className="fixed inset-0 bg-black/60 z-50 flex justify-end view-fade"
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            className="w-full max-w-md h-full bg-slate border-l border-line overflow-y-auto p-6"
+          >
+            <div className="flex items-baseline justify-between mb-4">
+              <div>
+                <div className="section-number">Live Peek</div>
+                <h3 className="text-xl font-bold mt-1">Belief Graph</h3>
+              </div>
+              <button
+                onClick={() => setShowBeliefs(false)}
+                className="text-mute hover:text-paper text-2xl leading-none"
+                title="Close"
+              >
+                ×
+              </button>
+            </div>
+            <p className="text-mute text-[11px] mb-4">
+              What the lattice has learned and currently holds with active confidence.
+              Decays over a 45-day half-life.
+            </p>
+            {beliefsLoading && (
+              <div className="text-mute text-sm typing">
+                loading<span>.</span><span>.</span><span>.</span>
+              </div>
+            )}
+            {!beliefsLoading && beliefsPeek.length === 0 && (
+              <div className="text-mute text-sm">
+                No beliefs stored yet. Have a few conversations and the Fact Extractor will populate this.
+              </div>
+            )}
+            {!beliefsLoading && beliefsPeek.map(b => (
+              <div key={b.id} className="mb-4 pb-4 border-b border-line last:border-b-0">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="text-sm text-paper mb-2 flex-1">{b.fact}</div>
+                  <button
+                    onClick={async () => {
+                      if (!window.confirm(`Forget this belief?\n\n"${b.fact.slice(0, 100)}${b.fact.length > 100 ? '…' : ''}"`)) return;
+                      try {
+                        const res = await fetch(`${API_BASE}/api/beliefs/${b.id}`, {
+                          method: 'DELETE',
+                          headers: { 'x-api-key': apiKey },
+                        });
+                        if (!res.ok) throw new Error(await res.text() || `${res.status}`);
+                        setBeliefsPeek(prev => prev.filter(x => x.id !== b.id));
+                      } catch (e) {
+                        alert(`Forget failed: ${e.message}`);
+                      }
+                    }}
+                    className="text-[10px] uppercase tracking-wider font-semibold border border-line text-mute hover:border-err hover:text-err transition px-2 py-1 flex-shrink-0"
+                    title="Permanently purge this belief"
+                  >
+                    Forget
+                  </button>
+                </div>
+                <div className="flex items-center gap-2 text-[10px] text-mute">
+                  <div className="w-20 h-1 bg-ink relative">
+                    <div
+                      className="absolute left-0 top-0 h-full bg-accent"
+                      style={{ width: `${b.effective_confidence * 100}%` }}
+                    />
+                  </div>
+                  <span className="font-mono">{b.effective_confidence.toFixed(2)}</span>
+                  <span>· {b.age_days}d</span>
+                  <span>· {b.source}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Threads View ────────────────────────────────────────────────────────────
+function ThreadsView({ apiKey, setCurrentThread, setView }) {
+  const api = useApi(apiKey);
+  const [threads, setThreads] = useState([]);
+  const [history, setHistory] = useState(null);
+  const [activeId, setActiveId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [confirmForgetId, setConfirmForgetId] = useState(null);
+  const [forgettingId, setForgettingId] = useState(null);
+  const [confirmAll, setConfirmAll] = useState(false);
+  const [forgettingAll, setForgettingAll] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setErr('');
+    api('/api/threads').then(d => { setThreads(d.threads); setLoading(false); })
+      .catch(e => { setErr(e.message); setLoading(false); });
+  }, [api]);
+
+  useEffect(load, [load]);
+
+  const loadHistory = async (id) => {
+    setActiveId(id);
+    setHistory(null);
+    try {
+      const d = await api(`/api/threads/${id}/history`);
+      setHistory(d);
+    } catch (e) { setErr(e.message); }
+  };
+
+  const forgetThread = async (id) => {
+    setForgettingId(id);
+    try {
+      const res = await fetch(`${API_BASE}/api/threads/${id}`, {
+        method: 'DELETE',
+        headers: { 'x-api-key': apiKey },
+      });
+      if (!res.ok) throw new Error(await res.text() || `${res.status}`);
+      setThreads(prev => prev.filter(t => t.thread_id !== id));
+      if (activeId === id) { setActiveId(null); setHistory(null); }
+      setConfirmForgetId(null);
+    } catch (e) {
+      setErr(`Forget thread failed: ${e.message}`);
+    } finally {
+      setForgettingId(null);
+    }
+  };
+
+  const forgetAllThreads = async () => {
+    setForgettingAll(true);
+    setErr('');
+    try {
+      const res = await fetch(`${API_BASE}/api/threads?confirm=true`, {
+        method: 'DELETE',
+        headers: { 'x-api-key': apiKey },
+      });
+      if (!res.ok) throw new Error(await res.text() || `${res.status}`);
+      const data = await res.json();
+      setThreads([]);
+      setActiveId(null);
+      setHistory(null);
+      setConfirmAll(false);
+      setErr(`✓ Cleared ${data.ledger_rows_deleted} ledger rows + ${data.memory_vectors_deleted} memory vectors.`);
+      setTimeout(() => setErr(''), 5000);
+    } catch (e) {
+      setErr(`Forget all threads failed: ${e.message}`);
+    } finally {
+      setForgettingAll(false);
+    }
+  };
+
+  return (
+    <div className="view-fade h-full flex flex-col lg:flex-row gap-4 p-4 lg:p-8">
+      <div className="lg:w-1/3 flex flex-col min-h-0">
+        <div className="mb-4 flex items-baseline justify-between gap-3 flex-wrap">
+          <div>
+            <div className="section-number">02 — Threads</div>
+            <h2 className="text-2xl font-bold mt-1">
+              Past <span className="accent-italic">conversations.</span>
+            </h2>
+          </div>
+          <div className="flex gap-2 items-center flex-wrap">
+            <button
+              onClick={load}
+              className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition px-3 py-2"
+            >
+              ↻ Refresh
+            </button>
+            {!confirmAll ? (
+              <button
+                onClick={() => setConfirmAll(true)}
+                disabled={threads.length === 0}
+                className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-err hover:text-err transition px-3 py-2 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-line disabled:hover:text-paper"
+                title="Wipe all conversation history AND semantic memory vectors"
+              >
+                ⚠ Forget All
+              </button>
+            ) : (
+              <div className="flex gap-2 items-center bg-ink border border-err px-2 py-1">
+                <span className="text-[10px] uppercase tracking-wider text-err font-bold">
+                  Delete all {threads.length}?
+                </span>
+                <button
+                  onClick={forgetAllThreads}
+                  disabled={forgettingAll}
+                  className="text-[10px] uppercase tracking-wider font-bold bg-err text-paper px-3 py-1 hover:opacity-80 transition disabled:opacity-50"
+                >
+                  {forgettingAll ? '…' : 'Confirm'}
+                </button>
+                <button
+                  onClick={() => setConfirmAll(false)}
+                  className="text-[10px] uppercase tracking-wider font-bold border border-line text-mute px-3 py-1 hover:text-paper transition"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+        {err && <div className="text-err text-xs mb-2 font-mono">{err}</div>}
+        <div className="flex-1 overflow-y-auto bg-slate border border-line">
+          {loading && <div className="p-6 text-mute text-sm">Loading…</div>}
+          {!loading && threads.length === 0 && (
+            <div className="p-6 text-mute text-sm">No threads yet. Have a conversation in Chat.</div>
+          )}
+          {threads.map(t => (
+            <div
+              key={t.thread_id}
+              className={`p-4 border-b border-line transition ${
+                activeId === t.thread_id ? 'bg-ink border-l-2 border-l-accent' : 'hover:bg-ink/50'
+              }`}
+            >
+              <button
+                onClick={() => loadHistory(t.thread_id)}
+                className="w-full text-left"
+              >
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-xs font-mono text-mute truncate">{t.thread_id}</span>
+                  <span className="text-[10px] text-mute uppercase">{t.last_intent}</span>
+                </div>
+                <div className="text-sm text-paper mt-1 line-clamp-2">{t.last_prompt}</div>
+                <div className="text-[10px] text-mute mt-1">
+                  {t.message_count} message{t.message_count !== 1 ? 's' : ''}
+                  {' · '}
+                  {new Date(t.last_epoch * 1000).toLocaleString()}
+                </div>
+              </button>
+              <div className="mt-2 flex justify-end">
+                {confirmForgetId === t.thread_id ? (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => forgetThread(t.thread_id)}
+                      disabled={forgettingId === t.thread_id}
+                      className="text-[10px] uppercase tracking-wider font-bold bg-err text-paper px-3 py-1 hover:opacity-80 transition disabled:opacity-50"
+                    >
+                      {forgettingId === t.thread_id ? '…' : 'Confirm Forget'}
+                    </button>
+                    <button
+                      onClick={() => setConfirmForgetId(null)}
+                      className="text-[10px] uppercase tracking-wider font-bold border border-line text-mute px-3 py-1 hover:text-paper transition"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmForgetId(t.thread_id)}
+                    className="text-[10px] uppercase tracking-wider font-semibold border border-line text-mute hover:border-err hover:text-err transition px-2 py-1"
+                    title="Purge this thread (ledger + memory vectors)"
+                  >
+                    Forget
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex-1 flex flex-col min-h-0">
+        {!activeId && (
+          <div className="flex-1 flex items-center justify-center text-mute text-sm">
+            Select a thread to view its history.
+          </div>
+        )}
+        {activeId && !history && <div className="text-mute text-sm">Loading history…</div>}
+        {history && (
+          <>
+            <div className="mb-3 flex items-center justify-between gap-2 flex-wrap">
+              <div className="text-xs font-mono text-mute">{history.thread_id}</div>
+              <button
+                onClick={() => { setCurrentThread(history.thread_id); setView('chat'); }}
+                className="text-xs text-accent hover:text-paper transition"
+              >
+                Continue this conversation →
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto bg-slate border border-line p-4 lg:p-6">
+              {history.messages.map((m, i) => (
+                <div key={i} className="mb-6">
+                  <div className="text-[10px] uppercase tracking-widest text-accent mb-1">
+                    You · {new Date(m.epoch * 1000).toLocaleString()} · {m.intent} · {m.path} · {m.latency_ms}ms
+                  </div>
+                  <div className="text-sm text-paper mb-3">{m.user_input}</div>
+                  <div className="text-[10px] uppercase tracking-widest text-mute mb-1">Lattice</div>
+                  <div className="text-sm text-paper whitespace-pre-wrap">{m.response}</div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Beliefs View ────────────────────────────────────────────────────────────
+function BeliefsView({ apiKey }) {
+  const api = useApi(apiKey);
+  const [beliefs, setBeliefs] = useState([]);
+  const [halfLife, setHalfLife] = useState(45);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [confirmId, setConfirmId] = useState(null);
+  const [forgetting, setForgetting] = useState(null);
+  const [confirmAll, setConfirmAll] = useState(false);
+  const [forgettingAll, setForgettingAll] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api('/api/beliefs').then(d => {
+      setBeliefs(d.beliefs);
+      setHalfLife(d.decay_half_life_days);
+      setLoading(false);
+    }).catch(e => { setErr(e.message); setLoading(false); });
+  }, [api]);
+
+  useEffect(load, [load]);
+
+  const forget = async (id) => {
+    setForgetting(id);
+    try {
+      const res = await fetch(`${API_BASE}/api/beliefs/${id}`, {
+        method: 'DELETE',
+        headers: { 'x-api-key': apiKey },
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `${res.status}`);
+      }
+      setBeliefs(prev => prev.filter(b => b.id !== id));
+      setConfirmId(null);
+    } catch (e) {
+      setErr(`Forget failed: ${e.message}`);
+    } finally {
+      setForgetting(null);
+    }
+  };
+
+  const forgetAll = async () => {
+    setForgettingAll(true);
+    setErr('');
+    try {
+      const res = await fetch(`${API_BASE}/api/beliefs?confirm=true`, {
+        method: 'DELETE',
+        headers: { 'x-api-key': apiKey },
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `${res.status}`);
+      }
+      const data = await res.json();
+      setBeliefs([]);
+      setConfirmAll(false);
+      setErr(`✓ Cleared ${data.deleted_count} belief${data.deleted_count !== 1 ? 's' : ''} from the graph.`);
+      setTimeout(() => setErr(''), 4000);
+    } catch (e) {
+      setErr(`Forget All failed: ${e.message}`);
+    } finally {
+      setForgettingAll(false);
+    }
+  };
+
+  return (
+    <div className="view-fade p-4 lg:p-8">
+      <div className="mb-6 flex items-baseline justify-between gap-3 flex-wrap">
+        <div>
+          <div className="section-number">03 — Beliefs</div>
+          <h2 className="text-2xl font-bold mt-1">
+            What the lattice <span className="accent-italic">knows about you.</span>
+          </h2>
+          <p className="text-mute text-xs mt-2">
+            Confidence decays exponentially with a {halfLife}-day half-life.
+            Facts below 0.20 effective confidence are excluded from active retrieval.
+            Click <span className="text-accent">Forget</span> to permanently purge a contaminated belief.
+          </p>
+        </div>
+        <div className="flex gap-2 items-center flex-wrap">
+          <button
+            onClick={load}
+            className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition px-3 py-2"
+          >
+            ↻ Refresh
+          </button>
+          {!confirmAll ? (
+            <button
+              onClick={() => setConfirmAll(true)}
+              disabled={beliefs.length === 0}
+              className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-err hover:text-err transition px-3 py-2 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-line disabled:hover:text-paper"
+              title="Wipe the entire belief graph — for dev/test workflows"
+            >
+              ⚠ Forget All
+            </button>
+          ) : (
+            <div className="flex gap-2 items-center bg-ink border border-err px-2 py-1">
+              <span className="text-[10px] uppercase tracking-wider text-err font-bold">
+                Delete all {beliefs.length}?
+              </span>
+              <button
+                onClick={forgetAll}
+                disabled={forgettingAll}
+                className="text-[10px] uppercase tracking-wider font-bold bg-err text-paper px-3 py-1 hover:opacity-80 transition disabled:opacity-50"
+              >
+                {forgettingAll ? '…' : 'Confirm'}
+              </button>
+              <button
+                onClick={() => setConfirmAll(false)}
+                className="text-[10px] uppercase tracking-wider font-bold border border-line text-mute px-3 py-1 hover:text-paper transition"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="bg-slate border border-line">
+        {loading && <div className="p-6 text-mute text-sm">Loading…</div>}
+        {err && <div className="p-6 text-err text-sm">{err}</div>}
+        {!loading && beliefs.length === 0 && (
+          <div className="p-6 text-mute text-sm">No beliefs stored yet. Have a few conversations and the Fact Extractor will populate this.</div>
+        )}
+        {beliefs.map(b => (
+          <div key={b.id} className="p-4 border-b border-line last:border-b-0">
+            <div className="flex items-start justify-between gap-3">
+              <div className="text-sm text-paper mb-2 flex-1">{b.fact}</div>
+              {confirmId === b.id ? (
+                <div className="flex gap-2 flex-shrink-0">
+                  <button
+                    onClick={() => forget(b.id)}
+                    disabled={forgetting === b.id}
+                    className="text-[10px] uppercase tracking-wider font-bold bg-err text-paper px-3 py-1 hover:opacity-80 transition disabled:opacity-50"
+                  >
+                    {forgetting === b.id ? '…' : 'Confirm Forget'}
+                  </button>
+                  <button
+                    onClick={() => setConfirmId(null)}
+                    className="text-[10px] uppercase tracking-wider font-bold border border-line text-mute px-3 py-1 hover:text-paper transition"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmId(b.id)}
+                  className="text-[10px] uppercase tracking-wider font-semibold border border-line text-mute hover:border-err hover:text-err transition px-3 py-1 flex-shrink-0"
+                  title="Permanently purge this belief from the graph"
+                >
+                  Forget
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-[10px] text-mute">
+              <div className="flex items-center gap-2">
+                <span className="uppercase tracking-widest">Conf:</span>
+                <div className="w-24 h-1 bg-ink relative">
+                  <div
+                    className="absolute left-0 top-0 h-full bg-accent"
+                    style={{ width: `${b.effective_confidence * 100}%` }}
+                  />
+                </div>
+                <span className="font-mono">{b.effective_confidence.toFixed(3)}</span>
+              </div>
+              <div>raw {b.raw_confidence.toFixed(2)}</div>
+              <div>· {b.age_days} days</div>
+              <div>· {b.source}</div>
+              <div className="font-mono opacity-50">· #{b.id}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Documents View ──────────────────────────────────────────────────────────
+function DocumentsView({ apiKey }) {
+  const api = useApi(apiKey);
+  const [docs, setDocs] = useState([]);
+  const [uploading, setUploading] = useState(false);
+  const [msg, setMsg] = useState('');
+  const fileRef = useRef(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  const refresh = useCallback(() => {
+    api('/api/docs').then(d => setDocs(d.documents)).catch(()=>{});
+  }, [api]);
+
+  useEffect(refresh, [refresh]);
+
+  const upload = async (file) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.md')) {
+      setMsg('Only .md files are accepted.');
+      return;
+    }
+    setUploading(true);
+    setMsg('');
+    const form = new FormData();
+    form.append('file', file);
+    try {
+      const res = await fetch(`${API_BASE}/api/docs/upload`, {
+        method: 'POST',
+        headers: { 'x-api-key': apiKey },
+        body: form,
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `${res.status}`);
+      }
+      const data = await res.json();
+      setMsg(`Uploaded ${data.filename} (${data.bytes} bytes).`);
+      refresh();
+    } catch (e) {
+      setMsg(`Upload failed: ${e.message}`);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div className="view-fade p-4 lg:p-8">
+      <div className="mb-6">
+        <div className="section-number">04 — Documents</div>
+        <h2 className="text-2xl font-bold mt-1">
+          Feed the lattice <span className="accent-italic">context.</span>
+        </h2>
+        <p className="text-mute text-xs mt-2">
+          Drop a .md file here and it becomes available to the Document Ingestion node
+          on the next deep-path query.
+        </p>
+      </div>
+
+      <div
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={e => {
+          e.preventDefault();
+          setDragOver(false);
+          if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
+        }}
+        onClick={() => fileRef.current?.click()}
+        className={`bg-slate border-2 border-dashed p-8 text-center cursor-pointer transition mb-6 ${
+          dragOver ? 'border-accent bg-ink' : 'border-line hover:border-mute'
+        }`}
+      >
+        <div className="text-3xl mb-2 opacity-40">↑</div>
+        <div className="text-sm text-paper">
+          {uploading ? 'Uploading…' : dragOver ? 'Drop to upload' : 'Drop a .md file here or click to browse'}
+        </div>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".md,text/markdown"
+          className="hidden"
+          onChange={e => upload(e.target.files?.[0])}
+        />
+      </div>
+      {msg && <div className="text-xs text-accent mb-4">{msg}</div>}
+
+      <div className="flex items-baseline justify-between mb-3">
+        <div className="section-number">Current Workspace</div>
+        <button
+          onClick={refresh}
+          className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition px-3 py-1"
+        >
+          ↻ Refresh
+        </button>
+      </div>
+      <div className="bg-slate border border-line">
+        {docs.length === 0 && (
+          <div className="p-6 text-mute text-sm">No documents yet.</div>
+        )}
+        {docs.map((d, i) => (
+          <div key={i} className="p-4 border-b border-line last:border-b-0 flex items-baseline justify-between">
+            <span className="text-sm font-mono text-paper">{d.filename}</span>
+            <span className="text-[10px] text-mute">
+              {(d.bytes / 1024).toFixed(1)} KB · {new Date(d.modified_epoch * 1000).toLocaleString()}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Settings View ───────────────────────────────────────────────────────────
+function SettingsView({ apiKey, onLogout, health }) {
+  const api = useApi(apiKey);
+  const [stats, setStats] = useState(null);
+  const [err, setErr] = useState('');
+
+  const load = useCallback(() => {
+    setErr('');
+    api('/api/stats').then(setStats).catch(e => setErr(e.message));
+  }, [api]);
+
+  useEffect(load, [load]);
+
+  return (
+    <div className="view-fade p-4 lg:p-8">
+      <div className="mb-6 flex items-baseline justify-between gap-3 flex-wrap">
+        <div>
+          <div className="section-number">05 — Settings</div>
+          <h2 className="text-2xl font-bold mt-1">
+            System <span className="accent-italic">status.</span>
+          </h2>
+        </div>
+        <button
+          onClick={load}
+          className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition px-3 py-2"
+        >
+          ↻ Refresh
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-slate border border-line p-4">
+          <div className="section-number mb-3">Server Health</div>
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between"><span className="text-mute">Status</span><span className={health?.status === 'ok' ? 'text-ok' : 'text-err'}>{health?.status || '—'}</span></div>
+            <div className="flex justify-between"><span className="text-mute">ChromaDB</span><span className={health?.chroma ? 'text-ok' : 'text-err'}>{health?.chroma ? '✓ online' : '✗ offline'}</span></div>
+            <div className="flex justify-between"><span className="text-mute">Tavily</span><span className={health?.tavily ? 'text-ok' : 'text-warn'}>{health?.tavily ? '✓ online' : '⚠ no key set'}</span></div>
+          </div>
+        </div>
+
+        <div className="bg-slate border border-line p-4">
+          <div className="section-number mb-3">Last Interaction</div>
+          {stats?.last_interaction ? (
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between"><span className="text-mute">Intent</span><span>{stats.last_interaction.intent}</span></div>
+              <div className="flex justify-between"><span className="text-mute">Path</span><span>{stats.last_interaction.path}</span></div>
+              <div className="flex justify-between"><span className="text-mute">Loop count</span><span>{stats.last_interaction.loop_count}</span></div>
+              <div className="flex justify-between"><span className="text-mute">Total latency</span><span className="font-mono">{stats.last_interaction.total_latency_ms} ms</span></div>
+            </div>
+          ) : <div className="text-mute text-sm">No interactions yet.</div>}
+        </div>
+
+        <div className="bg-slate border border-line p-4 lg:col-span-2">
+          <div className="section-number mb-3">Recent Node Latency</div>
+          {stats?.hardware_latency_log?.length ? (
+            <div className="space-y-1 text-xs font-mono">
+              {stats.hardware_latency_log.map((h, i) => (
+                <div key={i} className="flex justify-between border-b border-line/50 py-1">
+                  <span className="text-paper">{h.node}</span>
+                  <span className="text-mute">{h.latency_ms} ms</span>
+                </div>
+              ))}
+            </div>
+          ) : <div className="text-mute text-sm">No hardware log entries yet.</div>}
+        </div>
+
+        <div className="bg-slate border border-line p-4 lg:col-span-2">
+          <div className="section-number mb-3">Repository</div>
+          <a
+            href="https://github.com/earlpete222-sys/LatticeD"
+            target="_blank" rel="noopener noreferrer"
+            className="text-sm text-accent hover:text-paper transition"
+          >
+            github.com/earlpete222-sys/LatticeD →
+          </a>
+        </div>
+      </div>
+
+      <div className="mt-8 text-center">
+        <button onClick={onLogout} className="text-xs text-mute hover:text-err transition">
+          Disconnect from Lattice
+        </button>
+      </div>
+      {err && <div className="text-err text-xs mt-4">{err}</div>}
+    </div>
+  );
+}
+
+// ─── App Root ────────────────────────────────────────────────────────────────
+function App() {
+  const [apiKey, setApiKey] = useState(null);
+  const [health, setHealth] = useState(null);
+  const [view, setView] = useState('chat');
+  const [currentThread, setCurrentThread] = useState(null);
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 1024);
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 1024);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  if (!apiKey) {
+    return <LoginScreen onConnect={(k, h) => { setApiKey(k); setHealth(h); }} />;
+  }
+
+  const renderView = () => {
+    switch (view) {
+      case 'chat':     return <ChatView apiKey={apiKey} currentThread={currentThread} setCurrentThread={setCurrentThread} onReconnect={setHealth} />;
+      case 'threads':  return <ThreadsView apiKey={apiKey} setCurrentThread={setCurrentThread} setView={setView} />;
+      case 'beliefs':  return <BeliefsView apiKey={apiKey} />;
+      case 'docs':     return <DocumentsView apiKey={apiKey} />;
+      case 'settings': return <SettingsView apiKey={apiKey} onLogout={() => setApiKey(null)} health={health} />;
+      default: return null;
+    }
+  };
+
+  return (
+    <div className={`min-h-screen flex ${isMobile ? 'flex-col pb-16' : ''}`}>
+      {!isMobile && <Sidebar view={view} setView={setView} onLogout={() => setApiKey(null)} isMobile={false} />}
+      <main className="flex-1 min-w-0 overflow-y-auto h-screen">
+        {renderView()}
+      </main>
+      {isMobile && <Sidebar view={view} setView={setView} onLogout={() => setApiKey(null)} isMobile={true} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
+</content>
+</invoke>

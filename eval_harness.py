@@ -338,6 +338,66 @@ def tc_cache_hit(url: str, key: str) -> TestResult:
     )
 
 
+def tc_annual_income(url: str, key: str) -> TestResult:
+    """
+    Annual income with monthly expense — system must normalize $60,000/year to
+    $5,000/month before allocation math runs. Catches the bug where annual
+    figures were silently treated as monthly (12x error).
+
+    annual income = $60,000/yr → $5,000/mo  expenses = $1,500/mo  net = $3,500/mo
+    default savings 50% of net → $1,750/mo
+    """
+    prompt = (
+        "I earn $60,000 per year and my rent is $1,500 a month. "
+        "Build me a budget plan."
+    )
+    nodes, content, cached, elapsed = run_prompt(url, key, prompt, bypass_cache=True)
+    # 60000/12 = 5000   5000-1500 = 3500   3500*0.50 = 1750
+    checks = [
+        chk_contains(content, "5,000",     "annual normalized to monthly ($60k/yr → $5k/mo)"),
+        chk_contains(content, "1,500",     "monthly expense present"),
+        chk_contains(content, "3,500",     "net surplus correct (5000-1500=3500)"),
+        chk_contains(content, "1,750",     "savings 50% of net"),
+        chk_not_contains(content, "30,000", "raw annual NOT used as net (60000-1500*12=42000 would imply mishandling)"),
+        chk_node_visited(nodes, "math_engine", "math_engine ran"),
+    ]
+    return TestResult(
+        "annual_income", "Annual income normalized to monthly ($60k/yr → $5k/mo)", prompt,
+        all(c.passed for c in checks), checks, nodes, cached, elapsed,
+    )
+
+
+def tc_annual_income_with_house_goal(url: str, key: str) -> TestResult:
+    """
+    The exact user-reported bug scenario: annual income + monthly rent + house goal.
+    Verifies the 12x error fix AND the house preset (65% savings) both work together.
+
+    $56,000/year → $4,666.67/mo   rent $1,300/mo   net = $3,366.67/mo
+    house preset 65% → savings = $2,188.33/mo
+    """
+    prompt = (
+        "If I make $56,000 per year and spend $1,300 a month on rent, "
+        "how should I budget the rest of my money to save for a down payment "
+        "on a house in 12 months?"
+    )
+    nodes, content, cached, elapsed = run_prompt(url, key, prompt, bypass_cache=True)
+    # 56000/12 = 4666.67   4666.67-1300 = 3366.67   3366.67*0.65 = 2188.33
+    checks = [
+        chk_contains(content, "4,666",     "annual $56k/yr normalized to monthly $4,666"),
+        chk_contains(content, "3,366",     "net surplus correct (4666.67-1300=3366.67)"),
+        chk_contains(content, "2,188",     "savings 65% of net (house preset)"),
+        chk_not_contains(content, "56,000", "raw annual figure NOT shown as monthly income"),
+        chk_not_contains(content, "54,700", "the buggy net (56000-1300) NOT present"),
+        chk_not_contains(content, "35,555", "the buggy savings (54700*0.65) NOT present"),
+        chk_node_visited(nodes, "math_engine", "math_engine ran"),
+    ]
+    return TestResult(
+        "annual_income_house",
+        "Annual income + house goal (the user-reported bug scenario)", prompt,
+        all(c.passed for c in checks), checks, nodes, cached, elapsed,
+    )
+
+
 def tc_goal_house(url: str, key: str) -> TestResult:
     """
     Goal-aware allocation: saving for a house shifts savings to 65% of net.
@@ -407,6 +467,8 @@ TESTS = [
     tc_cache_hit,
     tc_goal_house,
     tc_goal_debt,
+    tc_annual_income,
+    tc_annual_income_with_house_goal,
 ]
 
 

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Literal, Optional, TypedDict
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Path as ApiPath, Query, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -166,6 +166,47 @@ _EXPENSE_KW = re.compile(
     r"debt|loan|payment|cost|fee|subscription|fixed|owe|due|monthly out)\b",
     re.IGNORECASE,
 )
+
+# ── Frequency Detection ────────────────────────────────────────────────────────
+# Detects the cadence of a dollar figure so amounts can be normalized to monthly
+# before allocation math runs.  Without this, "$56,000 per year" was being treated
+# as "$56,000 per month" — a 12x error that cascaded into every downstream number.
+_FREQ_ANNUAL = re.compile(
+    r"\b(?:per\s+year|/\s*year|/\s*yr|annual(?:ly)?|yearly|p\.?a\.?|a\s+year|each\s+year)\b",
+    re.IGNORECASE,
+)
+_FREQ_BIWEEKLY = re.compile(
+    r"\b(?:bi[\s-]?weekly|every\s+two\s+weeks|every\s+other\s+week)\b",
+    re.IGNORECASE,
+)
+_FREQ_WEEKLY = re.compile(
+    r"\b(?:per\s+week|/\s*week|/\s*wk|weekly|a\s+week|each\s+week)\b",
+    re.IGNORECASE,
+)
+_FREQ_MONTHLY = re.compile(
+    r"\b(?:per\s+month|/\s*month|/\s*mo|monthly|a\s+month|each\s+month)\b",
+    re.IGNORECASE,
+)
+
+# Normalized monthly multipliers.  Default (no frequency match) = 1.0 = monthly.
+_FREQ_MULTIPLIERS: Dict[str, float] = {
+    "annual":   1.0 / 12.0,    # $X/year → $X/12 per month
+    "biweekly": 26.0 / 12.0,   # ~2.167 — 26 biweekly periods ÷ 12 months
+    "weekly":   52.0 / 12.0,   # ~4.333 — 52 weeks ÷ 12 months
+    "monthly":  1.0,
+}
+
+def _scan_frequency(context: str) -> Optional[str]:
+    """
+    Return the frequency label explicitly found in the context window, or None.
+    Checked in order: biweekly first (so 'bi-weekly' doesn't get caught by /weekly/),
+    then annual, weekly, monthly.
+    """
+    if _FREQ_BIWEEKLY.search(context): return "biweekly"
+    if _FREQ_ANNUAL.search(context):   return "annual"
+    if _FREQ_WEEKLY.search(context):   return "weekly"
+    if _FREQ_MONTHLY.search(context):  return "monthly"
+    return None
 
 # ── Goal Detection ─────────────────────────────────────────────────────────────
 # Ordered by specificity — first match wins in _detect_goal().
@@ -1296,23 +1337,53 @@ def _extract_financial_entities(text: str):
         is_income  = bool(_INCOME_KW.search(pre_context))
         is_expense = bool(_EXPENSE_KW.search(pre_context))
 
-        # --- post-context: only when pre-context gives no classification ---
+        # Always compute a post-context window — used for both label fallback
+        # (when pre-context didn't classify) AND for frequency detection.
+        post_end = min(len(text), m.end() + 60)
+        if i < len(amount_matches) - 1:
+            post_end = min(post_end, amount_matches[i + 1].start())
+        post_context = text[m.end() : post_end]
+
+        # --- post-context fallback for expense label following the amount ---
         # Handles patterns like "have $1,900 in fixed expenses" where the label
         # follows the amount rather than preceding it.
         if not is_income and not is_expense:
-            post_end = min(len(text), m.end() + 60)
-            if i < len(amount_matches) - 1:
-                post_end = min(post_end, amount_matches[i + 1].start())
-            post_context = text[m.end() : post_end]
             if _EXPENSE_KW.search(post_context):
                 is_expense = True
 
+        # --- frequency normalization: convert annual/weekly/biweekly to monthly ---
+        # Frequency markers cluster very tightly to their amount in natural English.
+        # The label window (80 chars, segment-bounded) is too wide for frequency —
+        # it lets "$60,000 per year ... $1,500" leak "per year" into $1,500's window.
+        # Use a TIGHT post-window (30 chars, dominant English form: "$X per year"),
+        # and only fall back to a very small pre-window (15 chars) if post is empty.
+        FREQ_POST_RADIUS = 30
+        FREQ_PRE_RADIUS  = 15
+
+        next_start    = amount_matches[i + 1].start() if i < len(amount_matches) - 1 else len(text)
+        freq_post_end = min(len(text), m.end() + FREQ_POST_RADIUS, next_start)
+        freq_post_win = text[m.end() : freq_post_end]
+
+        prev_end_safe  = amount_matches[i - 1].end() if i > 0 else 0
+        freq_pre_start = max(prev_end_safe, m.start() - FREQ_PRE_RADIUS)
+        freq_pre_win   = text[freq_pre_start : m.start()]
+
+        # Post first (most common form), then pre as fallback, default monthly
+        frequency  = _scan_frequency(freq_post_win) or _scan_frequency(freq_pre_win) or "monthly"
+        multiplier = _FREQ_MULTIPLIERS[frequency]
+        normalized = amount * multiplier
+        if frequency != "monthly":
+            logger.info(
+                "[math_engine] Frequency normalized — $%.2f %s → $%.2f/month (×%.3f).",
+                amount, frequency, normalized, multiplier,
+            )
+
         if is_income and not is_expense:
-            income += amount
+            income += normalized
         elif is_expense:
-            expenses += amount
+            expenses += normalized
         else:
-            unclassified.append(amount)
+            unclassified.append(normalized)
 
     if income > 0 or expenses > 0:
         # Absorb any unclassified amounts: if we have income but no expenses yet,
@@ -2120,14 +2191,26 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_ui():
-    """Serves the frontend dashboard."""
-    ui_path = Path(__file__).parent / "ui.html"
+    """Serves the modern React UI (ui_v2.html) at the root path."""
+    ui_path = Path(__file__).parent / "ui_v2.html"
     if ui_path.exists():
         return HTMLResponse(ui_path.read_text(encoding="utf-8"))
+    # Fallback to legacy UI if v2 is missing
+    legacy = Path(__file__).parent / "ui.html"
+    if legacy.exists():
+        return HTMLResponse(legacy.read_text(encoding="utf-8"))
     return HTMLResponse(
-        "<h1>End Game AI - System Online</h1>"
-        "<p>Error: <b>ui.html</b> was not found in the same folder as End_Game_AI.py.</p>"
+        "<h1>LatticeD - System Online</h1>"
+        "<p>Error: neither <b>ui_v2.html</b> nor <b>ui.html</b> was found.</p>"
     )
+
+@app.get("/legacy", response_class=HTMLResponse)
+async def serve_legacy_ui():
+    """Serves the original WebSocket UI (ui.html) at /legacy for fallback testing."""
+    legacy = Path(__file__).parent / "ui.html"
+    if legacy.exists():
+        return HTMLResponse(legacy.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Legacy UI not found.</h1>")
 @app.get("/api/stats")
 async def get_runtime_stats(user_id: str = Depends(get_authenticated_user)):
     """Exposes interaction history and hardware performance logs to the UI."""
@@ -2157,6 +2240,383 @@ async def get_runtime_stats(user_id: str = Depends(get_authenticated_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database query failed: {e}")
+
+# ---------------------------------------------------------------------
+# UI Support Endpoints — added for ui_v2.html
+# ---------------------------------------------------------------------
+@app.get("/api/threads")
+async def list_threads(
+    limit: int = Query(50, ge=1, le=500),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Return a summary list of every thread that has interaction history.
+    Used by the UI's Threads view to populate the conversation list.
+    """
+    del user_id
+    try:
+        with runtime.open_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT thread_id,
+                       COUNT(*) AS message_count,
+                       MAX(timestamp) AS last_ts,
+                       (SELECT user_input FROM interaction_ledger AS i2
+                          WHERE i2.thread_id = i1.thread_id
+                          ORDER BY timestamp DESC LIMIT 1) AS last_prompt,
+                       (SELECT intent FROM interaction_ledger AS i3
+                          WHERE i3.thread_id = i1.thread_id
+                          ORDER BY timestamp DESC LIMIT 1) AS last_intent
+                  FROM interaction_ledger AS i1
+                 GROUP BY thread_id
+                 ORDER BY last_ts DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return {
+            "threads": [
+                {
+                    "thread_id":     row[0],
+                    "message_count": int(row[1]),
+                    "last_epoch":    float(row[2]) if row[2] else 0.0,
+                    "last_prompt":   row[3] or "",
+                    "last_intent":   row[4] or "",
+                }
+                for row in rows
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Thread list failed: {e}")
+
+@app.delete("/api/threads")
+async def forget_all_threads(
+    confirm: bool = Query(False, description="Must be true to actually delete. Safety guard."),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Bulk-delete every conversation thread — both the structured ledger entries
+    AND the corresponding semantic memory vectors. Use for clean-slate dev
+    workflows (recording demos, regression testing on a known state).
+
+    Requires explicit ?confirm=true. Cache and beliefs are NOT touched —
+    use the matching /api/beliefs DELETE to wipe those separately.
+    """
+    del user_id
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Bulk thread delete requires ?confirm=true to execute.",
+        )
+    try:
+        # Count + delete ledger rows
+        with runtime.db_lock:
+            with runtime.open_db() as conn:
+                ledger_count = conn.execute("SELECT COUNT(*) FROM interaction_ledger").fetchone()[0]
+                conn.execute("DELETE FROM interaction_ledger")
+                conn.commit()
+
+        # Delete all conversation vectors for this user from ChromaDB
+        vector_count = 0
+        if runtime.chroma_collection is not None:
+            def _purge_vectors():
+                # Count before deleting (Chroma's delete API doesn't return a count)
+                try:
+                    existing = runtime.chroma_collection.get(
+                        where={"user_id": INTERNAL_USER_ID},
+                        include=[],
+                    )
+                    n = len(existing.get("ids", []))
+                except Exception:
+                    n = 0
+                runtime.chroma_collection.delete(where={"user_id": INTERNAL_USER_ID})
+                return n
+            vector_count = await asyncio.to_thread(_purge_vectors)
+
+        logger.warning(
+            "[forget_all_threads] Purged ALL threads — %d ledger rows, %d memory vectors.",
+            ledger_count, vector_count,
+        )
+        return {
+            "ok": True,
+            "ledger_rows_deleted": int(ledger_count),
+            "memory_vectors_deleted": int(vector_count),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bulk thread forget failed: {e}")
+
+@app.delete("/api/threads/{thread_id}")
+async def forget_thread(
+    thread_id: str,
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Delete a single conversation thread completely — removes the interaction
+    ledger rows AND the corresponding semantic memory vectors. After this call,
+    no part of the conversation can be recalled by future queries.
+    """
+    del user_id
+    if not re.match(THREAD_ID_PATTERN, thread_id):
+        raise HTTPException(status_code=400, detail="Invalid thread_id format.")
+    try:
+        with runtime.db_lock:
+            with runtime.open_db() as conn:
+                ledger_count = conn.execute(
+                    "SELECT COUNT(*) FROM interaction_ledger WHERE thread_id = ?",
+                    (thread_id,),
+                ).fetchone()[0]
+                if ledger_count == 0:
+                    # Don't 404 — vectors might still exist; continue to purge them.
+                    logger.info("[forget_thread] No ledger rows for %s; checking vectors.", thread_id)
+                conn.execute(
+                    "DELETE FROM interaction_ledger WHERE thread_id = ?",
+                    (thread_id,),
+                )
+                conn.commit()
+
+        vector_count = 0
+        if runtime.chroma_collection is not None:
+            def _purge_vectors():
+                try:
+                    existing = runtime.chroma_collection.get(
+                        where={"$and": [
+                            {"user_id":   INTERNAL_USER_ID},
+                            {"thread_id": thread_id},
+                        ]},
+                        include=[],
+                    )
+                    n = len(existing.get("ids", []))
+                except Exception:
+                    n = 0
+                runtime.chroma_collection.delete(where={"$and": [
+                    {"user_id":   INTERNAL_USER_ID},
+                    {"thread_id": thread_id},
+                ]})
+                return n
+            vector_count = await asyncio.to_thread(_purge_vectors)
+
+        logger.info(
+            "[forget_thread] Purged thread %s — %d ledger rows, %d memory vectors.",
+            thread_id, ledger_count, vector_count,
+        )
+        return {
+            "ok": True,
+            "thread_id": thread_id,
+            "ledger_rows_deleted": int(ledger_count),
+            "memory_vectors_deleted": int(vector_count),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Thread forget failed: {e}")
+
+@app.get("/api/threads/{thread_id}/history")
+async def get_thread_history(
+    thread_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """Return the full interaction history for a specific thread, oldest first."""
+    del user_id
+    if not re.match(THREAD_ID_PATTERN, thread_id):
+        raise HTTPException(status_code=400, detail="Invalid thread_id format.")
+    try:
+        with runtime.open_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp, user_input, intent, path, latency_ms, output_prev
+                  FROM interaction_ledger
+                 WHERE thread_id = ?
+                 ORDER BY timestamp ASC
+                 LIMIT ?
+                """,
+                (thread_id, limit),
+            ).fetchall()
+        return {
+            "thread_id": thread_id,
+            "messages": [
+                {
+                    "epoch":      float(row[0]),
+                    "user_input": row[1] or "",
+                    "intent":     row[2] or "",
+                    "path":       row[3] or "",
+                    "latency_ms": int(row[4]) if row[4] is not None else 0,
+                    "response":   row[5] or "",
+                }
+                for row in rows
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Thread history failed: {e}")
+
+@app.get("/api/beliefs")
+async def list_beliefs(
+    limit: int = Query(50, ge=1, le=500),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Return belief graph entries with raw and effective (decay-adjusted) confidence.
+    Effective confidence uses the same DECAY_LAMBDA as the live retrieval logic.
+    """
+    del user_id
+    try:
+        with runtime.open_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, fact, confidence, last_seen, source
+                  FROM belief_graph
+                 WHERE confidence > 0.20
+                 ORDER BY last_seen DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        now = time.time()
+        beliefs = []
+        for bid, fact, raw_conf, last_seen, source in rows:
+            age_days = (now - float(last_seen)) / 86400.0
+            eff_conf = float(raw_conf) * math.exp(-DECAY_LAMBDA * age_days)
+            beliefs.append({
+                "id":                 int(bid),
+                "fact":               fact,
+                "raw_confidence":     round(float(raw_conf), 3),
+                "effective_confidence": round(eff_conf, 3),
+                "age_days":           round(age_days, 1),
+                "last_seen_epoch":    float(last_seen),
+                "source":             source or "",
+            })
+        beliefs.sort(key=lambda b: b["effective_confidence"], reverse=True)
+        return {"beliefs": beliefs, "decay_half_life_days": 45}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Belief query failed: {e}")
+
+@app.delete("/api/beliefs")
+async def forget_all_beliefs(
+    confirm: bool = Query(False, description="Must be true to actually delete. Safety guard."),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Bulk-delete every entry in the belief graph. Intended for dev/test workflows
+    where the user needs a clean slate (e.g. before recording a demo or running
+    the eval harness on a contaminated database).
+
+    Requires explicit ?confirm=true to execute — a single accidental DELETE
+    request returns a clear error instead of wiping the graph.
+    """
+    del user_id
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Bulk delete requires ?confirm=true to execute.",
+        )
+    try:
+        with runtime.db_lock:
+            with runtime.open_db() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM belief_graph").fetchone()[0]
+                conn.execute("DELETE FROM belief_graph")
+                conn.commit()
+        logger.warning("[forget_all_beliefs] Purged ALL belief graph entries: %d rows deleted.", count)
+        return {"ok": True, "deleted_count": int(count)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bulk forget failed: {e}")
+
+@app.delete("/api/beliefs/{belief_id}")
+async def forget_belief(
+    belief_id: int = ApiPath(..., ge=1),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Hard-delete a single belief by ID. Used by the UI's 'Forget' button to purge
+    contamination — beliefs the Fact Extractor stored that turned out to be wrong,
+    or facts that are no longer relevant. The Fact Extractor will re-add the fact
+    on a future session if it sees it confirmed again.
+    """
+    del user_id
+    try:
+        with runtime.db_lock:
+            with runtime.open_db() as conn:
+                # Capture the fact text before delete for logging
+                row = conn.execute(
+                    "SELECT fact FROM belief_graph WHERE id = ?", (belief_id,)
+                ).fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail=f"Belief {belief_id} not found.")
+                fact_preview = (row[0] or "")[:120]
+                conn.execute("DELETE FROM belief_graph WHERE id = ?", (belief_id,))
+                conn.commit()
+        logger.info("[forget_belief] Purged id=%d — '%s'", belief_id, fact_preview)
+        return {"ok": True, "deleted_id": belief_id, "fact_preview": fact_preview}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Forget failed: {e}")
+
+@app.post("/api/docs/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Accept a single document and save it into the runtime/docs/ folder so the
+    document_ingestion_node can pick it up on the next deep-path query.
+    Only .md files are accepted to match the existing ingestion logic.
+    """
+    del user_id
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+
+    # Reject anything that isn't markdown — keeps the ingestion pipeline simple
+    if not file.filename.lower().endswith(".md"):
+        raise HTTPException(
+            status_code=415,
+            detail="Only .md (Markdown) files are accepted. Convert other formats first.",
+        )
+
+    # Sanitise the filename — keep only safe characters, prevent path traversal
+    safe_name = re.sub(r"[^A-Za-z0-9._\-]", "_", Path(file.filename).name)
+    if not safe_name or safe_name.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    target = DOCS_DIR / safe_name
+    try:
+        DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        contents = await file.read()
+        # Cap individual document size at MAX_DOC_CHARS (in bytes — approximate cap)
+        if len(contents) > MAX_DOC_CHARS * 4:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Max {MAX_DOC_CHARS * 4} bytes per upload.",
+            )
+        target.write_bytes(contents)
+        logger.info("[upload] Document saved: %s (%d bytes)", safe_name, len(contents))
+        return {
+            "ok":       True,
+            "filename": safe_name,
+            "bytes":    len(contents),
+            "path":     str(target.relative_to(ROOT_DIR)),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
+@app.get("/api/docs")
+async def list_documents(user_id: str = Depends(get_authenticated_user)):
+    """List the documents currently sitting in runtime/docs/ awaiting ingestion."""
+    del user_id
+    try:
+        files = []
+        if DOCS_DIR.exists():
+            for p in sorted(DOCS_DIR.glob("*.md")):
+                stat = p.stat()
+                files.append({
+                    "filename":      p.name,
+                    "bytes":         stat.st_size,
+                    "modified_epoch": stat.st_mtime,
+                })
+        return {"documents": files}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Document listing failed: {e}")
 
 # ---------------------------------------------------------------------
 # Application Execution Entry Point
