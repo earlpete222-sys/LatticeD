@@ -478,7 +478,7 @@ LatticeD is the foundation. What comes next is making it a viable tool through t
 
 The case study you have just read describes a working system. The public GitHub repository will make every claim in this document independently verifiable — eval harness runnable in one command, full pipeline reproducible on consumer hardware, and architectural decisions documented in code.
 
-**Repository:** *[GitHub link will be added on public release — see Roadmap item 1, Section 6B]*
+**Repository:** [github.com/earlpete222-sys/LatticeD](https://github.com/earlpete222-sys/LatticeD)
 
 **If you are a hiring manager** building AI systems in financial services, healthcare, or other high-stakes domains: I am open to conversations about full-time engineering roles where this architectural thinking is directly applicable.
 
