@@ -25,11 +25,11 @@ be supplied as environment variables before running the system:
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `EARL_SECRET` | API authentication key for the LatticeD HTTP endpoint | Yes for any non-local deployment |
+| `LATTICED_SECRET` | API authentication key for the LatticeD HTTP endpoint | Yes for any non-local deployment |
 | `TAVILY_API_KEY` | Web grounding via Tavily Search API | Required for research path |
 | `OLLAMA_HOST` | Ollama inference endpoint | Defaults to `http://localhost:11434` |
 
-The default `EARL_SECRET` value (`local_dev_secret_123`) is intentionally
+The default `LATTICED_SECRET` value (`local_dev_secret_123`) is intentionally
 public and **must be changed** before exposing the service to any network
 beyond localhost. The application logs a warning when the default secret is
 still active.
@@ -46,7 +46,7 @@ default threat model assumes:
 - No untrusted parties have shell access to the host
 
 Production deployments that expose the API beyond localhost must:
-1. Set a strong `EARL_SECRET` value
+1. Set a strong `LATTICED_SECRET` value
 2. Place the service behind a reverse proxy with TLS
 3. Restrict access via firewall rules or VPN
 4. Review the shell execution capabilities in the agency loop and disable

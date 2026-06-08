@@ -4,13 +4,13 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>3fb9d24f-3dc6-4002-8522-295bf62ba15a</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>End_Game_AI.py</StartupFile>
+    <StartupFile>latticed.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
-    <Name>End_Game_AI</Name>
-    <RootNamespace>End_Game_AI</RootNamespace>
+    <Name>latticed</Name>
+    <RootNamespace>latticed</RootNamespace>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
@@ -21,7 +21,7 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="End_Game_AI.py" />
+    <Compile Include="latticed.py" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

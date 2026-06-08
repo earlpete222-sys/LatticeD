@@ -383,10 +383,10 @@ credentials.json
 .credentials/
 
 # ── Runtime artifacts (generated locally per-user) ───────────────────────────
-End_Game_AI/runtime/storage/
-End_Game_AI/runtime/outputs/
-End_Game_AI/runtime/docs/*.md
-End_Game_AI/runtime/.lock
+latticed/runtime/storage/
+latticed/runtime/outputs/
+latticed/runtime/docs/*.md
+latticed/runtime/.lock
 
 # ── Databases (user-specific persistent state) ───────────────────────────────
 *.db

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-eval_harness.py — Earl Prime Regression Test Suite v1.0
+eval_harness.py — LatticeD Regression Test Suite v1.0
 
-Sends known-good prompts to the running Earl Prime server and verifies:
+Sends known-good prompts to the running LatticeD server and verifies:
   - Financial math (income parsing, expense summing, allocation splits)
   - Research routing (never cached, grounding node runs)
   - Semantic cache round-trip (HIT on repeated prompt, returns fast)
@@ -14,7 +14,7 @@ Usage:
 
 Output:
     Console: pass/fail per test with per-check detail
-    File:    End_Game_AI/runtime/outputs/eval_results.json
+    File:    latticed/runtime/outputs/eval_results.json
 
 Requirements: httpx  (already a transitive dep; or: pip install httpx)
 Exit codes: 0 = all passed, 1 = one or more failed
@@ -52,7 +52,7 @@ CACHE_TIMEOUT    = 12    # seconds — a cache HIT must return within this
 
 OUTPUT_PATH = (
     Path(__file__).parent
-    / "End_Game_AI" / "runtime" / "outputs" / "eval_results.json"
+    / "latticed" / "runtime" / "outputs" / "eval_results.json"
 )
 
 
@@ -458,6 +458,95 @@ def tc_goal_debt(url: str, key: str) -> TestResult:
     )
 
 
+def tc_contamination_isolation(url: str, key: str) -> TestResult:
+    """
+    The user-reported contamination scenario: a prior financial conversation
+    must NOT bleed into a subsequent casual greeting via the belief graph or
+    semantic memory.
+
+    Round 1: financial prompt seeds the belief graph and semantic memory.
+    Round 2: casual greeting on a FRESH thread — should produce a clean
+    conversational reply, no mention of 529, college, emergency fund, savings,
+    rent, mortgage, or any other financial content.
+    """
+    # Round 1 — seed the system with a financial conversation
+    seed = (
+        "I make $5,000 a month and pay $1,200 in rent. "
+        "Help me build a savings plan for a house down payment."
+    )
+    print("    Seeding financial context...", end=" ", flush=True)
+    _nodes1, _content1, _cached1, elapsed1 = run_prompt(url, key, seed)
+    print(f"{elapsed1:.1f}s")
+
+    # Round 2 — casual greeting on a brand-new thread to isolate
+    print("    Casual greeting (must be clean)...", end=" ", flush=True)
+    nodes2, content2, cached2, elapsed2 = run_prompt(url, key, "How are you today?")
+    print(f"{elapsed2:.1f}s")
+
+    # Round 2 content must not contain ANY financial-domain leakage
+    checks = [
+        chk_not_contains(content2, "529",            "no 529 plan reference"),
+        chk_not_contains(content2, "college",        "no college reference"),
+        chk_not_contains(content2, "emergency fund", "no emergency fund reference"),
+        chk_not_contains(content2, "down payment",   "no down payment reference"),
+        chk_not_contains(content2, "savings plan",   "no savings plan reference"),
+        chk_not_contains(content2, "rent",           "no rent reference"),
+        chk_not_contains(content2, "$",              "no dollar figures"),
+        chk_not_contains(content2, "ALLOCATION MATRIX", "no allocation table"),
+    ]
+    return TestResult(
+        "contamination_isolation",
+        "Casual greeting must not inherit financial context from prior session",
+        "How are you today? (after a seeded financial conversation)",
+        all(c.passed for c in checks), checks, nodes2, cached2, elapsed2,
+    )
+
+
+def tc_relevant_belief_retrieval(url: str, key: str) -> TestResult:
+    """
+    The complement of the contamination test: when the user asks about a
+    topic that matches existing beliefs, those beliefs MUST be retrieved
+    even on the fast/chat path. Verifies that the relevance-aware retrieval
+    doesn't accidentally over-filter and lose useful context.
+
+    Round 1: user explicitly states what they do for fun (seeds the belief).
+    Round 2: user asks "What do I like to do for fun?" — must return an
+    answer that references the activity, proving the relevant belief was
+    retrieved despite being on the chat path.
+    """
+    activity_seed = (
+        "I want you to remember that my favorite weekend activity is hiking. "
+        "I go hiking almost every Saturday morning."
+    )
+    print("    Seeding activity belief...", end=" ", flush=True)
+    _nodes1, _content1, _cached1, elapsed1 = run_prompt(url, key, activity_seed)
+    print(f"{elapsed1:.1f}s")
+
+    print("    Asking about fun (must reference hiking)...", end=" ", flush=True)
+    nodes2, content2, cached2, elapsed2 = run_prompt(url, key, "What do I like to do for fun?")
+    print(f"{elapsed2:.1f}s")
+
+    content_lower = content2.lower()
+    # The response should reference hiking (or a synonym) — proving the
+    # relevant belief was retrieved and used despite being on the chat path.
+    hiking_mentioned = any(term in content_lower for term in ["hik", "weekend", "saturday", "trail"])
+
+    checks = [
+        CheckResult(
+            "relevant belief retrieved",
+            hiking_mentioned,
+            "Response references hiking/weekend/Saturday/trail" if hiking_mentioned
+            else f"None of [hiking, weekend, Saturday, trail] found in: {content2[:200]}",
+        ),
+    ]
+    return TestResult(
+        "relevant_belief_retrieval",
+        "Chat path must still retrieve beliefs that ARE relevant to the query",
+        "What do I like to do for fun? (after seeding 'I go hiking')",
+        all(c.passed for c in checks), checks, nodes2, cached2, elapsed2,
+    )
+
+
 # ── Test registry ─────────────────────────────────────────────────────────────
 TESTS = [
     tc_multi_expense,
@@ -469,12 +558,14 @@ TESTS = [
     tc_goal_debt,
     tc_annual_income,
     tc_annual_income_with_house_goal,
+    tc_contamination_isolation,
+    tc_relevant_belief_retrieval,
 ]
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 def run_all(url: str, key: str) -> list[TestResult]:
-    print(f"\nEarl Prime Eval Harness  v1.0\n{'=' * 60}")
+    print(f"\nLatticeD Eval Harness  v1.0\n{'=' * 60}")
     print(f"Server : {url}")
     print(f"Tests  : {len(TESTS)}")
     print()
@@ -519,8 +610,8 @@ def save_results(results: list[TestResult], path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Earl Prime regression test harness")
-    parser.add_argument("--url", default=DEFAULT_URL,  help="Base URL of running Earl Prime")
+    parser = argparse.ArgumentParser(description="LatticeD regression test harness")
+    parser.add_argument("--url", default=DEFAULT_URL,  help="Base URL of running LatticeD")
     parser.add_argument("--key", default=DEFAULT_KEY,  help="x-api-key value")
     args = parser.parse_args()
 
@@ -538,9 +629,9 @@ def main() -> None:
         print(f"Server healthy  chroma={chroma}  tavily={tav}")
     except Exception as exc:
         sys.exit(
-            f"\n✗ Cannot reach Earl Prime at {args.url}\n"
+            f"\n✗ Cannot reach LatticeD at {args.url}\n"
             f"  Error: {exc}\n"
-            f"  Is the server running?  .\\Start-EarlPrime.ps1\n"
+            f"  Is the server running?  .\\Start-LatticeD.ps1\n"
         )
 
     # ── Run all tests ─────────────────────────────────────────────────────────

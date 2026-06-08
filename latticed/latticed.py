@@ -77,22 +77,22 @@ logger = logging.getLogger("EndGameAI")
 # ---------------------------------------------------------------------
 # Directory and Environment Layout Configuration
 # ---------------------------------------------------------------------
-ROOT_DIR = Path(os.getenv("EARL_ROOT", str(Path(__file__).resolve().parent / "runtime"))).resolve()
+ROOT_DIR = Path(os.getenv("LATTICED_ROOT") or os.getenv("EARL_ROOT") or str(Path(__file__).resolve().parent / "runtime")).resolve()
 STORAGE_DIR = ROOT_DIR / "storage"
 OUTPUT_DIR = ROOT_DIR / "outputs"
-DOCS_DIR = Path(os.getenv("EARL_DOCS_DIR", str(ROOT_DIR / "docs"))).resolve()
+DOCS_DIR = Path(os.getenv("LATTICED_DOCS_DIR") or os.getenv("EARL_DOCS_DIR") or str(ROOT_DIR / "docs")).resolve()
 
-APP_DB_PATH = STORAGE_DIR / "end_game.db"
-CHECKPOINT_DB_PATH = STORAGE_DIR / "end_game_checkpoints.db"
+APP_DB_PATH = STORAGE_DIR / "latticed.db"
+CHECKPOINT_DB_PATH = STORAGE_DIR / "latticed_checkpoints.db"
 CHROMA_PATH = STORAGE_DIR / "vector_memory"
 
 DEFAULT_SECRET = "local_dev_secret_123"
-ACTIVE_SECRET = os.getenv("EARL_SECRET") or os.getenv("JARVIS_SECRET") or DEFAULT_SECRET
+ACTIVE_SECRET = os.getenv("LATTICED_SECRET") or os.getenv("EARL_SECRET") or os.getenv("JARVIS_SECRET") or DEFAULT_SECRET
 logger.info("[auth] ACTIVE_SECRET loaded — first 4 chars: %s*** length: %d", ACTIVE_SECRET[:4], len(ACTIVE_SECRET))
-INTERNAL_USER_ID = os.getenv("EARL_USER_ID", "earl_prime")
+INTERNAL_USER_ID = os.getenv("LATTICED_USER_ID") or os.getenv("EARL_USER_ID") or "latticed_user"
 
-MAX_PROMPT_CHARS = int(os.getenv("EARL_MAX_PROMPT_CHARS", "4000"))
-MAX_DOC_CHARS = int(os.getenv("EARL_MAX_DOC_CHARS", "12000"))
+MAX_PROMPT_CHARS = int(os.getenv("LATTICED_MAX_PROMPT_CHARS") or os.getenv("EARL_MAX_PROMPT_CHARS") or "4000")
+MAX_DOC_CHARS = int(os.getenv("LATTICED_MAX_DOC_CHARS") or os.getenv("EARL_MAX_DOC_CHARS") or "12000")
 THREAD_ID_PATTERN = r"^[a-zA-Z0-9_-]{1,64}$"
 DECAY_LAMBDA = math.log(2) / 45
 
@@ -251,6 +251,14 @@ def _detect_goal(text: str) -> str:
 # ── Semantic Cache ─────────────────────────────────────────────────────────────
 # Cosine similarity threshold for a cache hit (0.98 = nearly identical prompts).
 SEMANTIC_CACHE_THRESHOLD = 0.98
+
+# Minimum cosine similarity for a belief to be considered relevant to the current
+# user query. Below this, the belief is filtered out of retrieval — preventing
+# off-topic beliefs from contaminating unrelated conversations.
+# 0.30 = loosely related (e.g. "fun" matching beliefs about hobbies and activities)
+# 0.50 = moderately related
+# 0.70 = strongly related
+BELIEF_RELEVANCE_THRESHOLD = 0.30
 # TTL for cached responses in seconds.  Task/financial answers are deterministic
 # and can be cached long-term.  Research answers depend on live web data and must
 # not be served stale — they are excluded from the cache entirely at store time.
@@ -415,7 +423,7 @@ class AgentFactoryRegistry:
                 temperature=0.6,
                 max_tokens=400,
                 system_prompt=(
-                    "You are Earl Prime — a trusted advisor skilled in communication, active listening, "
+                    "You are LatticeD — a trusted advisor skilled in communication, active listening, "
                     "empathy, problem-solving, critical thinking, decision making, creative problem solving, "
                     "adaptability, teamwork, leadership, time management, emotional intelligence, conflict "
                     "resolution, negotiation, cultural awareness, and lifelong learning. "
@@ -433,7 +441,7 @@ class AgentFactoryRegistry:
                 temperature=0.1,
                 max_tokens=500,   # Synthesis model: no think chain — formats the math blueprint directly
                 system_prompt=(
-                    "You are Earl Prime's Quantitative Architect and financial strategist.\n\n"
+                    "You are LatticeD's Quantitative Architect and financial strategist.\n\n"
                     "The formatted budget table will be generated automatically — do NOT produce numbers, "
                     "dollar amounts, percentages, lists, bullet points, or headings.\n"
                     "Do NOT mention income, expenses, or any specific figures — the tables handle all of that.\n\n"
@@ -477,7 +485,7 @@ class AgentFactoryRegistry:
                 temperature=0.55,
                 max_tokens=700,
                 system_prompt=(
-                    "You are Earl Prime — a trusted life advisor with deep expertise in emotional intelligence, "
+                    "You are LatticeD — a trusted life advisor with deep expertise in emotional intelligence, "
                     "empathy, active listening, coaching, mentoring, relationship building (personal and romantic), "
                     "conflict resolution, negotiation, stress management, personal development, decision making, "
                     "creative problem solving, adaptability, cultural awareness, interpersonal skills, and lifelong learning.\n\n"
@@ -518,7 +526,7 @@ class AgentFactoryRegistry:
                 temperature=0.3,
                 max_tokens=500,
                 system_prompt=(
-                    "You are Earl Prime's Quantitative Architect and financial strategist.\n\n"
+                    "You are LatticeD's Quantitative Architect and financial strategist.\n\n"
                     "The formatted budget table will be generated automatically — do NOT produce numbers, "
                     "dollar amounts, percentages, lists, bullet points, or headings.\n"
                     "Do NOT mention income, expenses, or any specific figures — the tables handle all of that.\n\n"
@@ -570,7 +578,7 @@ class AgentFactoryRegistry:
                 temperature=0.1,
                 max_tokens=550,
                 system_prompt=(
-                    "You are Earl Prime's Research Synthesizer. Answer using ONLY the verified facts supplied.\n\n"
+                    "You are LatticeD's Research Synthesizer. Answer using ONLY the verified facts supplied.\n\n"
                     "RULES:\n"
                     "1. Your training knowledge about specific dollar limits, contribution caps, and tax rules "
                     "is OUTDATED and MUST NOT be used. Use ONLY the facts given to you.\n"
@@ -617,7 +625,7 @@ class AgentFactoryRegistry:
                 temperature=0.05,
                 max_tokens=800,
                 system_prompt=(
-                    "You are Earl Prime's Executive Arbiter — skilled in communication, leadership, "
+                    "You are LatticeD's Executive Arbiter — skilled in communication, leadership, "
                     "adaptability, and coaching. Synthesize the approved strategy into a clear, "
                     "actionable artifact the user can immediately apply. Write with authority and warmth."
                 )
@@ -659,7 +667,7 @@ class EarlRuntime:
 
     def validate_secret(self) -> None:
         if ACTIVE_SECRET == DEFAULT_SECRET:
-            logger.warning("Default security key is active. Update EARL_SECRET prior to scaling across networks.")
+            logger.warning("Default security key is active. Set LATTICED_SECRET env var before exposing the service beyond localhost.")
 
     def init_storage(self) -> None:
         for folder in (ROOT_DIR, STORAGE_DIR, OUTPUT_DIR, DOCS_DIR):
@@ -723,7 +731,7 @@ class EarlRuntime:
             import chromadb
             client = chromadb.PersistentClient(path=str(CHROMA_PATH))
             self.chroma_collection = client.get_or_create_collection(
-                name="end_game_lattice_cosine",
+                name="latticed_memory",
                 embedding_function=self._get_embed_fn(),
                 metadata={"hnsw:space": "cosine"}
             )
@@ -913,30 +921,82 @@ class EarlRuntime:
 
     def get_belief_context_sync(self, query: str) -> str:
         """
-        Read the belief graph and apply temporal decay at read time.
-        Confidence decays exponentially with age (same DECAY_LAMBDA as semantic memory).
-        Facts whose effective confidence drops below 0.20 are excluded — they've aged out.
+        Read the belief graph, apply temporal decay AND relevance filtering.
+
+        Two-stage scoring:
+          1. Temporal decay: confidence decays exponentially with age.
+             Facts below 0.20 effective confidence are excluded.
+          2. Relevance: each surviving fact is scored by cosine similarity
+             against the current user query using the shared embedding model.
+             Facts below BELIEF_RELEVANCE_THRESHOLD are excluded.
+
+        Without stage 2, every query received the same top-10 beliefs regardless
+        of topic — causing financial beliefs to leak into casual chat queries.
+        With stage 2, a casual greeting retrieves no beliefs unless beliefs
+        about casual topics exist; a financial query retrieves only beliefs
+        about money, goals, expenses; a "what do I do for fun" query retrieves
+        beliefs about activities, hobbies, restaurants.
         """
-        del query
         try:
             now = time.time()
             with self.open_db() as conn:
                 rows = conn.execute(
                     "SELECT fact, confidence, last_seen FROM belief_graph "
-                    "WHERE confidence > 0.20 ORDER BY last_seen DESC LIMIT 20"
+                    "WHERE confidence > 0.20 ORDER BY last_seen DESC LIMIT 40"
                 ).fetchall()
             if not rows:
                 return ""
-            # Apply decay: effective_confidence = raw * exp(-lambda * age_days)
-            decayed = []
+
+            # Stage 1: temporal decay
+            decayed: list[tuple[float, str]] = []
             for fact, raw_conf, last_seen in rows:
                 age_days = (now - float(last_seen)) / 86400.0
                 eff_conf = float(raw_conf) * math.exp(-DECAY_LAMBDA * age_days)
                 if eff_conf >= 0.20:
                     decayed.append((eff_conf, fact))
-            decayed.sort(key=lambda x: x[0], reverse=True)
             if not decayed:
                 return ""
+
+            # Stage 2: relevance filtering by cosine similarity
+            encoder = _get_shared_st_model() if _SHARED_ST_MODEL is not None else None
+            if encoder is not None and query and query.strip():
+                try:
+                    import numpy as np
+                    q_emb = encoder.encode(query, convert_to_numpy=True)
+                    q_norm = float(np.linalg.norm(q_emb)) or 1.0
+                    scored: list[tuple[float, float, str]] = []
+                    for conf, fact in decayed:
+                        f_emb = encoder.encode(fact, convert_to_numpy=True)
+                        f_norm = float(np.linalg.norm(f_emb)) or 1.0
+                        sim = float(np.dot(q_emb, f_emb) / (q_norm * f_norm))
+                        if sim >= BELIEF_RELEVANCE_THRESHOLD:
+                            scored.append((sim, conf, fact))
+                    # Rank by combined score (similarity weighted by confidence)
+                    scored.sort(key=lambda t: t[0] * t[1], reverse=True)
+                    if not scored:
+                        logger.info(
+                            "[belief_retrieval] %d beliefs survived decay but none "
+                            "passed relevance threshold (%.2f) for query: %.60s",
+                            len(decayed), BELIEF_RELEVANCE_THRESHOLD, query,
+                        )
+                        return ""
+                    logger.info(
+                        "[belief_retrieval] %d relevant beliefs returned (of %d candidates).",
+                        len(scored[:10]), len(decayed),
+                    )
+                    return "BELIEF GRAPH:\n" + "\n".join(
+                        f"  [{conf:.2f} | rel {sim:.2f}] {fact}"
+                        for sim, conf, fact in scored[:10]
+                    )
+                except Exception:
+                    logger.warning(
+                        "[belief_retrieval] Relevance scoring failed — falling back to confidence-only.",
+                        exc_info=True,
+                    )
+                    # Fall through to confidence-only result below
+
+            # Fallback: confidence-only ranking (encoder unavailable or scoring failed)
+            decayed.sort(key=lambda x: x[0], reverse=True)
             return "BELIEF GRAPH:\n" + "\n".join(
                 f"  [{conf:.2f}] {fact}" for conf, fact in decayed[:10]
             )
@@ -985,7 +1045,7 @@ class EarlRuntime:
         if self.chroma_collection is None: return
         def _write():
             self.chroma_collection.add(
-                documents=[f"User: {user_input[:400]} | Earl Prime: {output[:800]}"],
+                documents=[f"User: {user_input[:400]} | LatticeD: {output[:800]}"],
                 metadatas=[{"user_id": INTERNAL_USER_ID, "thread_id": thread_id, "created_at_epoch": time.time(), "timestamp": datetime.now(timezone.utc).isoformat()}],
                 ids=[str(uuid.uuid4())]
             )
@@ -1217,8 +1277,15 @@ async def intent_classifier_node(state: SovereignState) -> dict:
         "tool_call_count": 0
     }
 
-def fast_fanout_node(state: SovereignState) -> dict: del state; return {}
-def deep_fanout_node(state: SovereignState) -> dict: del state; return {}
+def fast_fanout_node(state: SovereignState) -> dict:
+    # Routing-only node. Echo execution_path so LangGraph's stream mode emits
+    # an update event — otherwise empty-dict returns are filtered out and the
+    # UI's pipeline visualization never lights this node up.
+    return {"execution_path": state.get("execution_path", "fast")}
+
+def deep_fanout_node(state: SovereignState) -> dict:
+    # Same routing-only pattern as fast_fanout_node above.
+    return {"execution_path": state.get("execution_path", "deep")}
 
 async def memory_retrieval_node(state: SovereignState) -> dict:
     timer = PerfTimer("memory_retrieval")
@@ -1227,6 +1294,14 @@ async def memory_retrieval_node(state: SovereignState) -> dict:
     return {"retrieved_memory": mem}
 
 async def belief_retrieval_node(state: SovereignState) -> dict:
+    """
+    Pull verified facts from the belief graph that are RELEVANT to the current
+    user query. The retrieval function (get_belief_context_sync) applies both
+    temporal decay AND cosine-similarity relevance filtering — so casual chat
+    queries naturally retrieve no off-topic financial beliefs, while a
+    question like "what do I do for fun?" still retrieves activity-related
+    beliefs from any past session.
+    """
     timer = PerfTimer("belief_retrieval")
     ctx = await asyncio.to_thread(runtime.get_belief_context_sync, state["user_input"])
     timer.stop()
@@ -1907,9 +1982,16 @@ async def artifact_writer_node(state: SovereignState) -> dict:
 
     if output:
         await runtime.semantic_write(state.get("user_input", ""), output, thread_id)
+        # IMPORTANT: extract facts ONLY from the user's own statement, NOT from the
+        # assistant's response. Including the assistant output creates an amplification
+        # loop — if the model produces a contaminated response (e.g. mentions a 529 plan
+        # when the user never did), the Fact Extractor would store "user has 529 plan"
+        # as a belief, which then re-contaminates every future query. Reading the user
+        # input only breaks that cycle.
         extraction_context = (
-            f"USER REQUEST: {state.get('user_input', '')[:300]}\n\n"
-            f"ASSISTANT RESPONSE: {output[:800]}"
+            f"USER REQUEST: {state.get('user_input', '')[:400]}\n\n"
+            "Extract only facts the USER explicitly stated. Do not infer goals, "
+            "preferences, or financial details that were not literally said."
         )
         raw_facts = await runtime.execute_registry_inference("fact_extractor", extraction_context)
         try:
@@ -1922,7 +2004,10 @@ async def artifact_writer_node(state: SovereignState) -> dict:
         if facts:
             await asyncio.to_thread(runtime.update_belief_graph_sync, facts, True, "fact_extractor")
     timer.stop()
-    return {}
+    # Non-empty return so LangGraph stream mode yields this node — without it,
+    # the UI's pipeline visualization never sees the Artifact Writer activate.
+    # Re-stating final_output is a benign no-op (same value, same key).
+    return {"final_output": output}
 
 def clean_model_text(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -2069,12 +2154,12 @@ async def lifespan(app: FastAPI):
     checkpointer = await checkpoint_cm.__aenter__()
     try:
         app.state.graph = build_graph(checkpointer)
-        logger.info("End Game AI V3.1 Cognitive System Online.")
+        logger.info("LatticeD V3.1 Cognitive System Online.")
         yield
     finally:
         await checkpoint_cm.__aexit__(None, None, None)
 
-app = FastAPI(title="End_Game_AI", lifespan=lifespan)
+app = FastAPI(title="LatticeD", lifespan=lifespan)
 
 @app.get("/api/health")
 async def health(user_id: str = Depends(get_authenticated_user)):
@@ -2121,6 +2206,22 @@ async def evolve(
                         continue
                     accumulated.update(update)
                     yield "data: " + json.dumps({"node": node, "agent": NODE_AGENT_MAP.get(node, node), "status": "running"}) + "\n\n"
+
+                    # Emit routing metadata as soon as intent_classifier resolves
+                    # so the UI can show which path the pipeline took.
+                    if node == "intent_classifier" and "execution_path" in update:
+                        yield "data: " + json.dumps({
+                            "phase":            "routing",
+                            "execution_path":   update.get("execution_path", ""),
+                            "intent_category":  update.get("intent_category", ""),
+                            "route_reason":     update.get("route_reason", ""),
+                        }) + "\n\n"
+                    # Emit goal metadata when the math engine detects a financial goal
+                    if node == "math_engine" and update.get("active_goal") and update.get("active_goal") != "default":
+                        yield "data: " + json.dumps({
+                            "phase":          "goal",
+                            "active_goal":    update["active_goal"],
+                        }) + "\n\n"
         except Exception as _exc:
             import traceback as _tb
             _graph_error = f"[GRAPH_ERROR] {type(_exc).__name__}: {_exc}\n{_tb.format_exc()}"
@@ -2175,6 +2276,18 @@ async def websocket_endpoint(websocket: WebSocket):
                         if not update: continue
                         accumulated.update(update)
                         await websocket.send_json({"node": node, "agent": NODE_AGENT_MAP.get(node, node), "status": "complete"})
+                        if node == "intent_classifier" and "execution_path" in update:
+                            await websocket.send_json({
+                                "phase":            "routing",
+                                "execution_path":   update.get("execution_path", ""),
+                                "intent_category":  update.get("intent_category", ""),
+                                "route_reason":     update.get("route_reason", ""),
+                            })
+                        if node == "math_engine" and update.get("active_goal") and update.get("active_goal") != "default":
+                            await websocket.send_json({
+                                "phase":       "goal",
+                                "active_goal": update["active_goal"],
+                            })
             except Exception:
                 logger.exception("WebSocket graph stream error — sending partial final state.")
 
@@ -2600,6 +2713,107 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
+@app.get("/api/cache")
+async def list_cache_entries(
+    limit: int = Query(50, ge=1, le=500),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    List entries in the semantic cache with their stored metadata.
+    Used by the UI's Cache view to surface contamination and enable purge.
+    """
+    del user_id
+    if runtime.semantic_cache_collection is None:
+        return {"entries": [], "threshold": SEMANTIC_CACHE_THRESHOLD}
+    try:
+        def _fetch():
+            return runtime.semantic_cache_collection.get(
+                limit=limit,
+                include=["documents", "metadatas"],
+            )
+        raw = await asyncio.to_thread(_fetch)
+        ids = raw.get("ids", []) or []
+        docs = raw.get("documents", []) or []
+        metas = raw.get("metadatas", []) or []
+        now = time.time()
+        entries = []
+        for i, cid in enumerate(ids):
+            prompt = docs[i] if i < len(docs) else ""
+            meta = metas[i] if i < len(metas) else {}
+            cached_at = float(meta.get("cached_at", 0))
+            ttl       = float(meta.get("ttl_seconds", CACHE_TTL_DEFAULT_SECONDS))
+            age_sec   = (now - cached_at) if cached_at > 0 else None
+            ttl_remaining = (ttl - age_sec) if age_sec is not None else None
+            entries.append({
+                "id":                cid,
+                "prompt":            prompt or "",
+                "response_preview":  (meta.get("response") or "")[:240],
+                "intent":            meta.get("intent") or "",
+                "cached_at_epoch":   cached_at,
+                "age_seconds":       age_sec,
+                "ttl_seconds":       ttl,
+                "ttl_remaining_seconds": ttl_remaining,
+                "expired":           (ttl_remaining is not None and ttl_remaining <= 0),
+            })
+        # Most recent first
+        entries.sort(key=lambda e: e["cached_at_epoch"], reverse=True)
+        return {"entries": entries, "threshold": SEMANTIC_CACHE_THRESHOLD}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache list failed: {e}")
+
+@app.delete("/api/cache")
+async def forget_all_cache(
+    confirm: bool = Query(False, description="Must be true to actually delete. Safety guard."),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Bulk-delete every semantic cache entry. Useful for dev/test workflows
+    where stale or contaminated cache entries are interfering with fresh runs.
+    Beliefs and conversation memory are NOT touched — use their respective
+    DELETE endpoints to wipe those.
+    """
+    del user_id
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Bulk cache delete requires ?confirm=true to execute.",
+        )
+    if runtime.semantic_cache_collection is None:
+        return {"ok": True, "deleted_count": 0}
+    try:
+        def _purge():
+            existing = runtime.semantic_cache_collection.get(include=[])
+            ids = existing.get("ids", []) or []
+            if ids:
+                runtime.semantic_cache_collection.delete(ids=ids)
+            return len(ids)
+        count = await asyncio.to_thread(_purge)
+        logger.warning("[forget_all_cache] Purged ALL cache entries: %d rows deleted.", count)
+        return {"ok": True, "deleted_count": int(count)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bulk cache forget failed: {e}")
+
+@app.delete("/api/cache/{cache_id}")
+async def forget_cache_entry(
+    cache_id: str,
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Delete a single cache entry by its ChromaDB document ID. Used by the UI's
+    per-row Forget button on the Cache view.
+    """
+    del user_id
+    if runtime.semantic_cache_collection is None:
+        raise HTTPException(status_code=503, detail="Semantic cache not initialized.")
+    try:
+        def _delete():
+            runtime.semantic_cache_collection.delete(ids=[cache_id])
+        await asyncio.to_thread(_delete)
+        logger.info("[forget_cache_entry] Purged cache id=%s", cache_id)
+        return {"ok": True, "deleted_id": cache_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache forget failed: {e}")
+
 @app.get("/api/docs")
 async def list_documents(user_id: str = Depends(get_authenticated_user)):
     """List the documents currently sitting in runtime/docs/ awaiting ingestion."""
@@ -2624,12 +2838,32 @@ async def list_documents(user_id: str = Depends(get_authenticated_user)):
 if __name__ == "__main__":
     import uvicorn
 
-    # Launch the ASGI production server locally on port 8000
-    logger.info("Initializing Uvicorn production engine...")
+    # Bind configuration — defaults to localhost-only for safety.
+    # Set LATTICED_HOST=0.0.0.0 to expose on the LAN (e.g. for phone testing).
+    bind_host = os.getenv("LATTICED_HOST", "127.0.0.1").strip()
+    bind_port = int(os.getenv("LATTICED_PORT", "8000"))
+
+    logger.info("Initializing Uvicorn production engine on %s:%d ...", bind_host, bind_port)
+
+    # Loud security warning if exposing to the network with the default secret
+    if bind_host != "127.0.0.1" and ACTIVE_SECRET == DEFAULT_SECRET:
+        warning = (
+            "\n" + "!" * 72 + "\n"
+            "!! SECURITY WARNING\n"
+            f"!! Binding to {bind_host} exposes LatticeD beyond localhost,\n"
+            "!! but LATTICED_SECRET is still the default value 'local_dev_secret_123'.\n"
+            "!! ANYONE on this network can call the API with that key.\n"
+            "!!\n"
+            "!! Set a strong LATTICED_SECRET environment variable before exposing\n"
+            "!! this service on any network with other devices on it.\n"
+            + "!" * 72 + "\n"
+        )
+        logger.warning(warning)
+
     uvicorn.run(
-        "End_Game_AI:app", 
-        host="127.0.0.1", 
-        port=8000, 
-        reload=False, 
+        "latticed:app",
+        host=bind_host,
+        port=bind_port,
+        reload=False,
         log_level="info"
     )

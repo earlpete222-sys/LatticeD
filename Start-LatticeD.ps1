@@ -1,17 +1,25 @@
 param(
     [switch]$Watch,
-    [switch]$Dev
+    [switch]$Dev,
+    [switch]$LAN     # When set, binds to 0.0.0.0 so other devices on the local network can reach the UI.
 )
 
-# ── Path Configuration ────────────────────────────────────────────────────────
+# When -LAN is passed, expose the server on all interfaces so phones / tablets
+# on the same WiFi can hit the UI. Otherwise, keep localhost-only for safety.
+if ($LAN) {
+    $env:LATTICED_HOST = "0.0.0.0"
+    Write-Host "[LAN MODE] Binding to 0.0.0.0 - other devices on this network can reach LatticeD." -ForegroundColor Yellow
+}
+
+# -- Path Configuration --------------------------------------------------------
 # Override any of these via environment variables before launching:
 #   $env:LATTICED_PYTHON  = "C:\path\to\python.exe"   (default: just "python")
 #   $env:LATTICED_HOME    = "C:\path\to\LatticeD"     (default: script's own folder)
 #   $env:LATTICED_OLLAMA  = "C:\path\to\ollama.exe"   (default: %LOCALAPPDATA%\Programs\Ollama)
 $PYTHON       = if ($env:LATTICED_PYTHON) { $env:LATTICED_PYTHON } else { "python" }
 $LATTICED_ROOT = if ($env:LATTICED_HOME) { $env:LATTICED_HOME } else { $PSScriptRoot }
-$AGENT_SCRIPT = Join-Path $LATTICED_ROOT "End_Game_AI\End_Game_AI.py"
-$AGENT_DIR    = Join-Path $LATTICED_ROOT "End_Game_AI"
+$AGENT_SCRIPT = Join-Path $LATTICED_ROOT "latticed\latticed.py"
+$AGENT_DIR    = Join-Path $LATTICED_ROOT "latticed"
 $OLLAMA_EXE   = if ($env:LATTICED_OLLAMA) { $env:LATTICED_OLLAMA } else { "$env:LOCALAPPDATA\Programs\Ollama\ollama app.exe" }
 $OLLAMA_API   = "http://localhost:11434/api/version"
 $MAX_WAIT     = 60
@@ -27,7 +35,7 @@ $env:OLLAMA_NUM_PARALLEL = "2"
 Log-Ok "OLLAMA_NUM_PARALLEL=2 (persisted to User scope)"
 
 # Prevents HuggingFace Hub from firing 40+ HEAD requests at startup to check
-# for model updates — models are local-only, updates are irrelevant.
+# for model updates - models are local-only, updates are irrelevant.
 [System.Environment]::SetEnvironmentVariable("HF_HUB_OFFLINE", "1", "User")
 $env:HF_HUB_OFFLINE = "1"
 Log-Ok "HF_HUB_OFFLINE=1  (suppresses HuggingFace network calls at startup)"
@@ -75,35 +83,36 @@ if (-not $ready) {
     Log-Warn "Ollama API did not respond in $MAX_WAIT s. Continuing anyway."
 }
 
-# Step 5 - Launch Earl Prime
+# Step 5 - Launch LatticeD
 if ($Dev) {
     Log-Step "DEV mode - uvicorn --reload (restarts on file save)"
     Log-Warn "Press Ctrl+C to stop."
     Set-Location $AGENT_DIR
-    & $PYTHON -m uvicorn End_Game_AI:app --reload --host 127.0.0.1 --port 8000
+    $uvHost = if ($env:LATTICED_HOST) { $env:LATTICED_HOST } else { "127.0.0.1" }
+    & $PYTHON -m uvicorn latticed:app --reload --host $uvHost --port 8000
 
 } elseif ($Watch) {
-    Log-Step "WATCHDOG mode - Earl Prime restarts automatically on crash"
+    Log-Step "WATCHDOG mode - LatticeD restarts automatically on crash"
     Log-Warn "Press Ctrl+C to stop."
     $delay = 5
     $attempts = 0
     while ($true) {
         $attempts++
-        Write-Host "`n  [$(Get-Date -Format 'HH:mm:ss')] Starting Earl Prime (attempt $attempts)..." -ForegroundColor Cyan
+        Write-Host "`n  [$(Get-Date -Format 'HH:mm:ss')] Starting LatticeD (attempt $attempts)..." -ForegroundColor Cyan
         Set-Location $AGENT_DIR
         & $PYTHON $AGENT_SCRIPT
         $code = $LASTEXITCODE
         if ($code -eq 0) {
-            Log-Ok "Earl Prime exited cleanly. Watchdog stopping."
+            Log-Ok "LatticeD exited cleanly. Watchdog stopping."
             break
         }
-        Log-Warn "Earl Prime stopped (exit code: $code). Restarting in $delay s..."
+        Log-Warn "LatticeD stopped (exit code: $code). Restarting in $delay s..."
         Start-Sleep -Seconds $delay
         if ($delay -lt 60) { $delay = $delay * 2 }
     }
 
 } else {
-    Log-Step "Starting Earl Prime..."
+    Log-Step "Starting LatticeD..."
     Log-Warn "Press Ctrl+C to stop."
     Set-Location $AGENT_DIR
     & $PYTHON $AGENT_SCRIPT

@@ -45,4 +45,4 @@ total = time.time() - t0
 print(f"\nDone — {chunks_seen} chunks in {total:.2f}s")
 if chunks_seen == 0:
     print("\n*** NO CHUNKS RECEIVED — server sent 0 bytes in the body ***")
-    print("Check the Earl Prime console for an exception in gen().")
+    print("Check the LatticeD console for an exception in gen().")

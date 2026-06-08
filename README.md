@@ -56,11 +56,11 @@ export TAVILY_API_KEY="your_tavily_key_here"          # macOS / Linux
 $env:TAVILY_API_KEY = "your_tavily_key_here"          # Windows PowerShell
 
 # 5. Launch the framework
-python End_Game_AI/End_Game_AI.py
+python latticed/latticed.py
 ```
 
 The HTTP API will be available at `http://127.0.0.1:8000`.
-Open `End_Game_AI/ui.html` in a browser for the minimal web interface.
+Open `latticed/ui_v2.html` in a browser for the full React interface (or visit `http://127.0.0.1:8000/` once the server is running).
 
 ### Windows Quick Launch
 
@@ -68,10 +68,10 @@ Two PowerShell helpers are included for Windows users:
 
 ```powershell
 # One-shot launch (also stops/restarts Ollama with OLLAMA_NUM_PARALLEL=2)
-.\Start-EarlPrime.ps1
+.\Start-LatticeD.ps1
 
 # Register as an auto-start scheduled task
-.\Register-EarlPrimeTask.ps1
+.\Register-LatticeDTask.ps1
 ```
 
 ---
@@ -157,13 +157,15 @@ Override defaults via environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `EARL_SECRET` | `local_dev_secret_123` | API key for the HTTP endpoint (**change this for any non-local use**) |
+| `LATTICED_SECRET` | `local_dev_secret_123` | API key for the HTTP endpoint (**change this for any non-local use**) |
 | `TAVILY_API_KEY` | (none) | Enables web grounding on the research path |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama inference endpoint |
-| `EARL_ROOT` | `End_Game_AI/runtime` | Runtime storage root |
-| `EARL_DOCS_DIR` | `EARL_ROOT/docs` | Document workspace |
-| `EARL_MAX_PROMPT_CHARS` | `4000` | Max prompt length |
-| `EARL_MAX_DOC_CHARS` | `12000` | Max characters per ingested document |
+| `LATTICED_ROOT` | `latticed/runtime` | Runtime storage root |
+| `LATTICED_DOCS_DIR` | `LATTICED_ROOT/docs` | Document workspace |
+| `LATTICED_MAX_PROMPT_CHARS` | `4000` | Max prompt length |
+| `LATTICED_MAX_DOC_CHARS` | `12000` | Max characters per ingested document |
+| `LATTICED_HOST` | `127.0.0.1` | Bind interface (set to `0.0.0.0` for LAN access) |
+| `LATTICED_PORT` | `8000` | Bind port |
 | `OLLAMA_NUM_PARALLEL` | `2` | Concurrent Ollama inference slots |
 | `HF_HUB_OFFLINE` | `1` | Suppresses HuggingFace startup network calls |
 
@@ -189,7 +191,7 @@ licensing inquiries.
 See [SECURITY.md](./SECURITY.md) for the vulnerability disclosure policy and
 production deployment guidance.
 
-The default `EARL_SECRET` is intentionally public and must be changed before
+The default `LATTICED_SECRET` is intentionally public and must be changed before
 exposing the service beyond `127.0.0.1`.
 
 ---
