@@ -398,6 +398,81 @@ def tc_annual_income_with_house_goal(url: str, key: str) -> TestResult:
     )
 
 
+def tc_architect_narrative_discipline(url: str, key: str) -> TestResult:
+    """
+    The Quant Architect's narrative must address ONLY what the user said.
+    Previously the architect's system prompt contained an example mentioning
+    "emergency fund / college contributions / 529 plan / tax-free growth" —
+    every response inherited those phrases regardless of whether the user
+    mentioned them.
+
+    User mentions only income, rent, and a generic savings plan.
+    Forbidden in the response: 529, college, emergency fund, IRA, 401k,
+    retirement, insurance, tax-free, tuition, education.
+    """
+    prompt = (
+        "I earn $6,000 a month and pay $1,500 a month in rent. "
+        "Help me with a savings plan."
+    )
+    nodes, content, cached, elapsed = run_prompt(url, key, prompt, bypass_cache=True)
+    # math sanity (also verifies parser): 6000-1500 = 4500, 50% savings = 2250
+    checks = [
+        chk_contains(content, "4,500",            "net surplus correct"),
+        chk_contains(content, "2,250",            "default 50% savings correct"),
+        chk_not_contains(content, "529",          "no 529 plan injection"),
+        chk_not_contains(content, "college",      "no college injection"),
+        chk_not_contains(content, "emergency fund","no emergency fund injection"),
+        chk_not_contains(content, "IRA",          "no IRA injection"),
+        chk_not_contains(content, "401",          "no 401(k) injection"),
+        chk_not_contains(content, "retirement",   "no retirement injection"),
+        chk_not_contains(content, "tax-free",     "no tax-free injection"),
+        chk_not_contains(content, "tuition",      "no tuition injection"),
+        chk_not_contains(content, "education",    "no education injection"),
+        chk_node_visited(nodes, "math_engine",    "math_engine ran"),
+    ]
+    return TestResult(
+        "architect_narrative_discipline",
+        "Architect addresses only what the user stated — no boilerplate injection",
+        prompt,
+        all(c.passed for c in checks), checks, nodes, cached, elapsed,
+    )
+
+
+def tc_pay_keyword_disambiguation(url: str, key: str) -> TestResult:
+    """
+    Disambiguation regression — the word "pay" must signal an EXPENSE (money
+    going out), not income. Previously _INCOME_KW used pay(?:check)? which
+    matched bare "pay" and caused "pay $1,300 in rent" to be summed alongside
+    actual income.
+
+    Also tests the frequency PRE window tightening — "a year" from $66,000's
+    post-context must NOT leak into $1,300's pre-context.
+
+    income = $66,000/yr -> $5,500/mo   rent = $1,300/mo   net = $4,200
+    default 50% savings -> $2,100/mo
+    """
+    prompt = (
+        "I earn $66,000 a year and pay $1,300 in rent. "
+        "Build me a savings plan."
+    )
+    nodes, content, cached, elapsed = run_prompt(url, key, prompt, bypass_cache=True)
+    # 66000/12 = 5500   5500-1300 = 4200   4200*0.50 = 2100
+    checks = [
+        chk_contains(content, "5,500",     "annual $66k/yr normalized to monthly $5,500"),
+        chk_contains(content, "1,300",     "rent recognized as expense (not income)"),
+        chk_contains(content, "4,200",     "net surplus correct (5500-1300=4200)"),
+        chk_contains(content, "2,100",     "savings 50% of net"),
+        chk_not_contains(content, "5,608", "buggy income (pay treated as income) NOT present"),
+        chk_not_contains(content, "67,300", "buggy combined annual income NOT present"),
+        chk_node_visited(nodes, "math_engine", "math_engine ran"),
+    ]
+    return TestResult(
+        "pay_keyword_disambiguation",
+        "Bare 'pay' is expense, not income (the $66k/yr rent bug)", prompt,
+        all(c.passed for c in checks), checks, nodes, cached, elapsed,
+    )
+
+
 def tc_goal_house(url: str, key: str) -> TestResult:
     """
     Goal-aware allocation: saving for a house shifts savings to 65% of net.
@@ -558,6 +633,8 @@ TESTS = [
     tc_goal_debt,
     tc_annual_income,
     tc_annual_income_with_house_goal,
+    tc_pay_keyword_disambiguation,
+    tc_architect_narrative_discipline,
     tc_contamination_isolation,
     tc_relevant_belief_retrieval,
 ]

@@ -158,7 +158,12 @@ FINANCIAL_CONFIG: Dict[str, Any] = {
 # Used by the label-aware parser in deterministic_math_engine.
 # Word-boundary anchored so "income" doesn't match "income tax" fragment mid-word.
 _INCOME_KW = re.compile(
-    r"\b(?:earn|make|income|salary|take.?home|revenue|bring|wages?|pay(?:check)?|gross|net pay)\b",
+    # Note: bare "pay" is intentionally EXCLUDED — in English, "I pay $X for Y"
+    # signals an expense (money going out), not income. Only "paycheck" /
+    # "paychecks" reliably indicate income. The prior pattern pay(?:check)?
+    # was too permissive and caused "pay $1,300 in rent" to be classified
+    # as income, summed alongside actual income figures.
+    r"\b(?:earn|make|income|salary|take.?home|revenue|bring|wages?|paychecks?|gross|net pay)\b",
     re.IGNORECASE,
 )
 _EXPENSE_KW = re.compile(
@@ -441,18 +446,39 @@ class AgentFactoryRegistry:
                 temperature=0.1,
                 max_tokens=500,   # Synthesis model: no think chain — formats the math blueprint directly
                 system_prompt=(
-                    "You are LatticeD's Quantitative Architect and financial strategist.\n\n"
-                    "The formatted budget table will be generated automatically — do NOT produce numbers, "
-                    "dollar amounts, percentages, lists, bullet points, or headings.\n"
-                    "Do NOT mention income, expenses, or any specific figures — the tables handle all of that.\n\n"
-                    "Your entire response must be ONE short paragraph (2-3 sentences maximum) that:\n"
-                    "1. Acknowledges the user's specific situation (family size, stated goals, lifestyle)\n"
-                    "2. Names the single highest-priority financial action given their situation\n"
-                    "3. Ends with one forward-looking recommendation\n\n"
-                    "Example tone: 'With a young family and a solid monthly surplus, your most urgent move is "
-                    "building a three-month emergency fund before any college contributions. Once that buffer "
-                    "is in place, redirect the savings allocation into a 529 plan for maximum tax-free growth.'\n\n"
-                    "Write the paragraph only. Stop immediately after it."
+                    "You are LatticeD's Quantitative Architect — a confident financial strategist with a "
+                    "complete budget plan already prepared for the user. The user is your client. They have "
+                    "shared their financial situation. You have already done the math. Your job is to present "
+                    "the plan to them in a brief, warm, professional opening paragraph that introduces the "
+                    "budget table below.\n\n"
+                    "WRITE LIKE THIS (these are templates — adapt the wording naturally to fit the situation):\n\n"
+                    "  When no specific goal is stated:\n"
+                    "  'Your income comfortably covers your fixed expenses with a meaningful surplus remaining. "
+                    "The allocation below directs that surplus toward savings while leaving balanced room for "
+                    "groceries, utilities, and entertainment. Holding the line on these weekly targets compounds "
+                    "into real financial flexibility over time.'\n\n"
+                    "  When the user is saving for a house:\n"
+                    "  'You have a clear goal in front of you: saving for a house. The plan below shifts more of "
+                    "your surplus into dedicated savings to support that down payment timeline. Staying disciplined "
+                    "on the other categories is what gets you to closing day.'\n\n"
+                    "  When the user is paying off debt:\n"
+                    "  'Your focus is clear — paying off debt. The plan below redirects the bulk of your surplus "
+                    "toward that payoff while preserving room for the essentials. Each month of discipline "
+                    "compounds into accelerated freedom from those balances.'\n\n"
+                    "  When the user is building an emergency fund:\n"
+                    "  'You are building an emergency fund — the right move for financial stability. The plan "
+                    "below dedicates the largest share of your surplus to that buffer while keeping the rest of "
+                    "your spending balanced. A few months of this discipline gets you a meaningful safety cushion.'\n\n"
+                    "VOICE: Address the user as 'you' and 'your.' The user writes their prompt in first person "
+                    "('I earn, I pay') — translate that into second person ('your income, your rent') when you "
+                    "reference their situation back to them. Speak as the analyst presenting to them, not as them.\n\n"
+                    "THE TABLE BELOW HANDLES ALL NUMBERS. Your paragraph should describe the situation "
+                    "qualitatively — words like 'comfortably,' 'meaningful surplus,' 'disciplined' work better "
+                    "than dollar amounts. The table will be appended automatically right after your paragraph.\n\n"
+                    "STAY ON TOPIC: Reference only the goal the user actually stated (or none, if they did not "
+                    "state one). Topics like college savings, retirement accounts, IRAs, 401(k)s, 529 plans, or "
+                    "insurance products should not appear unless the user specifically asked about them.\n\n"
+                    "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
             ),
             "factual_auditor": AgentSpec(
@@ -526,18 +552,39 @@ class AgentFactoryRegistry:
                 temperature=0.3,
                 max_tokens=500,
                 system_prompt=(
-                    "You are LatticeD's Quantitative Architect and financial strategist.\n\n"
-                    "The formatted budget table will be generated automatically — do NOT produce numbers, "
-                    "dollar amounts, percentages, lists, bullet points, or headings.\n"
-                    "Do NOT mention income, expenses, or any specific figures — the tables handle all of that.\n\n"
-                    "Your entire response must be ONE short paragraph (2-3 sentences maximum) that:\n"
-                    "1. Acknowledges the user's specific situation (family size, stated goals, lifestyle)\n"
-                    "2. Names the single highest-priority financial action given their situation\n"
-                    "3. Ends with one forward-looking recommendation\n\n"
-                    "Example tone: 'With a young family and a solid monthly surplus, your most urgent move is "
-                    "building a three-month emergency fund before any college contributions. Once that buffer "
-                    "is in place, redirect the savings allocation into a 529 plan for maximum tax-free growth.'\n\n"
-                    "Write the paragraph only. Stop immediately after it."
+                    "You are LatticeD's Quantitative Architect — a confident financial strategist with a "
+                    "complete budget plan already prepared for the user. The user is your client. They have "
+                    "shared their financial situation. You have already done the math. Your job is to present "
+                    "the plan to them in a brief, warm, professional opening paragraph that introduces the "
+                    "budget table below.\n\n"
+                    "WRITE LIKE THIS (these are templates — adapt the wording naturally to fit the situation):\n\n"
+                    "  When no specific goal is stated:\n"
+                    "  'Your income comfortably covers your fixed expenses with a meaningful surplus remaining. "
+                    "The allocation below directs that surplus toward savings while leaving balanced room for "
+                    "groceries, utilities, and entertainment. Holding the line on these weekly targets compounds "
+                    "into real financial flexibility over time.'\n\n"
+                    "  When the user is saving for a house:\n"
+                    "  'You have a clear goal in front of you: saving for a house. The plan below shifts more of "
+                    "your surplus into dedicated savings to support that down payment timeline. Staying disciplined "
+                    "on the other categories is what gets you to closing day.'\n\n"
+                    "  When the user is paying off debt:\n"
+                    "  'Your focus is clear — paying off debt. The plan below redirects the bulk of your surplus "
+                    "toward that payoff while preserving room for the essentials. Each month of discipline "
+                    "compounds into accelerated freedom from those balances.'\n\n"
+                    "  When the user is building an emergency fund:\n"
+                    "  'You are building an emergency fund — the right move for financial stability. The plan "
+                    "below dedicates the largest share of your surplus to that buffer while keeping the rest of "
+                    "your spending balanced. A few months of this discipline gets you a meaningful safety cushion.'\n\n"
+                    "VOICE: Address the user as 'you' and 'your.' The user writes their prompt in first person "
+                    "('I earn, I pay') — translate that into second person ('your income, your rent') when you "
+                    "reference their situation back to them. Speak as the analyst presenting to them, not as them.\n\n"
+                    "THE TABLE BELOW HANDLES ALL NUMBERS. Your paragraph should describe the situation "
+                    "qualitatively — words like 'comfortably,' 'meaningful surplus,' 'disciplined' work better "
+                    "than dollar amounts. The table will be appended automatically right after your paragraph.\n\n"
+                    "STAY ON TOPIC: Reference only the goal the user actually stated (or none, if they did not "
+                    "state one). Topics like college savings, retirement accounts, IRAs, 401(k)s, 529 plans, or "
+                    "insurance products should not appear unless the user specifically asked about them.\n\n"
+                    "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
             ),
             "grounding_extractor": AgentSpec(
@@ -1431,9 +1478,15 @@ def _extract_financial_entities(text: str):
         # The label window (80 chars, segment-bounded) is too wide for frequency —
         # it lets "$60,000 per year ... $1,500" leak "per year" into $1,500's window.
         # Use a TIGHT post-window (30 chars, dominant English form: "$X per year"),
-        # and only fall back to a very small pre-window (15 chars) if post is empty.
+        # and only fall back to a very small pre-window (10 chars) if post is empty.
+        # PRE radius reduced from 15 to 10 to prevent the previous amount's frequency
+        # keyword from bleeding into this amount's window when amounts are close
+        # together. Example: "$66,000 a year and pay $1,300" — "a year" sits 16 chars
+        # before $1,300; a 15-char PRE would include it and misclassify $1,300 as
+        # annual. 10-char PRE still catches "monthly $X" (8 chars) and "yearly $X"
+        # (7 chars), which are the common leading-frequency forms.
         FREQ_POST_RADIUS = 30
-        FREQ_PRE_RADIUS  = 15
+        FREQ_PRE_RADIUS  = 10
 
         next_start    = amount_matches[i + 1].start() if i < len(amount_matches) - 1 else len(text)
         freq_post_end = min(len(text), m.end() + FREQ_POST_RADIUS, next_start)
