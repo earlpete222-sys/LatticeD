@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Literal, Optional, TypedDict
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Path as ApiPath, Query, UploadFile, WebSocket, WebSocketDisconnect, status
@@ -360,6 +360,89 @@ CATEGORY_HYBRID_EMB_WEIGHT     = 0.60
 CATEGORY_HYBRID_KEYWORD_WEIGHT = 0.40
 CATEGORY_MATCH_THRESHOLD       = 0.25
 CATEGORY_KEYWORD_SATURATION    = 3      # 3 keyword hits = max keyword score (1.0)
+
+# When the top category is in this range, the result is "ambiguous" — strong
+# enough to be suggestive but not strong enough to commit. The system queues a
+# question for the user instead of guessing silently.
+CATEGORY_AMBIGUITY_FLOOR  = 0.18    # Below this, no candidate is plausible enough to ask about
+CATEGORY_AMBIGUITY_CEILING = 0.32   # Above this, we're confident enough to skip asking
+CATEGORY_TIE_GAP          = 0.05    # If top two are within this, also ambiguous
+
+def categorize_with_confidence(text: str, max_categories: int = 3
+) -> Tuple[List[str], bool, List[Tuple[str, float]]]:
+    """
+    Extended categorizer used by the active learning loop.
+
+    Returns:
+        categories         : auto-assigned categories above threshold (may be empty
+                             when ambiguous — in that case the system queues a question)
+        ambiguous          : True when the result is uncertain enough to ask the user
+        ranked_candidates  : (category, score) tuples sorted by score, top 5
+    """
+    if not text or not text.strip() or not CATEGORY_ANCHOR_EMBEDDINGS:
+        return ["other"], False, []
+
+    try:
+        import numpy as np
+        encoder = _get_shared_st_model() if _SHARED_ST_MODEL is not None else None
+        if encoder is None:
+            return ["other"], False, []
+
+        text_emb  = encoder.encode(text, convert_to_numpy=True)
+        text_norm = float(np.linalg.norm(text_emb)) or 1.0
+        text_lower = text.lower()
+        text_words = set(re.findall(r"[a-z0-9]+", text_lower))
+
+        def _kw_match(kw: str) -> bool:
+            return (kw in text_lower) if " " in kw else (kw in text_words)
+
+        scores: Dict[str, float] = {}
+        for category, anchor_emb in CATEGORY_ANCHOR_EMBEDDINGS.items():
+            a_norm  = float(np.linalg.norm(anchor_emb)) or 1.0
+            emb_sim = float(np.dot(text_emb, anchor_emb) / (text_norm * a_norm))
+            keywords = CATEGORY_KEYWORDS.get(category, set())
+            if keywords:
+                hits = sum(1 for kw in keywords if _kw_match(kw))
+                kw_score = min(1.0, hits / CATEGORY_KEYWORD_SATURATION)
+            else:
+                kw_score = 0.0
+            scores[category] = (
+                CATEGORY_HYBRID_EMB_WEIGHT     * emb_sim +
+                CATEGORY_HYBRID_KEYWORD_WEIGHT * kw_score
+            )
+
+        ranked = sorted(scores.items(), key=lambda t: t[1], reverse=True)
+        top_candidates = ranked[:5]
+        # Exclude the "other" sink from suggestion lists (it's the fallback, not a real suggestion)
+        suggested = [(c, round(s, 4)) for c, s in top_candidates if c != "other" and s >= 0.15]
+
+        above_threshold = [(c, s) for c, s in ranked if s >= CATEGORY_MATCH_THRESHOLD and c != "other"]
+
+        # Ambiguity detection
+        ambiguous = False
+        top_score = ranked[0][1] if ranked else 0.0
+        if above_threshold:
+            # Confident enough to assign — but check for ties
+            if len(above_threshold) >= 2 and (above_threshold[0][1] - above_threshold[1][1]) < CATEGORY_TIE_GAP:
+                ambiguous = True
+            elif top_score < CATEGORY_AMBIGUITY_CEILING:
+                # Right above threshold but still uncertain
+                ambiguous = True
+            categories = [c for c, _ in above_threshold[:max_categories]]
+        else:
+            # Nothing above threshold
+            if top_score >= CATEGORY_AMBIGUITY_FLOOR:
+                # Plausible but uncertain — ask the user
+                ambiguous = True
+                categories = []   # don't auto-tag while pending
+            else:
+                # Truly off-topic
+                categories = ["other"]
+
+        return categories, ambiguous, suggested
+    except Exception:
+        logger.warning("[categorize_with_confidence] Failed; defaulting to 'other'.", exc_info=True)
+        return ["other"], False, []
 
 def categorize_text(text: str, max_categories: int = 3) -> List[str]:
     """
@@ -902,6 +985,21 @@ class EarlRuntime:
                     CREATE TABLE IF NOT EXISTS belief_graph (id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT UNIQUE NOT NULL, confidence REAL DEFAULT 0.5, last_seen REAL, source TEXT, categories TEXT DEFAULT '');
                     CREATE TABLE IF NOT EXISTS interaction_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, thread_id TEXT, user_input TEXT, intent TEXT, path TEXT, approved INTEGER, loop_count INTEGER, latency_ms INTEGER, output_prev TEXT);
                     CREATE TABLE IF NOT EXISTS hardware_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, node TEXT, latency_ms INTEGER);
+                    CREATE TABLE IF NOT EXISTS pending_questions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        memory_id TEXT,
+                        thread_id TEXT,
+                        memory_preview TEXT,
+                        question_type TEXT,
+                        question_text TEXT,
+                        options TEXT,
+                        scores_json TEXT,
+                        created_at REAL,
+                        answered_at REAL,
+                        answer TEXT,
+                        status TEXT DEFAULT 'pending'
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_pending_questions_status ON pending_questions(status, created_at DESC);
                     """
                 )
                 # Idempotent migration: add categories column to belief_graph if not present.
@@ -1277,9 +1375,16 @@ class EarlRuntime:
         # Categorize the USER INPUT only (not the assistant response) to mirror
         # the Fact Extractor's anti-amplification rule — we tag what the user
         # actually said, not what the model wrote about it.
-        categories = categorize_text(user_input)
-        categories_str = ",".join(categories)
+        categories, ambiguous, suggested = categorize_with_confidence(user_input)
+        # If the result is uncertain, mark it for user review and queue a question
+        # rather than committing to a guess. Categories ["pending_review"] is a
+        # sentinel value — retrieval filters can choose whether to include them.
+        if ambiguous and not categories:
+            categories_str = "pending_review"
+        else:
+            categories_str = ",".join(categories) if categories else "other"
 
+        memory_id = str(uuid.uuid4())
         def _write():
             self.chroma_collection.add(
                 documents=[f"User: {user_input[:400]} | LatticeD: {output[:800]}"],
@@ -1290,10 +1395,108 @@ class EarlRuntime:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "categories": categories_str,
                 }],
-                ids=[str(uuid.uuid4())]
+                ids=[memory_id]
             )
         await asyncio.to_thread(_write)
-        logger.info("[semantic_write] Memory stored — categories: [%s]", categories_str)
+        logger.info("[semantic_write] Memory stored — categories: [%s] (ambiguous=%s)", categories_str, ambiguous)
+
+        # Queue a question when categorization is uncertain. The user answers
+        # at their convenience via the Refine view — never blocks the pipeline.
+        if ambiguous and suggested:
+            await asyncio.to_thread(
+                self.queue_category_question,
+                memory_id, thread_id, user_input[:400],
+                suggested, scores={c: s for c, s in suggested},
+            )
+
+    def queue_category_question(
+        self,
+        memory_id: str,
+        thread_id: str,
+        memory_preview: str,
+        suggested: List[Tuple[str, float]],
+        scores: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """
+        Add an ambiguous-categorization question to the pending queue. The user
+        sees these in the Refine view and answers at their convenience. Their
+        answer updates the memory's category tags and (in Phase 3) becomes a
+        pattern rule the system learns from.
+        """
+        options = [c for c, _ in suggested[:4]]
+        if not options:
+            return
+        question_text = (
+            "I noticed this memory could fit a few categories. Which one matches best?"
+        )
+        try:
+            with self.db_lock:
+                with self.open_db() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO pending_questions
+                            (memory_id, thread_id, memory_preview, question_type,
+                             question_text, options, scores_json, created_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                        """,
+                        (
+                            memory_id, thread_id, memory_preview, "category",
+                            question_text, ",".join(options),
+                            json.dumps(scores or {}), time.time(),
+                        ),
+                    )
+                    conn.commit()
+            logger.info(
+                "[queue_category_question] Queued question for memory %s — options: %s",
+                memory_id[:8], options,
+            )
+        except Exception:
+            logger.warning("[queue_category_question] Failed to queue question.", exc_info=True)
+
+    def answer_category_question(self, question_id: int, answer: str) -> Dict[str, Any]:
+        """
+        Apply the user's answer: update the memory's category tags in ChromaDB
+        and mark the question as answered. Returns a status dict.
+        """
+        with self.db_lock:
+            with self.open_db() as conn:
+                row = conn.execute(
+                    "SELECT memory_id, options, status FROM pending_questions WHERE id = ?",
+                    (question_id,),
+                ).fetchone()
+                if not row:
+                    return {"ok": False, "error": "Question not found"}
+                memory_id, options_str, status = row
+                if status != "pending":
+                    return {"ok": False, "error": f"Question already {status}"}
+
+                options = [o.strip() for o in (options_str or "").split(",") if o.strip()]
+                if answer not in options and answer != "skip":
+                    return {"ok": False, "error": f"Answer '{answer}' not in options {options}"}
+
+                conn.execute(
+                    "UPDATE pending_questions SET answered_at=?, answer=?, status=? WHERE id=?",
+                    (time.time(), answer, "skipped" if answer == "skip" else "answered", question_id),
+                )
+                conn.commit()
+
+        # If user actually chose a category (not skip), update the memory's ChromaDB metadata
+        if answer != "skip" and memory_id and self.chroma_collection is not None:
+            try:
+                def _update():
+                    self.chroma_collection.update(
+                        ids=[memory_id],
+                        metadatas=[{"categories": answer}],
+                    )
+                _update()
+                logger.info(
+                    "[answer_category_question] Memory %s re-tagged with category: %s",
+                    memory_id[:8], answer,
+                )
+            except Exception:
+                logger.warning("[answer_category_question] Failed to update memory.", exc_info=True)
+
+        return {"ok": True, "memory_id": memory_id, "answer": answer}
 
     def log_interaction(self, state: SovereignState, latency_ms: int) -> None:
         with self.db_lock:
@@ -2821,6 +3024,102 @@ async def get_thread_history(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Thread history failed: {e}")
+
+@app.get("/api/questions/pending")
+async def list_pending_questions(
+    limit: int = Query(50, ge=1, le=200),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """List all questions waiting for the user's answer, newest first."""
+    del user_id
+    try:
+        with runtime.open_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, memory_id, thread_id, memory_preview, question_type,
+                       question_text, options, scores_json, created_at
+                  FROM pending_questions
+                 WHERE status = 'pending'
+              ORDER BY created_at DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        questions = []
+        for r in rows:
+            qid, mem_id, thread_id, preview, qtype, qtext, opts_str, scores_json, created_at = r
+            options = [o.strip() for o in (opts_str or "").split(",") if o.strip()]
+            try:
+                scores = json.loads(scores_json) if scores_json else {}
+            except Exception:
+                scores = {}
+            questions.append({
+                "id": int(qid),
+                "memory_id": mem_id,
+                "thread_id": thread_id,
+                "memory_preview": preview or "",
+                "question_type": qtype,
+                "question_text": qtext or "",
+                "options": options,
+                "scores": scores,
+                "created_at_epoch": float(created_at) if created_at else 0.0,
+            })
+        return {"questions": questions, "pending_count": len(questions)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pending question list failed: {e}")
+
+@app.get("/api/questions/count")
+async def count_pending_questions(user_id: str = Depends(get_authenticated_user)):
+    """Quick count of pending questions — used by the sidebar nav badge."""
+    del user_id
+    try:
+        with runtime.open_db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM pending_questions WHERE status='pending'"
+            ).fetchone()[0]
+        return {"pending_count": int(count)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pending question count failed: {e}")
+
+@app.post("/api/questions/{question_id}/answer")
+async def answer_question(
+    question_id: int = ApiPath(..., ge=1),
+    answer: str = Query(..., min_length=1, max_length=64),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Record the user's answer and apply it. If the answer is a category name from
+    the offered options, the related memory's category tags are updated in
+    ChromaDB. If the answer is 'skip', the question is marked skipped and
+    nothing else changes.
+    """
+    del user_id
+    try:
+        result = await asyncio.to_thread(runtime.answer_category_question, question_id, answer)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Answer failed"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Answer failed: {e}")
+
+@app.delete("/api/questions/{question_id}")
+async def skip_question(
+    question_id: int = ApiPath(..., ge=1),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """Skip a question without answering. Same effect as POST .../answer?answer=skip."""
+    del user_id
+    try:
+        result = await asyncio.to_thread(runtime.answer_category_question, question_id, "skip")
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Skip failed"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Skip failed: {e}")
 
 @app.get("/api/categorize")
 async def categorize_endpoint(

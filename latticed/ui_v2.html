@@ -202,14 +202,15 @@ function LoginScreen({ onConnect }) {
   );
 }
 
-function Sidebar({ view, setView, onLogout, isMobile }) {
+function Sidebar({ view, setView, onLogout, isMobile, pendingCount = 0 }) {
   const items = [
     { id: 'chat',     label: 'Chat',      num: '01' },
     { id: 'threads',  label: 'Threads',   num: '02' },
     { id: 'beliefs',  label: 'Beliefs',   num: '03' },
     { id: 'docs',     label: 'Documents', num: '04' },
     { id: 'cache',    label: 'Cache',     num: '05' },
-    { id: 'settings', label: 'Settings',  num: '06' },
+    { id: 'refine',   label: 'Refine',    num: '06', badge: pendingCount },
+    { id: 'settings', label: 'Settings',  num: '07' },
   ];
 
   if (isMobile) {
@@ -219,12 +220,17 @@ function Sidebar({ view, setView, onLogout, isMobile }) {
           <button
             key={item.id}
             onClick={() => setView(item.id)}
-            className={`flex-1 py-3 text-[10px] uppercase tracking-widest font-semibold ${
+            className={`flex-1 py-3 text-[10px] uppercase tracking-widest font-semibold relative ${
               view === item.id ? 'text-accent' : 'text-mute'
             }`}
           >
             <div className="text-[9px] opacity-60">{item.num}</div>
             <div>{item.label}</div>
+            {item.badge ? (
+              <span className="absolute top-1 right-1 bg-accent text-ink text-[9px] font-bold rounded-full min-w-[16px] h-[16px] px-1 flex items-center justify-center">
+                {item.badge}
+              </span>
+            ) : null}
           </button>
         ))}
       </nav>
@@ -249,7 +255,12 @@ function Sidebar({ view, setView, onLogout, isMobile }) {
             }`}
           >
             <span className="text-[10px] opacity-60 font-mono">{item.num}</span>
-            <span className="text-sm font-medium">{item.label}</span>
+            <span className="text-sm font-medium flex-1">{item.label}</span>
+            {item.badge ? (
+              <span className="bg-accent text-ink text-[10px] font-bold rounded-full min-w-[18px] h-[18px] px-1.5 flex items-center justify-center">
+                {item.badge}
+              </span>
+            ) : null}
           </button>
         ))}
       </nav>
@@ -1293,6 +1304,128 @@ function DocumentsView({ apiKey }) {
   );
 }
 
+// ─── Refine View — Active Learning Question Loop ────────────────────────────
+function RefineView({ apiKey, onPendingChange }) {
+  const api = useApi(apiKey);
+  const [questions, setQuestions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(null);   // question id currently being answered
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setErr('');
+    api('/api/questions/pending').then(d => {
+      setQuestions(d.questions || []);
+      setLoading(false);
+      if (onPendingChange) onPendingChange(d.pending_count || 0);
+    }).catch(e => { setErr(e.message); setLoading(false); });
+  }, [api, onPendingChange]);
+
+  useEffect(load, [load]);
+
+  const answer = async (q, choice) => {
+    setBusy(q.id);
+    try {
+      const url = choice === 'skip'
+        ? `${API_BASE}/api/questions/${q.id}`
+        : `${API_BASE}/api/questions/${q.id}/answer?answer=${encodeURIComponent(choice)}`;
+      const res = await fetch(url, {
+        method: choice === 'skip' ? 'DELETE' : 'POST',
+        headers: { 'x-api-key': apiKey },
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `${res.status}`);
+      }
+      setQuestions(prev => prev.filter(x => x.id !== q.id));
+      if (onPendingChange) onPendingChange(Math.max(0, (questions.length - 1)));
+    } catch (e) {
+      setErr(`Answer failed: ${e.message}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="view-fade p-4 lg:p-8">
+      <div className="mb-6 flex items-baseline justify-between gap-3 flex-wrap">
+        <div>
+          <div className="section-number">06 — Refine</div>
+          <h2 className="text-2xl font-bold mt-1">
+            Teach the lattice <span className="accent-italic">how you think.</span>
+          </h2>
+          <p className="text-mute text-xs mt-2 max-w-2xl">
+            When the system isn't sure how to categorize a memory, it asks instead
+            of guessing. Your answer updates the memory's tags and helps me
+            learn how you describe your own life. Skip anything you don't want
+            to answer — nothing is forced.
+          </p>
+        </div>
+        <button
+          onClick={load}
+          className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition px-3 py-2"
+        >
+          ↻ Refresh
+        </button>
+      </div>
+      {err && <div className="text-err text-xs mb-3 font-mono">{err}</div>}
+      <div className="space-y-3">
+        {loading && <div className="bg-slate border border-line p-6 text-mute text-sm">Loading…</div>}
+        {!loading && questions.length === 0 && (
+          <div className="bg-slate border border-line p-8 text-center">
+            <div className="text-3xl mb-2 opacity-30">◇</div>
+            <div className="text-paper text-sm font-medium">All caught up.</div>
+            <div className="text-mute text-xs mt-2 max-w-md mx-auto">
+              No questions waiting. As you have more conversations, the system
+              will queue questions here when categorization is ambiguous.
+            </div>
+          </div>
+        )}
+        {questions.map(q => (
+          <div key={q.id} className="bg-slate border border-line p-4 lg:p-5">
+            <div className="flex items-baseline justify-between mb-3">
+              <div className="section-number">{q.question_type || 'question'}</div>
+              <div className="text-[10px] text-mute font-mono">
+                {new Date(q.created_at_epoch * 1000).toLocaleString()}
+              </div>
+            </div>
+            <div className="text-[10px] uppercase tracking-widest text-mute mb-1">Memory</div>
+            <div className="text-sm text-paper mb-4 italic">
+              "{q.memory_preview || '(no preview)'}"
+            </div>
+            <div className="text-sm text-paper mb-3">{q.question_text}</div>
+            <div className="flex flex-wrap gap-2">
+              {q.options.map(opt => (
+                <button
+                  key={opt}
+                  onClick={() => answer(q, opt)}
+                  disabled={busy === q.id}
+                  className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent hover:bg-accent/10 transition px-4 py-2 disabled:opacity-40 disabled:cursor-not-allowed"
+                  title={
+                    q.scores && q.scores[opt] !== undefined
+                      ? `Score: ${q.scores[opt].toFixed(3)}`
+                      : opt
+                  }
+                >
+                  {opt}
+                </button>
+              ))}
+              <button
+                onClick={() => answer(q, 'skip')}
+                disabled={busy === q.id}
+                className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-mute hover:border-mute hover:text-paper transition px-4 py-2 disabled:opacity-40"
+              >
+                Skip
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── Cache View ──────────────────────────────────────────────────────────────
 function CacheView({ apiKey }) {
   const api = useApi(apiKey);
@@ -1580,12 +1713,29 @@ function App() {
   const [view, setView] = useState('chat');
   const [currentThread, setCurrentThread] = useState(null);
   const [isMobile, setIsMobile] = useState(window.innerWidth < 1024);
+  const [pendingCount, setPendingCount] = useState(0);
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 1024);
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, []);
+
+  // Poll the pending-questions count every 60s so the badge stays current.
+  // Only polls when authenticated.
+  useEffect(() => {
+    if (!apiKey) return;
+    let cancelled = false;
+    const refresh = () => {
+      fetch(`${API_BASE}/api/questions/count`, { headers: { 'x-api-key': apiKey } })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (!cancelled && d) setPendingCount(d.pending_count || 0); })
+        .catch(() => {});
+    };
+    refresh();
+    const id = setInterval(refresh, 60_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [apiKey]);
 
   if (!apiKey) {
     return <LoginScreen onConnect={(k, h) => { setApiKey(k); setHealth(h); }} />;
@@ -1598,6 +1748,7 @@ function App() {
       case 'beliefs':  return <BeliefsView apiKey={apiKey} />;
       case 'docs':     return <DocumentsView apiKey={apiKey} />;
       case 'cache':    return <CacheView apiKey={apiKey} />;
+      case 'refine':   return <RefineView apiKey={apiKey} onPendingChange={setPendingCount} />;
       case 'settings': return <SettingsView apiKey={apiKey} onLogout={() => setApiKey(null)} health={health} />;
       default: return null;
     }
@@ -1605,11 +1756,11 @@ function App() {
 
   return (
     <div className={`min-h-screen flex ${isMobile ? 'flex-col pb-20' : ''}`}>
-      {!isMobile && <Sidebar view={view} setView={setView} onLogout={() => setApiKey(null)} isMobile={false} />}
+      {!isMobile && <Sidebar view={view} setView={setView} onLogout={() => setApiKey(null)} isMobile={false} pendingCount={pendingCount} />}
       <main className="flex-1 min-w-0 lg:h-screen lg:overflow-y-auto">
         {renderView()}
       </main>
-      {isMobile && <Sidebar view={view} setView={setView} onLogout={() => setApiKey(null)} isMobile={true} />}
+      {isMobile && <Sidebar view={view} setView={setView} onLogout={() => setApiKey(null)} isMobile={true} pendingCount={pendingCount} />}
     </div>
   );
 }
