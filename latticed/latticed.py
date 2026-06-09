@@ -678,14 +678,41 @@ class AgentFactoryRegistry:
                 temperature=0.6,
                 max_tokens=400,
                 system_prompt=(
-                    "You are LatticeD — a trusted advisor skilled in communication, active listening, "
-                    "empathy, problem-solving, critical thinking, decision making, creative problem solving, "
-                    "adaptability, teamwork, leadership, time management, emotional intelligence, conflict "
-                    "resolution, negotiation, cultural awareness, and lifelong learning. "
-                    "Respond directly and warmly. Match your tone to what the user actually needs.\n\n"
-                    "IMPORTANT: If asked for specific facts, rates, percentages, legal rules, or regulations "
-                    "you are not certain about, say so clearly rather than guessing. "
-                    "Never invent statistics or financial rules."
+                    "You are LatticeD — a thoughtful, curious personal companion. The user is sharing "
+                    "a moment from their life with you. Your job is to respond like a good friend would: "
+                    "show interest, ASK A FOLLOW-UP QUESTION, react warmly, and only offer advice when "
+                    "the user clearly asks for it.\n\n"
+                    "CRITICAL: Focus entirely on the CURRENT 'Request' line. Do not reference 'History', "
+                    "'Beliefs', or anything else you see in the context unless the user's current message "
+                    "is literally about that past topic. If History contains 'park' and the user just said "
+                    "'I made dinner', ignore the park entirely and respond about dinner.\n\n"
+                    "DEFAULT BEHAVIOR — when the user shares something casual:\n"
+                    "1. Acknowledge what they said in 2-5 words.\n"
+                    "2. Ask ONE specific follow-up question about it.\n"
+                    "3. Stop. Do not assume how they felt, what they did, or what they want.\n\n"
+                    "EXAMPLES (these show the pattern — adapt naturally to what the user says):\n\n"
+                    "  User: 'Spent the day at the park.'\n"
+                    "  You: 'Nice. What did you do there?'\n\n"
+                    "  User: 'Caught up with my brother today.'\n"
+                    "  You: 'How is he doing?'\n\n"
+                    "  User: 'Long week.'\n"
+                    "  You: 'Sorry to hear that. What's been weighing on you most?'\n\n"
+                    "  User: 'I made dinner.'\n"
+                    "  You: 'What did you make?'\n\n"
+                    "  User: 'How are you today?'\n"
+                    "  You: 'I'm here and ready. What's on your mind?'\n\n"
+                    "FORBIDDEN PATTERNS — do not do these:\n"
+                    "- Do not start with 'I know you...' or 'You said...' — you don't know how they felt, "
+                    "  and echoing their words back is not engagement.\n"
+                    "- Do not say 'I noticed you...' about anything from earlier in the conversation. "
+                    "  The current message is what matters.\n"
+                    "- Do not begin with 'As an AI...' or 'I don't have information...' disclaimers.\n"
+                    "- Do not give unsolicited advice, tips, or suggestions. Wait for the user to ask.\n"
+                    "- Do not invent facts, statistics, rates, rules, or regulations. If asked something "
+                    "factual you're not confident about, say so plainly and offer to look it up.\n\n"
+                    "VOICE: Warm, direct, curious. Address the user as 'you'. Match their energy — a "
+                    "four-word message gets a one-sentence reply with a question. Be brief.\n\n"
+                    "Write the response only. Stop after the question mark."
                 )
             ),
             "quant_architect": AgentSpec(
@@ -1349,6 +1376,13 @@ class EarlRuntime:
             except Exception:
                 logger.warning("[update_belief_graph] DB write failed.", exc_info=True)
 
+    # Minimum cosine similarity for a stored memory to be considered relevant
+    # enough to surface in retrieval. Without this floor, ChromaDB returns the
+    # top-N nearest matches even when they're only loosely related — causing
+    # the model to reference unrelated past memories (e.g. 'hiking' surfacing
+    # for a 'park' query) and produce contaminated responses.
+    MEMORY_RELEVANCE_THRESHOLD = 0.45
+
     async def semantic_recall(self, query: str, thread_id: str, limit: int = 4) -> str:
         if self.chroma_collection is None: return ""
         def _query():
@@ -1362,10 +1396,26 @@ class EarlRuntime:
             scored = []
             now = time.time()
             for doc, meta, dist in zip(docs, metadatas, distances):
-                score = (1.0 - float(dist)) * math.exp(-DECAY_LAMBDA * ((now - float(meta.get("created_at_epoch", now))) / 86400))
-                scored.append((score, doc))
+                similarity = 1.0 - float(dist)                       # cosine distance → similarity
+                # Skip memories below the relevance floor before even applying decay
+                if similarity < self.MEMORY_RELEVANCE_THRESHOLD:
+                    continue
+                age_days = (now - float(meta.get("created_at_epoch", now))) / 86400
+                score = similarity * math.exp(-DECAY_LAMBDA * age_days)
+                scored.append((score, similarity, doc))
+            if not scored:
+                logger.info(
+                    "[semantic_recall] %d candidates fetched but none passed relevance "
+                    "threshold (%.2f) for query: %.60s",
+                    len(docs), self.MEMORY_RELEVANCE_THRESHOLD, query,
+                )
+                return ""
             scored.sort(key=lambda item: item[0], reverse=True)
-            return "SEMANTIC MEMORY:\n" + "\n---\n".join(d for _, d in scored[:limit])
+            logger.info(
+                "[semantic_recall] Returning %d relevant memories (max similarity %.3f) for query: %.60s",
+                min(limit, len(scored)), scored[0][1] if scored else 0.0, query,
+            )
+            return "SEMANTIC MEMORY:\n" + "\n---\n".join(d for _, _, d in scored[:limit])
         return await asyncio.to_thread(_query)
 
     async def semantic_write(self, user_input: str, output: str, thread_id: str) -> None:
@@ -1745,7 +1795,24 @@ def deep_fanout_node(state: SovereignState) -> dict:
     return {"execution_path": state.get("execution_path", "deep")}
 
 async def memory_retrieval_node(state: SovereignState) -> dict:
+    """
+    Recall past conversation memories from ChromaDB scoped to this thread.
+
+    Skipped for pure-chat prompts so previous casual exchanges don't bleed into
+    each new message. With memory recall enabled on chat, a previous 'park'
+    memory can surface for a 'dinner' query (cosine similarity stays high
+    across short casual statements), causing the model to reference unrelated
+    past context. Mirrors the belief_retrieval gating added earlier.
+    """
     timer = PerfTimer("memory_retrieval")
+    intent = (state.get("intent_category") or "").lower()
+    path   = (state.get("execution_path")  or "").lower()
+
+    if intent == "chat" or path == "fast":
+        logger.info("[memory_retrieval] Skipped — intent=%s path=%s (light conversation)", intent, path)
+        timer.stop()
+        return {"retrieved_memory": ""}
+
     mem = await runtime.semantic_recall(state["user_input"], state.get("thread_id", "main"))
     timer.stop()
     return {"retrieved_memory": mem}
