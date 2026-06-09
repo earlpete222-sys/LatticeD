@@ -438,6 +438,62 @@ def tc_architect_narrative_discipline(url: str, key: str) -> TestResult:
     )
 
 
+def tc_categorization_basic(url: str, key: str) -> TestResult:
+    """
+    Verify the hybrid categorization layer maps known phrases to expected
+    categories. Tests via the dedicated /api/categorize endpoint so we
+    exercise the categorizer in isolation, not the full pipeline.
+    """
+    cases = [
+        ("I had a doctor appointment and my blood pressure was high",  "health"),
+        ("Closed a huge deal at work today",                            "work"),
+        ("Took the kids hiking on Saturday",                            "family"),
+        ("Met up with friends for drinks last night",                   "social"),
+        ("Watched a great movie and played some video games",           "entertainment"),
+        ("Saving more money this month for investments",                "finance"),
+        ("Studying for my certification exam this weekend",             "education"),
+        ("Booked a flight to Chicago for next Friday",                  "travel"),
+    ]
+
+    headers = {"x-api-key": key}
+    passing = 0
+    detail_lines = []
+    for text, expected_cat in cases:
+        try:
+            r = _requests_lib.get(
+                f"{url}/api/categorize",
+                params={"text": text},
+                headers=headers,
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
+            cats = data.get("categories", [])
+            if expected_cat in cats:
+                passing += 1
+                detail_lines.append(f"  ✓  '{text[:40]}...' → {cats} (includes {expected_cat})")
+            else:
+                detail_lines.append(f"  ✗  '{text[:40]}...' → {cats} (expected {expected_cat})")
+        except Exception as e:
+            detail_lines.append(f"  ✗  '{text[:40]}...' → ERROR: {e}")
+
+    check_passed = passing == len(cases)
+    checks = [
+        CheckResult(
+            f"categorization accuracy ({passing}/{len(cases)})",
+            check_passed,
+            "All known phrases mapped to expected categories" if check_passed
+            else "\n".join(detail_lines),
+        )
+    ]
+    return TestResult(
+        "categorization_basic",
+        f"Hybrid categorizer maps {len(cases)} known phrases to expected categories",
+        f"({len(cases)} categorization probes)",
+        check_passed, checks, [], False, 0.0,
+    )
+
+
 def tc_pay_keyword_disambiguation(url: str, key: str) -> TestResult:
     """
     Disambiguation regression — the word "pay" must signal an EXPENSE (money
@@ -635,6 +691,7 @@ TESTS = [
     tc_annual_income_with_house_goal,
     tc_pay_keyword_disambiguation,
     tc_architect_narrative_discipline,
+    tc_categorization_basic,
     tc_contamination_isolation,
     tc_relevant_belief_retrieval,
 ]

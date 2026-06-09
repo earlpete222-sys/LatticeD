@@ -253,6 +253,173 @@ def _detect_goal(text: str) -> str:
             return goal
     return "default"
 
+# ── Category Taxonomy ─────────────────────────────────────────────────────────
+# Every memory written to ChromaDB and every fact added to the belief graph is
+# tagged with one or more life-event categories from this fixed taxonomy.
+#
+# The anchor text is written in QUESTION SHAPE — each anchor describes the kind
+# of question a memory in this category could answer.  This aligns retrieval
+# (where users ask "what did I do for fun?") with storage (where memories get
+# tagged by which questions they plausibly answer).  Cosine similarity between
+# a memory and an anchor measures "could this memory plausibly answer that
+# kind of question."
+#
+# Categorization is hybrid: anchor embedding similarity (~0.7 weight) plus
+# keyword presence (~0.3 weight).  Multi-label by design — most life events
+# span multiple categories (e.g. "hiking with the kids" → family + entertainment).
+CATEGORY_ANCHORS_TEXT: Dict[str, str] = {
+    "work":          "What meetings, projects, deadlines, deals, or career events "
+                     "happened? Work assignments, professional conversations, office "
+                     "politics, performance reviews, business decisions, job duties.",
+    "health":        "When did I last see the doctor? What appointments, exercise, "
+                     "sleep, symptoms, medications, or wellness matters came up? "
+                     "Medical visits, physical activity, mental health, therapy.",
+    "family":        "What involved my spouse, partner, kids, parents, siblings, or "
+                     "extended family? Time with the kids, taking them places, weekends "
+                     "with family, activities together, family outings, raising children, "
+                     "playing with kids, picking up the kids, family gatherings, "
+                     "conversations with relatives, household coordination, childcare, "
+                     "family decisions, dinner with the family.",
+    "social":        "Who did I see socially — friends, dating, social gatherings, "
+                     "club meetings, parties, drinks, social events outside work and family?",
+    "entertainment": "What did I do for fun? Movies, games, concerts, hobbies, shows, "
+                     "recreation, leisure activities, things I enjoyed in my free time.",
+    "finance":       "What about money — budget, savings, investments, expenses, taxes, "
+                     "major purchases, financial decisions, income, bills, debt?",
+    "education":     "What did I learn or study? Courses, books, school assignments, "
+                     "training, professional development, academic work, certifications.",
+    "travel":        "What about trips, vacations, commutes, transportation, destinations, "
+                     "flights, hotels, road trips, travel planning?",
+    "home":          "What about the household — repairs, renovations, real estate, "
+                     "chores, maintenance, neighborhood, yard, moving?",
+    "food":          "What did I cook, eat, order, or buy for food? Restaurants, "
+                     "groceries, dining out, recipes, meal planning, drinks.",
+    "other":         "General conversation, casual remarks, miscellaneous topics that "
+                     "do not fit a more specific category.",
+}
+
+# Lowercase keyword sets per category. Presence of any keyword in the memory text
+# contributes to that category's hybrid score. Designed to be additive with
+# embedding similarity, not a replacement.
+CATEGORY_KEYWORDS: Dict[str, set] = {
+    "work":          {"work", "working", "worked", "workplace", "meeting", "project", "deadline",
+                      "boss", "coworker", "colleague", "office", "client", "deal",
+                      "presentation", "promotion", "raise", "performance", "review",
+                      "report", "email", "calendar", "team", "deliverable", "sprint",
+                      "deploy", "ship", "manager", "job", "career"},
+    "health":        {"doctor", "appointment", "medication", "prescription", "exercise",
+                      "workout", "gym", "run", "running", "hike", "hiking", "walk", "diet",
+                      "sleep", "headache", "sick", "ill", "symptom", "blood", "pressure",
+                      "therapy", "therapist", "checkup", "physical", "wellness", "mental"},
+    "family":        {"wife", "husband", "spouse", "partner", "kid", "kids", "child",
+                      "children", "son", "daughter", "mom", "dad", "mother", "father",
+                      "parents", "sister", "brother", "sibling", "family", "grandkids",
+                      "grandma", "grandpa", "cousin", "in-law"},
+    "social":        {"friend", "friends", "date", "dating", "party", "gathering",
+                      "drinks", "hangout", "club", "meetup", "happy hour", "brunch",
+                      "social", "bestie"},
+    "entertainment": {"movie", "film", "game", "gaming", "show", "concert", "music",
+                      "hobby", "fun", "relax", "leisure", "watch", "play", "festival",
+                      "weekend", "vacation", "tv", "netflix", "podcast", "book club"},
+    "finance":       {"budget", "saving", "savings", "investment", "stock", "bond",
+                      "income", "expense", "rent", "mortgage", "debt", "loan", "credit",
+                      "tax", "salary", "money", "dollar", "cost", "afford", "spend",
+                      "bill", "401k", "ira", "retirement", "broker"},
+    "education":     {"learn", "course", "class", "book", "read", "study", "school",
+                      "university", "college", "degree", "training", "certification",
+                      "exam", "homework", "tuition"},
+    "travel":        {"trip", "travel", "traveling", "traveled", "vacation", "flight",
+                      "fly", "flying", "flew", "hotel", "drive", "drove", "commute",
+                      "airport", "destination", "abroad", "passport", "airbnb", "uber",
+                      "lyft", "book", "booked", "booking", "boarding", "itinerary"},
+    "home":          {"house", "apartment", "repair", "renovation", "neighbor", "yard",
+                      "garden", "chore", "clean", "maintenance", "lawn", "plumbing",
+                      "electrician", "contractor", "move", "moving"},
+    "food":          {"eat", "ate", "cook", "cooking", "restaurant", "dinner", "lunch",
+                      "breakfast", "groceries", "grocery", "recipe", "meal", "kitchen",
+                      "order", "delivery", "takeout", "coffee", "beer", "wine"},
+}
+
+# Computed once at startup; populated by init_intent_encoder().
+CATEGORY_ANCHOR_EMBEDDINGS: Dict[str, Any] = {}
+
+# Hybrid scoring weights and threshold (configurable).
+#
+# Weights re-balanced 0.6 embedding / 0.4 keyword after measuring real scores:
+# all-MiniLM-L6-v2 gives surprisingly low similarities (0.20-0.30) for activity
+# sentences against noun-heavy anchors. Pure keyword hits like 'kids' or 'flight'
+# were getting under-weighted at 0.3, so clean unambiguous signals couldn't lift
+# borderline cases over threshold. 0.4 keyword weight lets strong matches matter
+# without overwhelming the semantic embedding contribution.
+#
+# Threshold lowered from 0.40 to 0.25 in two stages. 0.40 was a rough estimate
+# from intuition. Measured embedding similarities are consistently 0.15-0.30 for
+# related concepts, so 0.40 was structurally too high. 0.25 is calibrated to
+# what 'moderate combined evidence' actually looks like with this encoder.
+CATEGORY_HYBRID_EMB_WEIGHT     = 0.60
+CATEGORY_HYBRID_KEYWORD_WEIGHT = 0.40
+CATEGORY_MATCH_THRESHOLD       = 0.25
+CATEGORY_KEYWORD_SATURATION    = 3      # 3 keyword hits = max keyword score (1.0)
+
+def categorize_text(text: str, max_categories: int = 3) -> List[str]:
+    """
+    Hybrid categorization — combines anchor embedding similarity with keyword
+    presence to tag a memory with 1-3 life-event categories. Returns ["other"]
+    if no category meets CATEGORY_MATCH_THRESHOLD.
+
+    Performance: ~5-15ms per call (one new embedding + 11 cosine comparisons +
+    11 keyword scans). Reuses _SHARED_ST_MODEL — no extra VRAM, no LLM call.
+
+    Multi-label by design — most life events span multiple categories.
+    """
+    if not text or not text.strip() or not CATEGORY_ANCHOR_EMBEDDINGS:
+        return ["other"]
+
+    try:
+        import numpy as np
+        encoder = _get_shared_st_model() if _SHARED_ST_MODEL is not None else None
+        if encoder is None:
+            return ["other"]
+
+        text_emb  = encoder.encode(text, convert_to_numpy=True)
+        text_norm = float(np.linalg.norm(text_emb)) or 1.0
+        text_lower = text.lower()
+        # Word-boundary set: prevents 'great' from matching 'eat' as substring.
+        # For multi-word keywords (e.g. 'happy hour'), we fall back to substring
+        # check against the lowercased text.
+        text_words = set(re.findall(r"[a-z0-9]+", text_lower))
+
+        def _kw_match(kw: str) -> bool:
+            return (kw in text_lower) if " " in kw else (kw in text_words)
+
+        scores: Dict[str, float] = {}
+        for category, anchor_emb in CATEGORY_ANCHOR_EMBEDDINGS.items():
+            a_norm  = float(np.linalg.norm(anchor_emb)) or 1.0
+            emb_sim = float(np.dot(text_emb, anchor_emb) / (text_norm * a_norm))
+
+            keywords = CATEGORY_KEYWORDS.get(category, set())
+            if keywords:
+                hits = sum(1 for kw in keywords if _kw_match(kw))
+                # 3 keyword hits saturates to 1.0. Short phrases with 1-2 hits
+                # still get meaningful scores (0.33 and 0.67 respectively).
+                kw_score = min(1.0, hits / CATEGORY_KEYWORD_SATURATION)
+            else:
+                kw_score = 0.0
+
+            scores[category] = (
+                CATEGORY_HYBRID_EMB_WEIGHT     * emb_sim +
+                CATEGORY_HYBRID_KEYWORD_WEIGHT * kw_score
+            )
+
+        # Filter and sort
+        passing = [(cat, sc) for cat, sc in scores.items() if sc >= CATEGORY_MATCH_THRESHOLD]
+        passing.sort(key=lambda t: t[1], reverse=True)
+        result = [cat for cat, _ in passing[:max_categories]]
+        return result if result else ["other"]
+    except Exception:
+        logger.warning("[categorize_text] Scoring failed; defaulting to 'other'.", exc_info=True)
+        return ["other"]
+
 # ── Semantic Cache ─────────────────────────────────────────────────────────────
 # Cosine similarity threshold for a cache hit (0.98 = nearly identical prompts).
 SEMANTIC_CACHE_THRESHOLD = 0.98
@@ -732,11 +899,18 @@ class EarlRuntime:
                 conn.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS loyalty_weights (user_id TEXT PRIMARY KEY, weights TEXT NOT NULL, updated REAL NOT NULL);
-                    CREATE TABLE IF NOT EXISTS belief_graph (id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT UNIQUE NOT NULL, confidence REAL DEFAULT 0.5, last_seen REAL, source TEXT);
+                    CREATE TABLE IF NOT EXISTS belief_graph (id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT UNIQUE NOT NULL, confidence REAL DEFAULT 0.5, last_seen REAL, source TEXT, categories TEXT DEFAULT '');
                     CREATE TABLE IF NOT EXISTS interaction_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, thread_id TEXT, user_input TEXT, intent TEXT, path TEXT, approved INTEGER, loop_count INTEGER, latency_ms INTEGER, output_prev TEXT);
                     CREATE TABLE IF NOT EXISTS hardware_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, node TEXT, latency_ms INTEGER);
                     """
                 )
+                # Idempotent migration: add categories column to belief_graph if not present.
+                # Older databases predate the category taxonomy.
+                try:
+                    conn.execute("ALTER TABLE belief_graph ADD COLUMN categories TEXT DEFAULT ''")
+                    logger.info("[init_db] Added 'categories' column to belief_graph (migration).")
+                except sqlite3.OperationalError:
+                    pass   # Column already exists — nothing to do.
                 row = conn.execute("SELECT user_id FROM loyalty_weights WHERE user_id=?", (INTERNAL_USER_ID,)).fetchone()
                 if not row:
                     defaults = {"family": 0.35, "reliability": 0.25, "learning": 0.20, "safety": 0.15, "speed": 0.05}
@@ -1059,12 +1233,20 @@ class EarlRuntime:
             try:
                 with self.open_db() as conn:
                     for fact in clean_facts[:8]:
+                        # Tag the fact with category labels from the taxonomy.
+                        categories = ",".join(categorize_text(fact))
                         row = conn.execute("SELECT id, confidence FROM belief_graph WHERE fact=?", (fact,)).fetchone()
                         if row:
                             confidence = max(0.0, min(1.0, float(row[1]) + delta))
-                            conn.execute("UPDATE belief_graph SET confidence=?, last_seen=?, source=? WHERE id=?", (confidence, time.time(), source, row[0]))
+                            conn.execute(
+                                "UPDATE belief_graph SET confidence=?, last_seen=?, source=?, categories=? WHERE id=?",
+                                (confidence, time.time(), source, categories, row[0])
+                            )
                         else:
-                            conn.execute("INSERT INTO belief_graph (fact, confidence, last_seen, source) VALUES (?,?,?,?)", (fact, 0.58 if confirmed else 0.35, time.time(), source))
+                            conn.execute(
+                                "INSERT INTO belief_graph (fact, confidence, last_seen, source, categories) VALUES (?,?,?,?,?)",
+                                (fact, 0.58 if confirmed else 0.35, time.time(), source, categories)
+                            )
                     conn.commit()
             except Exception:
                 logger.warning("[update_belief_graph] DB write failed.", exc_info=True)
@@ -1090,13 +1272,28 @@ class EarlRuntime:
 
     async def semantic_write(self, user_input: str, output: str, thread_id: str) -> None:
         if self.chroma_collection is None: return
+        # Categorize the memory before storing — produces multi-label tags from
+        # the fixed taxonomy so future retrieval can filter or boost by category.
+        # Categorize the USER INPUT only (not the assistant response) to mirror
+        # the Fact Extractor's anti-amplification rule — we tag what the user
+        # actually said, not what the model wrote about it.
+        categories = categorize_text(user_input)
+        categories_str = ",".join(categories)
+
         def _write():
             self.chroma_collection.add(
                 documents=[f"User: {user_input[:400]} | LatticeD: {output[:800]}"],
-                metadatas=[{"user_id": INTERNAL_USER_ID, "thread_id": thread_id, "created_at_epoch": time.time(), "timestamp": datetime.now(timezone.utc).isoformat()}],
+                metadatas=[{
+                    "user_id": INTERNAL_USER_ID,
+                    "thread_id": thread_id,
+                    "created_at_epoch": time.time(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "categories": categories_str,
+                }],
                 ids=[str(uuid.uuid4())]
             )
         await asyncio.to_thread(_write)
+        logger.info("[semantic_write] Memory stored — categories: [%s]", categories_str)
 
     def log_interaction(self, state: SovereignState, latency_ms: int) -> None:
         with self.db_lock:
@@ -1195,7 +1392,7 @@ def init_intent_encoder() -> None:
     when ChromaDB has already loaded the model (or vice-versa).
     Total cost on a warm singleton: ~150ms for anchor encoding; ~5ms per query.
     """
-    global INTENT_ENCODER, INTENT_ANCHOR_EMBEDDINGS
+    global INTENT_ENCODER, INTENT_ANCHOR_EMBEDDINGS, CATEGORY_ANCHOR_EMBEDDINGS
     try:
         INTENT_ENCODER = _get_shared_st_model()
         INTENT_ANCHOR_EMBEDDINGS = {
@@ -1205,6 +1402,16 @@ def init_intent_encoder() -> None:
         logger.info(
             "Vector intent encoder ready — %d anchors precomputed.",
             len(INTENT_ANCHOR_EMBEDDINGS)
+        )
+        # Pre-compute category anchor embeddings using the same shared encoder.
+        # Reuses _SHARED_ST_MODEL — zero extra weight loading.
+        CATEGORY_ANCHOR_EMBEDDINGS = {
+            cat: INTENT_ENCODER.encode(text, convert_to_numpy=True)
+            for cat, text in CATEGORY_ANCHORS_TEXT.items()
+        }
+        logger.info(
+            "Category anchors ready — %d categories precomputed for memory tagging.",
+            len(CATEGORY_ANCHOR_EMBEDDINGS)
         )
     except ImportError:
         logger.warning(
@@ -2615,6 +2822,69 @@ async def get_thread_history(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Thread history failed: {e}")
 
+@app.get("/api/categorize")
+async def categorize_endpoint(
+    text: str = Query(..., min_length=2, max_length=2000),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """
+    Classify arbitrary text into one or more life-event categories using the
+    hybrid scoring layer. Useful for UI debugging, eval harness verification,
+    and confirming the categorization layer is operational. Returns the
+    matched categories and the raw scores for transparency.
+    """
+    del user_id
+    try:
+        import numpy as np
+        if not CATEGORY_ANCHOR_EMBEDDINGS:
+            return {"categories": ["other"], "scores": {}, "ready": False}
+
+        encoder = _get_shared_st_model() if _SHARED_ST_MODEL is not None else None
+        if encoder is None:
+            return {"categories": ["other"], "scores": {}, "ready": False}
+
+        text_emb = encoder.encode(text, convert_to_numpy=True)
+        text_norm = float(np.linalg.norm(text_emb)) or 1.0
+        text_lower = text.lower()
+        text_words = set(re.findall(r"[a-z0-9]+", text_lower))
+        def _kw_match(kw: str) -> bool:
+            return (kw in text_lower) if " " in kw else (kw in text_words)
+
+        scores: Dict[str, Dict[str, float]] = {}
+        for cat, anchor_emb in CATEGORY_ANCHOR_EMBEDDINGS.items():
+            a_norm = float(np.linalg.norm(anchor_emb)) or 1.0
+            emb_sim = float(np.dot(text_emb, anchor_emb) / (text_norm * a_norm))
+            kws = CATEGORY_KEYWORDS.get(cat, set())
+            if kws:
+                hits = sum(1 for kw in kws if _kw_match(kw))
+                kw_score = min(1.0, hits / CATEGORY_KEYWORD_SATURATION)
+            else:
+                kw_score = 0.0
+            combined = (
+                CATEGORY_HYBRID_EMB_WEIGHT     * emb_sim +
+                CATEGORY_HYBRID_KEYWORD_WEIGHT * kw_score
+            )
+            scores[cat] = {
+                "embedding_similarity": round(emb_sim, 4),
+                "keyword_score":        round(kw_score, 4),
+                "combined":             round(combined, 4),
+            }
+
+        categories = categorize_text(text)
+        return {
+            "text":      text,
+            "categories": categories,
+            "threshold": CATEGORY_MATCH_THRESHOLD,
+            "weights":   {
+                "embedding": CATEGORY_HYBRID_EMB_WEIGHT,
+                "keyword":   CATEGORY_HYBRID_KEYWORD_WEIGHT,
+            },
+            "scores":    scores,
+            "ready":     True,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Categorization failed: {e}")
+
 @app.get("/api/beliefs")
 async def list_beliefs(
     limit: int = Query(50, ge=1, le=500),
@@ -2629,7 +2899,7 @@ async def list_beliefs(
         with runtime.open_db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, fact, confidence, last_seen, source
+                SELECT id, fact, confidence, last_seen, source, categories
                   FROM belief_graph
                  WHERE confidence > 0.20
                  ORDER BY last_seen DESC
@@ -2639,12 +2909,13 @@ async def list_beliefs(
             ).fetchall()
         now = time.time()
         beliefs = []
-        for bid, fact, raw_conf, last_seen, source in rows:
+        for bid, fact, raw_conf, last_seen, source, categories in rows:
             age_days = (now - float(last_seen)) / 86400.0
             eff_conf = float(raw_conf) * math.exp(-DECAY_LAMBDA * age_days)
             beliefs.append({
                 "id":                 int(bid),
                 "fact":               fact,
+                "categories":         [c for c in (categories or "").split(",") if c],
                 "raw_confidence":     round(float(raw_conf), 3),
                 "effective_confidence": round(eff_conf, 3),
                 "age_days":           round(age_days, 1),
