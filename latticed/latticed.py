@@ -4927,6 +4927,211 @@ class LatticeContext:
             "voice_profiles":    len(self.voice.profiles),
         }
 
+# =====================================================================
+# SPRINT 15 — MCP STDIO NETWORK SURFACE
+# =====================================================================
+# Line-delimited JSON-RPC 2.0 transcode over stdin/stdout on top of
+# Sprint 9's in-process MCPServer.  Makes the server consumable by
+# Claude Desktop, mcp-cli, and any MCP-aware client.
+#
+#   encode_jsonrpc_response(...) / decode_jsonrpc_request(line)
+#   MCPStdioBridge(server, consumer_id)
+#     .handle_line(raw)  -> response line ("" for notifications)
+#     .serve(stdin, stdout)   blocking event loop (sync)
+#     async .serve_async(...) for async pipes
+#
+# JSON-RPC envelope (per spec):
+#   request:  {"jsonrpc":"2.0", "id":<int|str>, "method":<str>, "params":<obj?>}
+#   response: {"jsonrpc":"2.0", "id":<same>,    "result":<obj>}
+#   error:    {"jsonrpc":"2.0", "id":<same|null>,
+#              "error":{"code":<int>,"message":<str>,"data":<obj?>}}
+#
+# Method translation:
+#   "initialize"        -> server-info handshake
+#   "tools/list"        -> srv.tools/list
+#   "tools/call"        -> srv.tools/call with params
+#   "resources/list"    -> srv.resources/list
+#   "resources/read"    -> srv.resources/read
+#   "shutdown"          -> graceful close
+# =====================================================================
+
+JSONRPC_VERSION       = "2.0"
+JSONRPC_PARSE_ERROR   = -32700
+JSONRPC_INVALID_REQ   = -32600
+JSONRPC_METHOD_NOT_FOUND = -32601
+JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_INTERNAL_ERROR = -32603
+JSONRPC_APP_ERROR     = -32000  # generic application-level
+
+LATTICED_SERVER_INFO: Dict[str, Any] = {
+    "name":            "latticed-mcp",
+    "version":         "0.15.0",
+    "protocolVersion": "2024-11-05",
+    "capabilities": {
+        "tools":     {"listChanged": False},
+        "resources": {"listChanged": False, "subscribe": False},
+    },
+}
+
+def encode_jsonrpc_response(request_id: Any, result: Any) -> str:
+    return json.dumps({"jsonrpc": JSONRPC_VERSION, "id": request_id, "result": result})
+
+def encode_jsonrpc_error(request_id: Any, code: int, message: str,
+                        data: Optional[Any] = None) -> str:
+    err: Dict[str, Any] = {"code": int(code), "message": str(message)}
+    if data is not None:
+        err["data"] = data
+    return json.dumps({"jsonrpc": JSONRPC_VERSION, "id": request_id, "error": err})
+
+def decode_jsonrpc_request(raw: str) -> Tuple[Optional[str], Optional[Any], Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Parse a single JSON-RPC line.
+    Returns (method, request_id, params, error_message).
+    On parse failure: error_message is populated and request_id is None.
+    Notifications (no id) yield request_id=None with a successful parse.
+    """
+    try:
+        msg = json.loads(raw)
+    except Exception as e:
+        return None, None, None, f"parse_error: {e}"
+    if not isinstance(msg, dict):
+        return None, None, None, "envelope_not_object"
+    if msg.get("jsonrpc") != JSONRPC_VERSION:
+        return None, None, None, "jsonrpc_version_mismatch"
+    method = msg.get("method")
+    if not isinstance(method, str) or not method:
+        return None, msg.get("id"), None, "missing_method"
+    params = msg.get("params") or {}
+    if not isinstance(params, dict):
+        return None, msg.get("id"), None, "params_not_object"
+    return method, msg.get("id"), params, None
+
+class MCPStdioBridge:
+    """
+    Translates JSON-RPC 2.0 lines into MCPRequest dispatch on an
+    underlying MCPServer.  Consumer identity is fixed at construction
+    time so the client doesn't have to repeat it on every call.
+
+    Usage (sync):
+        bridge = MCPStdioBridge(server, consumer_id="claude-desktop")
+        bridge.serve(sys.stdin, sys.stdout)
+    """
+
+    def __init__(self, server: MCPServer, consumer_id: str) -> None:
+        self.server = server
+        self.consumer_id = consumer_id
+        self.shutdown_requested = False
+
+    # ----- single-line dispatch -----
+    def handle_line(self, raw: str) -> str:
+        """
+        Parse + dispatch one JSON-RPC line.  Returns the response line
+        (without trailing newline) or "" for notifications.
+        """
+        if not raw or not raw.strip():
+            return ""
+        method, req_id, params, err = decode_jsonrpc_request(raw.strip())
+        if err is not None:
+            # If we couldn't even read a method, return parse error.
+            if method is None and req_id is None:
+                return encode_jsonrpc_error(None, JSONRPC_PARSE_ERROR, err)
+            return encode_jsonrpc_error(req_id, JSONRPC_INVALID_REQ, err)
+
+        is_notification = (req_id is None)
+
+        # Standard MCP / JSON-RPC methods.
+        if method == "initialize":
+            result = {
+                "serverInfo": LATTICED_SERVER_INFO,
+                "consumerId": self.consumer_id,
+                "boot": True,
+            }
+            return "" if is_notification else encode_jsonrpc_response(req_id, result)
+
+        if method == "shutdown":
+            self.shutdown_requested = True
+            return "" if is_notification else encode_jsonrpc_response(req_id, {"ok": True})
+
+        if method == "ping":
+            return "" if is_notification else encode_jsonrpc_response(req_id, {"pong": True})
+
+        # MCP-namespaced methods translate into the in-process server.
+        translated = {
+            "tools/list":     "tools/list",
+            "tools/call":     "tools/call",
+            "resources/list": "resources/list",
+            "resources/read": "resources/read",
+        }.get(method)
+
+        if translated is None:
+            if is_notification:
+                return ""
+            return encode_jsonrpc_error(req_id, JSONRPC_METHOD_NOT_FOUND,
+                                         f"method_not_found:{method}")
+
+        try:
+            mcp_req = MCPRequest(method=translated,
+                                  consumer_id=self.consumer_id,
+                                  params=params or {})
+            resp = self.server.handle(mcp_req)
+        except Exception as e:
+            if is_notification:
+                return ""
+            return encode_jsonrpc_error(req_id, JSONRPC_INTERNAL_ERROR,
+                                         f"dispatch_exception:{type(e).__name__}:{e}")
+
+        if is_notification:
+            return ""
+
+        if not resp.ok:
+            # Map server-side denial / error into JSON-RPC error frame.
+            return encode_jsonrpc_error(req_id, JSONRPC_APP_ERROR,
+                                         resp.error or "server_error",
+                                         data={
+                                             "audit_entry": asdict(resp.audit_entry)
+                                                  if resp.audit_entry else None,
+                                         })
+
+        # Successful response.
+        return encode_jsonrpc_response(req_id, resp.result)
+
+    # ----- blocking sync loop -----
+    def serve(self, stdin: Any, stdout: Any) -> None:
+        """Line-by-line dispatch over file-like streams.  Blocking."""
+        while not self.shutdown_requested:
+            line = stdin.readline()
+            if not line:
+                break    # EOF
+            reply = self.handle_line(line)
+            if reply:
+                stdout.write(reply + "\n")
+                try:
+                    stdout.flush()
+                except Exception:
+                    pass
+
+    # ----- async loop -----
+    async def serve_async(self, reader: Any, writer: Any) -> None:
+        """
+        asyncio variant.  reader.readline() must return bytes; writer
+        must expose .write(bytes) and .drain() (asyncio StreamWriter API).
+        """
+        while not self.shutdown_requested:
+            line_bytes = await reader.readline()
+            if not line_bytes:
+                break
+            try:
+                raw = line_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            reply = self.handle_line(raw)
+            if reply:
+                writer.write((reply + "\n").encode("utf-8"))
+                try:
+                    await writer.drain()
+                except Exception:
+                    pass
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
