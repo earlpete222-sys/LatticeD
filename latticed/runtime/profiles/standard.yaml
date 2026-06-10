@@ -1,0 +1,14 @@
+# LatticeD hardware profile: STANDARD
+# 8-12GB VRAM. Two distinct 7B-class families.
+
+tier: standard
+
+available_models:
+  - deepseek-r1:7b
+  - qwen2.5-coder:7b
+
+consensus_overrides: {}
+
+notes:
+  - "8-12GB VRAM tier."
+  - "Architect pair becomes genuinely adversarial - exploratory variant uses deepseek-r1 family."

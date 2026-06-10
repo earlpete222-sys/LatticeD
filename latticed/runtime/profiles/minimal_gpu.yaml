@@ -1,0 +1,20 @@
+# LatticeD hardware profile: MINIMAL_GPU
+# 4GB-class consumer GPUs (current default).
+#
+# Two-model minimum is structurally enforced by the two distinct families
+# loaded into VRAM. Architect pair currently shares qwen2.5-coder at the
+# runtime layer (documented compromise); pool declarations carry the
+# cross-family target until pool-based selection ships.
+
+tier: minimal_gpu
+
+available_models:
+  - deepseek-r1:1.5b
+  - qwen2.5-coder:1.5b
+
+consensus_overrides: {}
+
+notes:
+  - "4GB-class GPUs - current default profile."
+  - "Two models held in VRAM simultaneously via OLLAMA_NUM_PARALLEL=2."
+  - "Architect pair: model_name shares qwen2.5-coder family today; pool declares deepseek-r1 target for explore variant."

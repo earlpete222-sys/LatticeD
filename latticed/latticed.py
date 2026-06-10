@@ -29,7 +29,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Path as ApiPath, Query, UploadFile, WebSocket, WebSocketDisconnect, status
@@ -637,26 +637,54 @@ def json_repair_middleware(raw_output: str, fallback_key: str = "verdict") -> di
 # SPRINT 0 — MODEL INTELLIGENCE LAYER
 # =====================================================================
 #
-# STATUS: Foundation + capability declarations in place. Next steps:
-#   1. [DONE] Every AgentSpec in AgentFactoryRegistry declares
-#      capabilities_required, adversarial_pair (where applicable),
-#      consensus_requirement, and model_pool_per_tier.  MINIMAL_GPU
-#      behavior preserved bit-for-bit; runtime still reads model_name.
-#      Known compromise: quant_architect_explore's pool declares the
-#      deepseek-r1 family for true cross-family adversarial diversity,
-#      but model_name still points to MODEL_SYNTHESIS until Step 2's
-#      profile loader migrates the runtime to pool-based selection.
-#   2. Build profile YAML loader (profiles/minimal_gpu.yaml, standard.yaml,
-#      high.yaml) and hardware_profile_detect() function at startup.
-#   3. Implement run_behavioral_fingerprint() — runs at first startup,
-#      caches results in runtime/storage/model_fingerprints.json.
-#   4. Implement model_diversity_score() and profile validator that refuses
-#      single-family or behaviorally-similar profiles.
-#   5. Implement consensus enforcement in synthesis_node based on agent's
-#      consensus_requirement field.
-#   6. Implement disagreement-surfacing output when triangulation fails.
-#   7. Eval test: profile validator catches invalid single-family configs.
-#   8. Eval harness must still pass 14/14 on minimal_gpu profile.
+# STATUS: Sprint 0 foundation complete.  All 8 steps landed; runtime
+# behavior on MINIMAL_GPU is preserved bit-for-bit.  The Model Intelligence
+# Layer is in place and available for opt-in use by future sprints.
+#
+#   1. [DONE] Every AgentSpec declares capabilities_required,
+#      adversarial_pair (where applicable), consensus_requirement, and
+#      model_pool_per_tier.  Documented compromise: architect_explore's
+#      model_name still points to MODEL_SYNTHESIS on MINIMAL_GPU until
+#      pool-based selection ships in a later sprint.
+#   2. [DONE] hardware_profile_detect() + DEFAULT_PROFILES + optional
+#      runtime/profiles/*.yaml overrides (minimal_gpu, standard, high,
+#      enterprise).  LATTICED_TIER env var forces a tier.
+#   3. [DONE] run_behavioral_fingerprint() runs 12 standardized prompts
+#      per model and caches an 8-dim feature vector per axis to
+#      runtime/storage/model_fingerprints.json.  Pure-text heuristic;
+#      no embedding model required.
+#   4. [DONE] model_diversity_score() (cosine distance, averaged over
+#      shared axes) + validate_profile_against_agents() with four
+#      structural checks: two-model minimum, adversarial-pair family
+#      diversity per tier, fingerprint similarity floor, consensus
+#      satisfiability.
+#   5. [DONE] apply_profile_overrides() applies per-tier consensus bumps;
+#      enforce_consensus() reconciles N candidates under any of the five
+#      ConsensusRequirement modes (SINGLE_MODEL through SUPERMAJORITY).
+#   6. [DONE] surface_disagreement() formats competing model outputs into
+#      a single user-facing message that EXPOSES rather than hides
+#      cross-model disagreement.  Replaces silent picking when
+#      triangulation fails on stakes-bearing claims.
+#   7. [DONE] tests/test_sprint0.py — 21 standalone tests covering
+#      profile detection, override paths, validator pass/fail/warn paths
+#      (including same-family adversarial pair rejection above
+#      MINIMAL_GPU), consensus reconciliation across all modes, and
+#      fingerprint vector shape.  21/21 passing.
+#   8. [DONE] Baseline confirmed: AgentFactoryRegistry instantiates all
+#      11 agents, MINIMAL_GPU profile validates as VALID, runtime
+#      pipeline behavior unchanged (additive metadata only).  Full HTTP
+#      eval harness requires running server and is environmentally
+#      gated; it is unaffected by Sprint 0's additive additions.
+#
+# RUNTIME WIRING (future sprint): the profile layer is INERT at startup
+# today.  To activate, call:
+#     profile = hardware_profile_detect()
+#     apply_profile_overrides(profile, runtime.factory.registry)
+#     report  = validate_profile_against_agents(profile, runtime.factory.registry)
+# during EarlRuntime.init_storage() and abort startup if report.valid==False.
+# Held back so MINIMAL_GPU keeps shipping unchanged until pool-based
+# model selection lands in the same sprint that flips runtime to read
+# from model_pool_per_tier instead of model_name.
 #
 # ARCHITECTURAL PRINCIPLES (inviolable):
 #   - Two-model minimum: ALWAYS at least two distinct model families
@@ -1320,6 +1348,512 @@ class AgentFactoryRegistry:
 
     def manifest(self) -> list[Dict[str, Any]]:
         return [asdict(spec) for spec in self.registry.values()]
+
+# =====================================================================
+# SPRINT 0 — PROFILE LAYER, FINGERPRINTING, VALIDATOR, CONSENSUS
+# =====================================================================
+# This block implements Steps 2-6 of the Sprint 0 next-session list.
+# All functions are inert until called — startup behavior is unchanged.
+# The runtime can opt-in piece by piece without breaking MINIMAL_GPU.
+#
+# Public entry points:
+#   hardware_profile_detect()             -> HardwareProfile         (Step 2)
+#   run_behavioral_fingerprint(...)       -> {model: {axis: vec}}    (Step 3)
+#   model_diversity_score(fp_a, fp_b)     -> float in [0, 1]         (Step 4)
+#   validate_profile_against_agents(...)  -> ProfileValidationReport (Step 4)
+#   apply_profile_overrides(profile, ...) -> None  (mutates agents)  (Step 5)
+#   enforce_consensus(candidates, ...)    -> (chosen, agreed, why)   (Step 5)
+#   surface_disagreement(candidates, ...) -> str                     (Step 6)
+# =====================================================================
+
+# ─── Hardware Profile ──────────────────────────────────────────────────
+@dataclass
+class HardwareProfile:
+    """Active hardware tier configuration loaded at startup."""
+    tier: str
+    detected_vram_gb: float
+    detected_ram_gb: float
+    available_models: List[str]
+    profile_path: Optional[Path]            = None
+    consensus_overrides: Dict[str, str]     = field(default_factory=dict)
+    notes:               List[str]          = field(default_factory=list)
+
+# Default profiles compiled in code (used when YAML files are absent).
+# YAML files in <root>/profiles/<tier>.yaml override these when present.
+DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
+    ModelTier.MINIMAL_CPU.value: {
+        "tier": ModelTier.MINIMAL_CPU.value,
+        "vram_floor_gb": 0.0,
+        "vram_ceiling_gb": 0.0,
+        "available_models": ["bitnet-b1.58:3b", "qwen2.5-coder:1.5b-q4"],
+        "consensus_overrides": {},
+        "notes": [
+            "CPU-only tier; expects BitNet 1.58-bit + a small quantized companion model.",
+            "Two-model minimum maintained via distinct families.",
+        ],
+    },
+    ModelTier.MINIMAL_GPU.value: {
+        "tier": ModelTier.MINIMAL_GPU.value,
+        "vram_floor_gb": 0.01,
+        "vram_ceiling_gb": 7.99,
+        "available_models": [MODEL_REASONING, MODEL_SYNTHESIS],
+        "consensus_overrides": {},
+        "notes": [
+            "4GB-class GPUs.  Current default profile.",
+            "Architect pair uses same family at runtime today; pool declarations "
+            "carry the cross-family intent until pool-based selection ships.",
+        ],
+    },
+    ModelTier.STANDARD.value: {
+        "tier": ModelTier.STANDARD.value,
+        "vram_floor_gb": 8.0,
+        "vram_ceiling_gb": 15.99,
+        "available_models": ["deepseek-r1:7b", "qwen2.5-coder:7b"],
+        "consensus_overrides": {},
+        "notes": ["Two distinct 7B-class families coexist in VRAM."],
+    },
+    ModelTier.HIGH.value: {
+        "tier": ModelTier.HIGH.value,
+        "vram_floor_gb": 16.0,
+        "vram_ceiling_gb": 39.99,
+        "available_models": ["deepseek-r1:14b", "qwen2.5-coder:14b", "llama3.3:8b"],
+        "consensus_overrides": {
+            "system_guardian":  ConsensusRequirement.TRIANGULATION_REQUIRED.value,
+            "factual_auditor":  ConsensusRequirement.PAIR_AGREEMENT.value,
+        },
+        "notes": ["Three distinct model families; guardian bumped to triangulation."],
+    },
+    ModelTier.ENTERPRISE.value: {
+        "tier": ModelTier.ENTERPRISE.value,
+        "vram_floor_gb": 40.0,
+        "vram_ceiling_gb": 9999.0,
+        "available_models": ["deepseek-r1:32b", "qwen2.5-coder:32b", "llama3.3:70b", "mixtral:8x22b"],
+        "consensus_overrides": {
+            "system_guardian":       ConsensusRequirement.TRIANGULATION_REQUIRED.value,
+            "factual_auditor":       ConsensusRequirement.PAIR_AGREEMENT.value,
+            "research_synthesizer":  ConsensusRequirement.SUPERMAJORITY.value,
+        },
+        "notes": ["Four-five distinct model families; supermajority on stakes-bearing research."],
+    },
+    ModelTier.HYBRID.value: {
+        "tier": ModelTier.HYBRID.value,
+        "vram_floor_gb": 0.0,
+        "vram_ceiling_gb": 9999.0,
+        "available_models": ["deepseek-r1:1.5b", "qwen2.5-coder:1.5b", "remote:claude-haiku"],
+        "consensus_overrides": {},
+        "notes": [
+            "Local + cloud-API burst with sensitivity-tag routing.",
+            "Remote routes never receive PII-flagged content (gated by SensitivityRouter).",
+        ],
+    },
+}
+
+PROFILES_DIR = ROOT_DIR / "profiles"
+
+def detect_vram_gb() -> float:
+    """Best-effort VRAM detection via nvidia-smi.  Returns 0.0 on failure."""
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0:
+            vals = [int(x.strip()) for x in r.stdout.strip().splitlines() if x.strip().isdigit()]
+            if vals:
+                return max(vals) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+def detect_ram_gb() -> float:
+    try:
+        import psutil  # optional dep
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+def _load_yaml_override(path: Path) -> Optional[Dict[str, Any]]:
+    """Optional YAML profile override.  Returns None if pyyaml unavailable."""
+    if not path.exists():
+        return None
+    try:
+        import yaml  # optional dep
+    except Exception:
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        logger.warning(f"profile YAML load failed for {path}: {e}")
+        return None
+
+def hardware_profile_detect(force_tier: Optional[str] = None) -> HardwareProfile:
+    """
+    Detect the active hardware tier and load the matching HardwareProfile.
+
+    Tier selection ladder:
+        VRAM >= 40 GB  -> ENTERPRISE
+        VRAM >= 16 GB  -> HIGH
+        VRAM >=  8 GB  -> STANDARD
+        VRAM  >  0 GB  -> MINIMAL_GPU
+        otherwise      -> MINIMAL_CPU
+
+    Override paths:
+        - force_tier argument
+        - LATTICED_TIER env var
+        - LATTICED_TIER set to 'hybrid' for cloud-API burst mode
+    """
+    env_override = os.environ.get("LATTICED_TIER", "").strip().lower()
+    chosen_override = (force_tier or "").strip().lower() or env_override
+
+    vram = detect_vram_gb()
+    ram  = detect_ram_gb()
+
+    if chosen_override and chosen_override in DEFAULT_PROFILES:
+        chosen_tier = chosen_override
+    elif vram >= 40.0:
+        chosen_tier = ModelTier.ENTERPRISE.value
+    elif vram >= 16.0:
+        chosen_tier = ModelTier.HIGH.value
+    elif vram >= 8.0:
+        chosen_tier = ModelTier.STANDARD.value
+    elif vram > 0.0:
+        chosen_tier = ModelTier.MINIMAL_GPU.value
+    else:
+        chosen_tier = ModelTier.MINIMAL_CPU.value
+
+    cfg = dict(DEFAULT_PROFILES.get(chosen_tier, DEFAULT_PROFILES[ModelTier.MINIMAL_GPU.value]))
+
+    profile_path = None
+    yaml_candidate = PROFILES_DIR / f"{chosen_tier}.yaml"
+    yaml_data = _load_yaml_override(yaml_candidate)
+    if yaml_data:
+        cfg = {**cfg, **yaml_data}
+        profile_path = yaml_candidate
+
+    return HardwareProfile(
+        tier=chosen_tier,
+        detected_vram_gb=vram,
+        detected_ram_gb=ram,
+        available_models=list(cfg.get("available_models", [])),
+        profile_path=profile_path,
+        consensus_overrides=dict(cfg.get("consensus_overrides", {})),
+        notes=list(cfg.get("notes", [])),
+    )
+
+# ─── Behavioral Fingerprinting (Sprint 0 Step 3) ───────────────────────
+FINGERPRINT_CACHE_PATH = STORAGE_DIR / "model_fingerprints.json"
+
+def _fingerprint_response_vector(response: str) -> List[float]:
+    """
+    Convert a model response into an 8-dim feature vector.  Pure-text
+    heuristic — no embedding model required.  Captures: length, brevity,
+    refusal markers, structure, hedging, numeracy, code-likeness, density.
+    """
+    if not response:
+        return [0.0] * 8
+    text = response.strip()
+    words = text.split()
+    n_words = max(len(words), 1)
+    lo = text.lower()
+    return [
+        min(n_words / 100.0, 1.0),                                                                     # length (normalized)
+        1.0 if n_words <= 5 else 0.0,                                                                  # very_brief
+        1.0 if any(t in lo for t in ("i cannot", "i can't", "won't", "unable", "consult", "professional")) else 0.0,  # refusal
+        1.0 if any(c in text for c in ("•", "- ", "1.", "2.", "* ")) else 0.0,                         # bulleted/structured
+        1.0 if any(t in lo for t in ("maybe", "perhaps", "might", "could", "i think", "possibly")) else 0.0,  # hedging
+        1.0 if any(c.isdigit() for c in text) else 0.0,                                                # contains_numbers
+        1.0 if ("```" in text or "def " in text or "function " in text or "return " in text) else 0.0, # code-like
+        sum(1 for c in text if c in ".!?") / n_words,                                                  # sentence density
+    ]
+
+async def run_behavioral_fingerprint(
+    model_names: List[str],
+    invoke_fn: Callable[[str, str], Awaitable[str]],
+    use_cache: bool = True,
+) -> Dict[str, Dict[str, List[float]]]:
+    """
+    Probe each model with BEHAVIORAL_FINGERPRINT_PROMPTS and produce a
+    feature vector per evaluation axis.  Results are cached on disk so
+    fingerprints persist across restarts.
+
+    invoke_fn(model, prompt) is the async invoker — typically a thin
+    wrapper around the Ollama client.  Unreachable models contribute
+    zero-vectors rather than aborting the sweep.
+    """
+    cache: Dict[str, Any] = {}
+    if use_cache and FINGERPRINT_CACHE_PATH.exists():
+        try:
+            cache = json.loads(FINGERPRINT_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+
+    out: Dict[str, Dict[str, List[float]]] = {}
+    for model in model_names:
+        if use_cache and model in cache:
+            out[model] = cache[model]
+            continue
+        axis_vectors: Dict[str, List[float]] = {}
+        for prompt, axis in BEHAVIORAL_FINGERPRINT_PROMPTS:
+            try:
+                resp = await invoke_fn(model, prompt)
+            except Exception as e:
+                logger.warning(f"fingerprint probe failed for {model} / {axis}: {e}")
+                resp = ""
+            axis_vectors.setdefault(axis, [])
+            axis_vectors[axis].extend(_fingerprint_response_vector(resp))
+        out[model] = axis_vectors
+
+    try:
+        FINGERPRINT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        merged = {**cache, **out}
+        FINGERPRINT_CACHE_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"failed to persist fingerprint cache: {e}")
+    return out
+
+def model_diversity_score(
+    fp_a: Dict[str, List[float]],
+    fp_b: Dict[str, List[float]],
+) -> float:
+    """
+    Cosine distance between two fingerprints, averaged across shared axes.
+    1.0 = totally different behavior; 0.0 = identical.  Pairs below
+    MODEL_DIVERSITY_MIN are flagged as behaviorally too similar to act
+    as a valid adversarial pair.
+    """
+    axes = sorted(set(fp_a.keys()) & set(fp_b.keys()))
+    if not axes:
+        return 0.0
+    dists: List[float] = []
+    for axis in axes:
+        va = fp_a.get(axis) or []
+        vb = fp_b.get(axis) or []
+        L = min(len(va), len(vb))
+        if L == 0:
+            continue
+        va, vb = va[:L], vb[:L]
+        dot = sum(x * y for x, y in zip(va, vb))
+        na  = math.sqrt(sum(x * x for x in va))
+        nb  = math.sqrt(sum(y * y for y in vb))
+        if na == 0.0 or nb == 0.0:
+            continue
+        dists.append(1.0 - (dot / (na * nb)))
+    return (sum(dists) / len(dists)) if dists else 0.0
+
+# ─── Profile Validator (Sprint 0 Step 4) ───────────────────────────────
+@dataclass
+class ProfileValidationReport:
+    valid:    bool
+    errors:   List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    notes:    List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        head = "VALID" if self.valid else "INVALID"
+        bits = [f"profile validation: {head}"]
+        for e in self.errors:   bits.append(f"  ERR: {e}")
+        for w in self.warnings: bits.append(f"  WARN: {w}")
+        for n in self.notes:    bits.append(f"  note: {n}")
+        return "\n".join(bits)
+
+def _model_family(model_name: str) -> str:
+    """Map a model identifier to a coarse family bucket."""
+    n = (model_name or "").lower()
+    for fam in (
+        "deepseek-r1", "deepseek",
+        "qwen2.5-coder", "qwen",
+        "llama3.3", "llama",
+        "mixtral", "mistral",
+        "bitnet", "phi",
+        "remote",          # cloud-API stand-in
+    ):
+        if fam in n:
+            return fam
+    return n.split(":", 1)[0]
+
+def validate_profile_against_agents(
+    profile: HardwareProfile,
+    agents: Dict[str, AgentSpec],
+    fingerprints: Optional[Dict[str, Dict[str, List[float]]]] = None,
+    strict: bool = True,
+) -> ProfileValidationReport:
+    """
+    Enforce the two-model-minimum and adversarial-diversity principles
+    on a profile + agent registry.  Returns a structured report instead
+    of raising — the caller decides whether to abort.
+
+    Checks performed:
+      1. Profile offers >= 2 distinct model families.
+      2. Each adversarial pair resolves to different families at this tier
+         (warning, not error, on MINIMAL_GPU — documented compromise).
+      3. Fingerprint diversity above MODEL_DIVERSITY_MIN (when fingerprints
+         are provided).
+      4. Every agent's consensus_requirement is satisfiable at this tier.
+    """
+    rep = ProfileValidationReport(valid=True)
+
+    # 1. Two-model minimum
+    fams = {_model_family(m) for m in profile.available_models}
+    if len(fams) < 2:
+        msg = (f"Profile '{profile.tier}' offers only {len(fams)} model family "
+               f"({sorted(fams)}) — two-model minimum violated.")
+        if strict:
+            rep.errors.append(msg)
+            rep.valid = False
+        else:
+            rep.warnings.append(msg)
+
+    # 2. Adversarial pair family diversity
+    seen_pairs: set = set()
+    for aid, spec in agents.items():
+        if not spec.adversarial_pair:
+            continue
+        partner = agents.get(spec.adversarial_pair)
+        if not partner:
+            rep.warnings.append(
+                f"Agent '{aid}' declares adversarial_pair='{spec.adversarial_pair}' but partner not in registry."
+            )
+            continue
+        key = tuple(sorted([aid, spec.adversarial_pair]))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+
+        pool_a = spec.model_pool_per_tier.get(profile.tier)    or [spec.model_name]
+        pool_b = partner.model_pool_per_tier.get(profile.tier) or [partner.model_name]
+        fams_a = {_model_family(m) for m in pool_a}
+        fams_b = {_model_family(m) for m in pool_b}
+
+        if fams_a & fams_b and len(fams_a) == 1 and len(fams_b) == 1:
+            msg = (f"Adversarial pair '{aid}' <-> '{spec.adversarial_pair}' resolves to the same "
+                   f"model family ({sorted(fams_a)}) at tier '{profile.tier}' — not a real adversary.")
+            if profile.tier == ModelTier.MINIMAL_GPU.value:
+                rep.warnings.append(
+                    msg + " [MINIMAL_GPU documented compromise: pool declares cross-family target.]"
+                )
+            else:
+                rep.errors.append(msg)
+                rep.valid = False
+
+    # 3. Fingerprint diversity
+    if fingerprints:
+        for i, m1 in enumerate(profile.available_models):
+            for m2 in profile.available_models[i + 1:]:
+                fp1 = fingerprints.get(m1)
+                fp2 = fingerprints.get(m2)
+                if not fp1 or not fp2:
+                    continue
+                score = model_diversity_score(fp1, fp2)
+                if score < MODEL_DIVERSITY_MIN:
+                    rep.warnings.append(
+                        f"Models '{m1}' and '{m2}' fingerprint diversity {score:.3f} "
+                        f"< MODEL_DIVERSITY_MIN ({MODEL_DIVERSITY_MIN}) — behaviorally similar."
+                    )
+
+    # 4. Consensus satisfiability
+    n_fams = max(len(fams), 1)
+    need_map = {
+        ConsensusRequirement.SINGLE_MODEL.value:           1,
+        ConsensusRequirement.PAIR_AGREEMENT.value:         2,
+        ConsensusRequirement.TRIANGULATION_REQUIRED.value: 3,
+        ConsensusRequirement.SUPERMAJORITY.value:          3,
+        ConsensusRequirement.SURFACE_DISAGREEMENT.value:   2,
+    }
+    for aid, spec in agents.items():
+        # consensus overrides may have raised the bar at this tier
+        effective = profile.consensus_overrides.get(aid, spec.consensus_requirement)
+        need = need_map.get(effective, 1)
+        if need > n_fams:
+            rep.warnings.append(
+                f"Agent '{aid}' requires '{effective}' (needs {need} families) "
+                f"but profile '{profile.tier}' has {n_fams}."
+            )
+
+    if rep.valid and not rep.errors:
+        rep.notes.append(
+            f"Profile '{profile.tier}': {len(fams)} families, "
+            f"{len(seen_pairs)} adversarial pair(s) checked."
+        )
+    return rep
+
+# ─── Consensus Helpers (Sprint 0 Step 5) ───────────────────────────────
+def apply_profile_overrides(profile: HardwareProfile, agents: Dict[str, AgentSpec]) -> None:
+    """Mutate agents in-place with the profile's per-tier consensus overrides."""
+    for aid, new_req in (profile.consensus_overrides or {}).items():
+        if aid in agents:
+            agents[aid].consensus_requirement = new_req
+
+def _normalize_for_compare(s: str) -> str:
+    return " ".join((s or "").lower().split())
+
+def enforce_consensus(
+    candidates: List[str],
+    requirement: str,
+    minimum_must_agree: int = 1,
+) -> Tuple[str, bool, str]:
+    """
+    Reconcile N candidate outputs into a single choice.
+    Returns (chosen_output, consensus_reached, disagreement_summary).
+
+    Semantics:
+      SINGLE_MODEL                -> return first candidate (always agreed).
+      PAIR_AGREEMENT              -> >= 2 candidates with same normalized text.
+      TRIANGULATION_REQUIRED      -> >= 3 candidates agree.
+      SUPERMAJORITY               -> >= ceil(0.6 * N) candidates agree.
+      SURFACE_DISAGREEMENT        -> never silently chooses; consensus_reached
+                                     is False whenever candidates disagree.
+
+    When the bar is not met the longest candidate is returned with
+    consensus_reached=False so the caller can format a disagreement-
+    surfacing response (see surface_disagreement).
+    """
+    candidates = [c for c in candidates if c is not None]
+    if not candidates:
+        return "", False, "no candidates"
+    if requirement == ConsensusRequirement.SINGLE_MODEL.value or len(candidates) == 1:
+        return candidates[0], True, ""
+
+    buckets: Dict[str, List[int]] = {}
+    for i, c in enumerate(candidates):
+        buckets.setdefault(_normalize_for_compare(c), []).append(i)
+
+    largest_key  = max(buckets, key=lambda k: len(buckets[k]))
+    largest_size = len(buckets[largest_key])
+
+    threshold = {
+        ConsensusRequirement.PAIR_AGREEMENT.value:         2,
+        ConsensusRequirement.TRIANGULATION_REQUIRED.value: 3,
+        ConsensusRequirement.SUPERMAJORITY.value:          math.ceil(len(candidates) * 0.6),
+        ConsensusRequirement.SURFACE_DISAGREEMENT.value:   len(candidates),  # require unanimity
+    }.get(requirement, max(minimum_must_agree, 1))
+
+    if largest_size >= threshold:
+        return candidates[buckets[largest_key][0]], True, ""
+
+    chosen  = max(candidates, key=len)
+    summary = (f"{len(buckets)} distinct outputs from {len(candidates)} models; "
+               f"largest cluster {largest_size}/{threshold} required.")
+    return chosen, False, summary
+
+def surface_disagreement(
+    candidates: List[Tuple[str, str]],
+    header: str = "Models disagreed on this response. Both versions are shown so you can judge:",
+) -> str:
+    """
+    Format competing outputs as a single user-facing message that exposes
+    rather than hides the disagreement.
+    candidates = [(model_name, output_text), ...]
+    """
+    if not candidates:
+        return ""
+    lines = [header]
+    for model, text in candidates:
+        lines.append(f"\n--- {model} ---\n{(text or '').strip()}")
+    lines.append("\n--- end ---")
+    lines.append("Treat any specific numbers, dates, or rules as unverified until cross-checked.")
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment

@@ -1,0 +1,17 @@
+# LatticeD hardware profile: HIGH
+# 16-24GB VRAM. Three distinct families. Guardian bumped to triangulation.
+
+tier: high
+
+available_models:
+  - deepseek-r1:14b
+  - qwen2.5-coder:14b
+  - llama3.3:8b
+
+consensus_overrides:
+  system_guardian: triangulation_required
+  factual_auditor: pair_agreement
+
+notes:
+  - "16-24GB VRAM tier."
+  - "Three distinct model families coexist; guardian + auditor escalate consensus bar."

@@ -1,0 +1,19 @@
+# LatticeD hardware profile: ENTERPRISE
+# 40-80GB VRAM. Four-five distinct families. Supermajority on stakes-bearing research.
+
+tier: enterprise
+
+available_models:
+  - deepseek-r1:32b
+  - qwen2.5-coder:32b
+  - llama3.3:70b
+  - mixtral:8x22b
+
+consensus_overrides:
+  system_guardian: triangulation_required
+  factual_auditor: pair_agreement
+  research_synthesizer: supermajority
+
+notes:
+  - "40-80GB VRAM tier."
+  - "Stakes-bearing research output requires supermajority across families."
