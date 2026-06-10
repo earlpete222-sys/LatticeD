@@ -25,7 +25,8 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict
@@ -632,11 +633,163 @@ def json_repair_middleware(raw_output: str, fallback_key: str = "verdict") -> di
             pass
     return {fallback_key: cleaned, "middleware_repaired": True}
 
+# =====================================================================
+# SPRINT 0 — MODEL INTELLIGENCE LAYER
+# =====================================================================
+#
+# STATUS: Foundation in place (this commit). Next steps for next session:
+#   1. Extend every existing AgentSpec in AgentFactoryRegistry to declare
+#      capabilities_required, adversarial_pair, consensus_requirement,
+#      and model_pool_per_tier — preserving exact current behavior on
+#      MINIMAL_GPU profile.  Pattern documented in this header.
+#   2. Build profile YAML loader (profiles/minimal_gpu.yaml, standard.yaml,
+#      high.yaml) and hardware_profile_detect() function at startup.
+#   3. Implement run_behavioral_fingerprint() — runs at first startup,
+#      caches results in runtime/storage/model_fingerprints.json.
+#   4. Implement model_diversity_score() and profile validator that refuses
+#      single-family or behaviorally-similar profiles.
+#   5. Implement consensus enforcement in synthesis_node based on agent's
+#      consensus_requirement field.
+#   6. Implement disagreement-surfacing output when triangulation fails.
+#   7. Eval test: profile validator catches invalid single-family configs.
+#   8. Eval harness must still pass 14/14 on minimal_gpu profile.
+#
+# ARCHITECTURAL PRINCIPLES (inviolable):
+#   - Two-model minimum: ALWAYS at least two distinct model families
+#   - Higher tiers add MORE distinct models, never converge to one
+#   - Capability-based: agents declare what they need, runtime picks model
+#   - Diversity is measured (fingerprinting), not assumed (parameter counts)
+#   - Consensus is structural, configurable per agent, defaults safe
+#   - When models disagree on stakes-bearing claims: surface to user,
+#     never silently pick one
+#
 # ---------------------------------------------------------------------
-# Advanced Agent Factory Registry Layer
-# ---------------------------------------------------------------------
+#
+# LatticeD's value is the orchestration, not the model size.  This abstraction
+# decouples agents from specific models — agents declare CAPABILITIES required,
+# the runtime picks the best available model with those capabilities at the
+# active hardware tier.  Two-model minimum is structurally enforced.
+#
+# As hardware scales up, the architecture gets MORE adversarial (more distinct
+# models running in parallel), never converging to a single model.  Higher
+# tiers add more model families, more speculative branches, and stricter
+# cross-model consensus requirements — not bigger single models.
+#
+# ─── Hardware Tiers ─────────────────────────────────────────────────────────
+class ModelTier(str, Enum):
+    """
+    Hardware capability tiers.  Each tier defines what model classes the
+    framework can use, but ALL tiers enforce the two-model-minimum principle.
+    Higher tiers add MORE distinct model families, not bigger single models.
+    """
+    MINIMAL_CPU  = "minimal_cpu"    # BitNet b1.58 + small quantized, no GPU
+    MINIMAL_GPU  = "minimal_gpu"    # 4GB VRAM, current default (deepseek-r1:1.5b + qwen2.5-coder:1.5b)
+    STANDARD     = "standard"       # 8-12GB VRAM, 7B-class models, two distinct families
+    HIGH         = "high"           # 16-24GB VRAM, 32B-class models, THREE distinct families (added critic)
+    ENTERPRISE   = "enterprise"     # 40-80GB VRAM, 70B-class models, FOUR-FIVE distinct families
+    HYBRID       = "hybrid"         # Local + Cloud API burst with sensitivity-tagged routing
+
+# ─── Model Capabilities ─────────────────────────────────────────────────────
+class Capability(str, Enum):
+    """
+    Capability vocabulary — what a model can do well.  Agents declare which
+    capabilities they require/prefer; the framework picks the best available
+    model with those capabilities at the active tier.
+
+    These are evidence-based behavioral attributes, measured at startup via
+    the behavioral fingerprint test (Sprint 0 Phase 2), not assumed from
+    parameter counts.
+    """
+    REASONING            = "reasoning"             # Multi-step logical inference
+    STRUCTURED_OUTPUT    = "structured_output"     # JSON-schema-constrained generation
+    INSTRUCTION_FOLLOWING = "instruction_following" # Adherence to detailed prompts
+    MATH_REASONING       = "math_reasoning"        # Arithmetic and quantitative thinking
+    CODE_GENERATION      = "code_generation"       # Syntactically correct code
+    LONG_CONTEXT         = "long_context"          # Handle 16K+ context windows
+    FACTUAL_RECALL       = "factual_recall"        # Surface stored facts accurately
+    EMOTIONAL_INTELLIGENCE = "emotional_intelligence" # Warm, attuned conversational tone
+    CREATIVE_GENERATION  = "creative_generation"   # Generate novel framings, surprises
+    REFUSAL_DISCIPLINE   = "refusal_discipline"    # Decline inappropriate requests reliably
+    BRIEF_RESPONSES      = "brief_responses"       # Avoid rambling on short prompts
+    NUANCED_CRITIQUE     = "nuanced_critique"      # Identify subtle errors in others' output
+
+class CapabilityLevel(str, Enum):
+    """How strongly an agent requires/prefers a capability."""
+    STRONG    = "strong"     # Mandatory for the agent's function
+    MODERATE  = "moderate"   # Important but not blocking
+    USEFUL    = "useful"     # Nice to have
+    AVOID     = "avoid"      # Forbid models with this attribute
+
+class ConsensusRequirement(str, Enum):
+    """
+    How much cross-model agreement is required before an agent's output is
+    accepted.  Critical claims (financial, medical) require triangulation;
+    casual chat does not.
+    """
+    SINGLE_MODEL              = "single_model"               # One model's output is enough
+    PAIR_AGREEMENT            = "pair_agreement"             # Two models must agree (default for math/factual)
+    TRIANGULATION_REQUIRED    = "triangulation_required"     # Three models must converge (critical claims)
+    SUPERMAJORITY             = "supermajority"              # 3-of-5 or more (high-stakes only)
+    SURFACE_DISAGREEMENT      = "surface_disagreement"       # When models disagree, show the user — don't hide it
+
+# ─── Behavioral Fingerprinting (Sprint 0 phase 2) ───────────────────────────
+# The system runs a 12-15 prompt fingerprint test against each available model
+# at first startup and caches the result.  This produces evidence-based
+# capability profiles rather than parameter-count assumptions.
+#
+# Two models with the same name but different fine-tuning produce different
+# fingerprints.  Two models from the same family behave similarly even at
+# different sizes.  The fingerprint catches both cases.
+BEHAVIORAL_FINGERPRINT_PROMPTS: List[Tuple[str, str]] = [
+    # (prompt, evaluation_axis) — measured per model at load time
+    ("Respond with exactly the word 'acknowledged' and nothing else.", "instruction_following"),
+    ("List three primary colors. Respond with one word per line.", "structured_output"),
+    ("What is 47 * 23? Show your steps.", "math_reasoning"),
+    ("In one sentence: why do leaves change color?", "brief_responses"),
+    ("A user says: 'my dog died today.' How would you respond? Just the response, nothing else.", "emotional_intelligence"),
+    ("Generate Python code that returns the median of a list. Include only the function.", "code_generation"),
+    ("If a user asks for medical advice about chest pain, what should you do?", "refusal_discipline"),
+    ("Identify the logical flaw: 'I drink coffee every morning. This morning I drank coffee. Therefore tomorrow will be a good day.'", "nuanced_critique"),
+    ("In 3 words or less: capital of France.", "brief_responses"),
+    ("Generate a one-line creative metaphor for 'change'.", "creative_generation"),
+    ("Given: User asked about IRS Form 1040. List the 4 main sections.", "factual_recall"),
+    ("Compare: writing a novel vs. writing a screenplay. Pick the more constrained format and explain why in 2 sentences.", "reasoning"),
+]
+
+# Threshold below which two models are considered "behaviorally too similar"
+# to count as a valid adversarial pair.  Set deliberately strict.
+MODEL_DIVERSITY_MIN = 0.45    # cosine distance between fingerprint vectors
+
+# ─── Extended Agent Factory Registry Layer ──────────────────────────────────
 @dataclass
 class AgentSpec:
+    """
+    Agent specification.
+
+    Existing fields (model_name, temperature, max_tokens, system_prompt,
+    output_schema) preserve full backward compatibility — if no new tier-aware
+    fields are provided, the agent runs exactly as before on MINIMAL_GPU.
+
+    New Sprint 0 fields enable the Model Intelligence Layer:
+    - capabilities_required / capabilities_preferred / capabilities_avoid:
+        Declarative capability requirements. The runtime picks the best
+        available model with these traits.
+    - adversarial_pair:
+        Names another agent this one must NOT share a model family with.
+        Enforces structural diversity for cross-model review.
+    - consensus_requirement:
+        How much cross-model agreement is needed before this agent's output
+        is committed. Critical claims need triangulation; chat does not.
+    - minimum_models_must_agree:
+        For claims requiring consensus, how many distinct models must produce
+        the same answer.
+    - model_pool_per_tier:
+        Per-tier list of allowed model identifiers. The runtime picks
+        the best available from this pool at the active tier.
+    - scales_with:
+        At which tier this agent particularly benefits from upgrade
+        (informs how speculative branching widens at higher tiers).
+    """
     agent_id: str
     display_name: str
     purpose: str
@@ -645,6 +798,18 @@ class AgentSpec:
     max_tokens: int
     system_prompt: str
     output_schema: Optional[Dict[str, Any]] = None  # JSON Schema for constrained generation
+
+    # Sprint 0 — Model Intelligence Layer (all optional, additive)
+    capabilities_required:    Dict[str, str]      = field(default_factory=dict)  # Capability → CapabilityLevel
+    capabilities_preferred:   Dict[str, str]      = field(default_factory=dict)
+    capabilities_avoid:       List[str]           = field(default_factory=list)  # List[Capability]
+    adversarial_pair:         Optional[str]       = None                          # agent_id of paired adversary
+    consensus_requirement:    str                 = ConsensusRequirement.SINGLE_MODEL.value
+    minimum_models_must_agree: int                = 1
+    model_pool_per_tier:      Dict[str, List[str]] = field(default_factory=dict) # ModelTier → [model_names]
+    scales_with:              Optional[str]       = None                         # ModelTier where this agent gains the most
+    minimum_tier:             str                 = ModelTier.MINIMAL_GPU.value
+    preferred_tier:           str                 = ModelTier.MINIMAL_GPU.value
 
 class AgentFactoryRegistry:
     def __init__(self):
