@@ -3313,6 +3313,229 @@ class MemoryStore:
         ]
         return before - len(self.records)
 
+# =====================================================================
+# SPRINT 7 — HARDWARE & PERFORMANCE + PHASE 2 MODEL INTELLIGENCE
+# =====================================================================
+# Two related pieces:
+#
+# 1. PerformanceLog — per-node latency tracking on a ring buffer so the
+#    runtime can answer "what's slow?" without keeping unbounded state.
+#
+# 2. Phase 2 Model Intelligence — uses behavioral fingerprints to
+#    SELECT the best available model for an agent's declared
+#    capabilities, replacing the Sprint 0 pool's positional pick with
+#    a real best-fit search.  Activation flips one line in the
+#    runtime (model_for_agent).
+#
+# 3. SpeculativeBrancher — a skeleton dispatcher that runs N model
+#    variants in parallel (capability-permitting) and lets the caller
+#    pick the winner via custom scoring.  Wired into synthesis_node
+#    in a future revision.
+# =====================================================================
+
+# ---------- 1. Performance log -----------------------------------------
+@dataclass
+class PerfSample:
+    node:        str
+    latency_ms:  float
+    timestamp:   float                              = field(default_factory=lambda: time.time())
+    metadata:    Dict[str, Any]                     = field(default_factory=dict)
+
+PERF_RING_SIZE = 1000
+
+class PerformanceLog:
+    """In-memory ring buffer of per-node latency samples + aggregates."""
+    def __init__(self, ring_size: int = PERF_RING_SIZE) -> None:
+        self.samples: List[PerfSample] = []
+        self.ring_size = ring_size
+
+    def record(self, node: str, latency_ms: float, **md: Any) -> None:
+        self.samples.append(PerfSample(node=node, latency_ms=float(latency_ms), metadata=dict(md)))
+        if len(self.samples) > self.ring_size:
+            self.samples = self.samples[-self.ring_size:]
+
+    def aggregate(self, node: Optional[str] = None) -> Dict[str, float]:
+        pool = [s for s in self.samples if (node is None or s.node == node)]
+        if not pool:
+            return {"count": 0.0}
+        lat = sorted(s.latency_ms for s in pool)
+        n = len(lat)
+        return {
+            "count":  float(n),
+            "p50":    lat[n // 2],
+            "p90":    lat[min(n - 1, int(n * 0.9))],
+            "p99":    lat[min(n - 1, int(n * 0.99))],
+            "mean":   sum(lat) / n,
+            "max":    lat[-1],
+            "min":    lat[0],
+        }
+
+    def slowest_nodes(self, top_k: int = 5) -> List[Tuple[str, float]]:
+        per_node: Dict[str, List[float]] = {}
+        for s in self.samples:
+            per_node.setdefault(s.node, []).append(s.latency_ms)
+        scored = [(n, sum(v) / len(v)) for n, v in per_node.items() if v]
+        scored.sort(key=lambda kv: -kv[1])
+        return scored[:top_k]
+
+# ---------- 2. Phase 2 Model Intelligence ------------------------------
+# Map evaluation axis (returned by fingerprint prompts) -> Capability enum value.
+FINGERPRINT_AXIS_TO_CAPABILITY: Dict[str, str] = {
+    "instruction_following":  Capability.INSTRUCTION_FOLLOWING.value,
+    "structured_output":      Capability.STRUCTURED_OUTPUT.value,
+    "math_reasoning":         Capability.MATH_REASONING.value,
+    "brief_responses":        Capability.BRIEF_RESPONSES.value,
+    "emotional_intelligence": Capability.EMOTIONAL_INTELLIGENCE.value,
+    "code_generation":        Capability.CODE_GENERATION.value,
+    "refusal_discipline":     Capability.REFUSAL_DISCIPLINE.value,
+    "nuanced_critique":       Capability.NUANCED_CRITIQUE.value,
+    "creative_generation":    Capability.CREATIVE_GENERATION.value,
+    "factual_recall":         Capability.FACTUAL_RECALL.value,
+    "reasoning":              Capability.REASONING.value,
+}
+
+# How a CapabilityLevel translates to required axis strength.  STRONG must
+# clear AXIS_STRENGTH_STRONG; MODERATE only AXIS_STRENGTH_MODERATE; AVOID
+# is a hard exclusion when the axis is strongly present.
+AXIS_STRENGTH_STRONG    = 0.6
+AXIS_STRENGTH_MODERATE  = 0.35
+
+def _axis_strength(vec: List[float]) -> float:
+    """
+    Reduce an 8-dim feature vector for one axis into a 0..1 scalar.
+    Heuristic: features 1, 3, 4, 5, 6, 7 are signal-bearing (brevity,
+    structure, hedging, numeracy, code-likeness, density).  Take the
+    mean as the strength estimate.
+    """
+    if not vec:
+        return 0.0
+    return min(1.0, sum(vec) / len(vec))
+
+def score_model_for_agent(
+    model_name: str,
+    agent_spec: "AgentSpec",
+    fingerprints: Dict[str, Dict[str, List[float]]],
+) -> Tuple[float, List[str]]:
+    """
+    Returns (score, notes).  Score is in [0, 1]; higher = better fit.
+    A return of (-1.0, [...]) signals a hard exclusion (avoid violated).
+    """
+    notes: List[str] = []
+    fp = fingerprints.get(model_name)
+    if not fp:
+        # No evidence — neutral 0.5.
+        return 0.5, [f"no fingerprint for {model_name}; neutral score"]
+
+    # Hard exclusion: capabilities_avoid
+    for cap in (agent_spec.capabilities_avoid or []):
+        axis = None
+        for ax, c in FINGERPRINT_AXIS_TO_CAPABILITY.items():
+            if c == cap:
+                axis = ax; break
+        if not axis:
+            continue
+        strength = _axis_strength(fp.get(axis, []))
+        if strength >= AXIS_STRENGTH_STRONG:
+            notes.append(f"AVOID violated: {axis} strength {strength:.2f}")
+            return -1.0, notes
+
+    # Required capabilities
+    required_ok = 0.0
+    required_total = 0.0
+    for cap, level in (agent_spec.capabilities_required or {}).items():
+        axis = None
+        for ax, c in FINGERPRINT_AXIS_TO_CAPABILITY.items():
+            if c == cap:
+                axis = ax; break
+        if not axis:
+            continue
+        strength = _axis_strength(fp.get(axis, []))
+        threshold = AXIS_STRENGTH_STRONG if level == CapabilityLevel.STRONG.value else AXIS_STRENGTH_MODERATE
+        required_total += 1.0
+        if strength >= threshold:
+            required_ok += 1.0
+        else:
+            notes.append(f"REQUIRED short: {axis} {strength:.2f} < {threshold:.2f}")
+
+    # Preferred capabilities (soft bonus)
+    preferred_bonus = 0.0
+    preferred_total = max(len(agent_spec.capabilities_preferred or {}), 1)
+    for cap in (agent_spec.capabilities_preferred or {}).keys():
+        axis = None
+        for ax, c in FINGERPRINT_AXIS_TO_CAPABILITY.items():
+            if c == cap:
+                axis = ax; break
+        if not axis:
+            continue
+        strength = _axis_strength(fp.get(axis, []))
+        if strength >= AXIS_STRENGTH_MODERATE:
+            preferred_bonus += 1.0
+
+    req_score = (required_ok / required_total) if required_total > 0 else 0.7
+    pref_score = preferred_bonus / preferred_total
+    score = 0.8 * req_score + 0.2 * pref_score
+    notes.append(f"required={required_ok:.0f}/{required_total:.0f} preferred_bonus={preferred_bonus:.0f}/{preferred_total}")
+    return score, notes
+
+def select_model_for_agent(
+    agent_spec: "AgentSpec",
+    profile: "HardwareProfile",
+    fingerprints: Optional[Dict[str, Dict[str, List[float]]]] = None,
+) -> Tuple[str, float, List[str]]:
+    """
+    Pick the best-fit model for this agent at the active tier.
+    Falls back to agent_spec.model_name if the pool is empty.
+    """
+    pool = list(agent_spec.model_pool_per_tier.get(profile.tier, []))
+    if not pool:
+        return agent_spec.model_name, 0.5, ["empty pool — falling back to model_name"]
+    if not fingerprints:
+        return pool[0], 0.5, ["no fingerprints available — first-in-pool"]
+    scored: List[Tuple[float, str, List[str]]] = []
+    for m in pool:
+        sc, notes = score_model_for_agent(m, agent_spec, fingerprints)
+        scored.append((sc, m, notes))
+    # Drop hard-excluded.
+    live = [s for s in scored if s[0] >= 0.0]
+    if not live:
+        return pool[0], 0.0, ["all pool models excluded — falling back"]
+    live.sort(key=lambda t: -t[0])
+    winner = live[0]
+    return winner[1], winner[0], winner[2]
+
+# ---------- 3. Speculative branching skeleton --------------------------
+@dataclass
+class SpeculativeBranch:
+    model_name: str
+    output: str
+    latency_ms: float
+    score: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+class SpeculativeBrancher:
+    """
+    Picks the winning output among N parallel model candidates using a
+    user-supplied scoring function.  Stateless; the runtime supplies the
+    actual async invokers in a future activation pass.
+    """
+    def __init__(self, scorer: Optional[Callable[[SpeculativeBranch], float]] = None) -> None:
+        self.scorer = scorer or (lambda b: float(len(b.output or "")))
+
+    def pick(self, branches: List[SpeculativeBranch]) -> Optional[SpeculativeBranch]:
+        if not branches:
+            return None
+        for b in branches:
+            b.score = float(self.scorer(b))
+        branches.sort(key=lambda b: -b.score)
+        return branches[0]
+
+    @staticmethod
+    def latency_weighted_scorer(weight: float = 0.001) -> Callable[[SpeculativeBranch], float]:
+        """Higher output content but lightly penalize slow branches."""
+        def _score(b: SpeculativeBranch) -> float:
+            return float(len(b.output or "")) - weight * float(b.latency_ms or 0.0)
+        return _score
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
