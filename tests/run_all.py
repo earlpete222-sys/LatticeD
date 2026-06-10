@@ -20,8 +20,10 @@ HERE = Path(__file__).resolve().parent
 
 def main() -> int:
     scripts = sorted(
-        HERE.glob("test_sprint*.py"),
-        key=lambda p: int("".join(c for c in p.stem.split("sprint")[-1] if c.isdigit()) or "0"),
+        list(HERE.glob("test_sprint*.py")) + list(HERE.glob("test_phase*.py")),
+        # sprint files sort numerically, phase files trail.
+        key=lambda p: (0 if "sprint" in p.stem else 1,
+                       int("".join(c for c in p.stem if c.isdigit()) or "0")),
     )
     if not scripts:
         print("No test_sprint*.py files found.")

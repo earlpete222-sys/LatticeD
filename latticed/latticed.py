@@ -4479,6 +4479,263 @@ def route_fact(text: str, business_store: BusinessStore, intent_threshold: float
         return ("business", active.business_id)
     return ("personal", None)
 
+# =====================================================================
+# PHASE 3 — RESEARCH BETS
+# =====================================================================
+# Three experimental tracks layered on top of Sprint 7's
+# SpeculativeBrancher.  None are wired into the runtime; they're
+# composable helpers the synthesis layer can opt into per turn.
+#
+#   A6 — TOURNAMENT
+#     Round-robin pairwise comparisons between candidate outputs from
+#     several models, scored by a user-supplied judge function.
+#     Winner = highest total wins; ties broken by total score.
+#
+#   A8 — SPECULATIVE DECODING (SKELETON)
+#     A small "draft" generator proposes a continuation; a larger
+#     "verifier" accepts or rejects per-token.  We can't run this
+#     in pure Python without LLM bindings, so this layer ships the
+#     accept/reject ledger + the verify_continuation hook that real
+#     model bindings plug into.
+#
+#   A12 — EVOLUTIONARY PROMPT SELECTION
+#     Holds a population of prompt variants per agent; each generation
+#     mutates a few survivors, scores them by a fitness function
+#     (defaults to ledger response_rate), and culls.  Persistent at
+#     runtime/storage/prompt_evolution.json.
+# =====================================================================
+
+# ---------- A6 — Tournament ------------------------------------------
+@dataclass
+class TournamentResult:
+    winner:      Optional[SpeculativeBranch]    = None
+    standings:   List[Tuple[str, int, float]]   = field(default_factory=list)   # (model, wins, total_score)
+    pairs:       List[Tuple[str, str, str]]     = field(default_factory=list)   # (a, b, winner)
+
+class Tournament:
+    """
+    Round-robin pairwise comparator over SpeculativeBranch candidates.
+    judge_fn(a, b) -> 1 if a wins, -1 if b wins, 0 for tie.
+    """
+    def __init__(self, judge_fn: Optional[Callable[[SpeculativeBranch, SpeculativeBranch], int]] = None) -> None:
+        self.judge_fn = judge_fn or self._default_judge
+
+    @staticmethod
+    def _default_judge(a: SpeculativeBranch, b: SpeculativeBranch) -> int:
+        # Longer-content wins; latency tiebreak.
+        la, lb = len(a.output or ""), len(b.output or "")
+        if la != lb:
+            return 1 if la > lb else -1
+        if a.latency_ms != b.latency_ms:
+            return 1 if a.latency_ms < b.latency_ms else -1
+        return 0
+
+    def run(self, branches: List[SpeculativeBranch]) -> TournamentResult:
+        rep = TournamentResult()
+        if not branches:
+            return rep
+        wins:  Dict[str, int]   = {b.model_name: 0 for b in branches}
+        score: Dict[str, float] = {b.model_name: 0.0 for b in branches}
+        for i in range(len(branches)):
+            for j in range(i + 1, len(branches)):
+                a, b = branches[i], branches[j]
+                verdict = self.judge_fn(a, b)
+                if verdict > 0:
+                    wins[a.model_name] += 1
+                    score[a.model_name] += 1.0
+                    rep.pairs.append((a.model_name, b.model_name, a.model_name))
+                elif verdict < 0:
+                    wins[b.model_name] += 1
+                    score[b.model_name] += 1.0
+                    rep.pairs.append((a.model_name, b.model_name, b.model_name))
+                else:
+                    score[a.model_name] += 0.5
+                    score[b.model_name] += 0.5
+                    rep.pairs.append((a.model_name, b.model_name, "tie"))
+        rep.standings = sorted(
+            [(m, wins[m], score[m]) for m in wins.keys()],
+            key=lambda t: (-t[1], -t[2]),
+        )
+        if rep.standings:
+            top_model = rep.standings[0][0]
+            for b in branches:
+                if b.model_name == top_model:
+                    rep.winner = b
+                    break
+        return rep
+
+# ---------- A8 — Speculative Decoding (skeleton) ---------------------
+@dataclass
+class SpeculativeDecodeStep:
+    draft_token:       str
+    accepted:          bool
+    verifier_token:    Optional[str]               = None
+    timestamp:         float                       = field(default_factory=lambda: time.time())
+
+class SpeculativeDecoder:
+    """
+    Skeleton.  Real implementations plug a draft model + verifier model
+    via the verify_fn callable.  This class records the accept/reject
+    ledger so downstream observability has structured data even before
+    real model bindings exist.
+    """
+    def __init__(self, verify_fn: Optional[Callable[[str, str], bool]] = None) -> None:
+        # verify_fn(prefix, draft_token) -> True if verifier accepts.
+        self.verify_fn: Callable[[str, str], bool] = verify_fn or (lambda prefix, tok: True)
+        self.ledger: List[SpeculativeDecodeStep] = []
+
+    def step(self, prefix: str, draft_token: str) -> SpeculativeDecodeStep:
+        accepted = bool(self.verify_fn(prefix, draft_token))
+        rec = SpeculativeDecodeStep(draft_token=draft_token, accepted=accepted,
+                                     verifier_token=draft_token if accepted else None)
+        self.ledger.append(rec)
+        return rec
+
+    def acceptance_rate(self) -> float:
+        if not self.ledger:
+            return 0.0
+        return sum(1 for s in self.ledger if s.accepted) / len(self.ledger)
+
+    def decode(self, prefix: str, draft_tokens: List[str]) -> Tuple[str, float]:
+        out = prefix
+        for tok in draft_tokens:
+            step = self.step(out, tok)
+            if step.accepted:
+                out += tok
+            else:
+                break  # real verifier would emit its own token here
+        return out, self.acceptance_rate()
+
+# ---------- A12 — Evolutionary Prompt Selection ---------------------
+@dataclass
+class PromptVariant:
+    text:           str
+    generation:     int                          = 0
+    parent:         Optional[str]                = None
+    score:          float                        = 0.0
+    samples:        int                          = 0
+    last_evaluated: Optional[float]              = None
+    metadata:       Dict[str, Any]               = field(default_factory=dict)
+
+PROMPT_EVOLUTION_PATH = STORAGE_DIR / "prompt_evolution.json"
+
+class PromptEvolutionEngine:
+    """
+    Per-agent population of prompt variants with simple GA-style
+    mutation + selection.  Fitness is supplied by the caller (default
+    is ledger.response_rate for that agent's prompts).  Persistent.
+    """
+    def __init__(
+        self,
+        path: Path = PROMPT_EVOLUTION_PATH,
+        population_size: int = 8,
+        elite_keep: int = 3,
+        mutation_rate: float = 0.3,
+    ) -> None:
+        self.path = path
+        self.populations: Dict[str, List[PromptVariant]] = {}   # agent_id -> variants
+        self.population_size = population_size
+        self.elite_keep = elite_keep
+        self.mutation_rate = mutation_rate
+
+    def load(self) -> "PromptEvolutionEngine":
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                self.populations = {
+                    a: [PromptVariant(**v) for v in vs]
+                    for a, vs in (data.get("populations") or {}).items()
+                }
+            except Exception as e:
+                logger.warning(f"prompt evolution load failed: {e}")
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"populations": {a: [asdict(v) for v in vs]
+                                    for a, vs in self.populations.items()}}
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def seed(self, agent_id: str, prompt: str) -> PromptVariant:
+        pop = self.populations.setdefault(agent_id, [])
+        for v in pop:
+            if v.text == prompt:
+                return v
+        v = PromptVariant(text=prompt, generation=0)
+        pop.append(v)
+        return v
+
+    def record_outcome(self, agent_id: str, prompt: str, success: bool) -> None:
+        pop = self.populations.setdefault(agent_id, [])
+        for v in pop:
+            if v.text == prompt:
+                v.samples += 1
+                # online mean of 1/0 success.
+                v.score = ((v.score * (v.samples - 1)) + (1.0 if success else 0.0)) / v.samples
+                v.last_evaluated = time.time()
+                return
+        # If unseen, seed it and record.
+        nv = self.seed(agent_id, prompt)
+        nv.samples = 1
+        nv.score = 1.0 if success else 0.0
+        nv.last_evaluated = time.time()
+
+    def best(self, agent_id: str) -> Optional[PromptVariant]:
+        pop = self.populations.get(agent_id) or []
+        if not pop:
+            return None
+        return sorted(pop, key=lambda v: (-v.score, -v.samples))[0]
+
+    @staticmethod
+    def _mutate(text: str) -> str:
+        """
+        Deterministic-style structural mutations: swap a few simple
+        function words, prepend/append a softener.  No LLM required.
+        """
+        swaps = [
+            ("Always", "Usually"), ("Never", "Rarely"),
+            ("must", "should"),     ("should", "could"),
+            ("brief", "concise"),   ("concise", "tight"),
+            ("warm", "kind"),       ("warm,", "friendly,"),
+        ]
+        out = text
+        applied = 0
+        for a, b in swaps:
+            if a in out and applied < 2:
+                out = out.replace(a, b, 1)
+                applied += 1
+        if applied == 0 and len(out) > 40:
+            out = out + " Keep responses focused."
+        return out
+
+    def evolve(self, agent_id: str) -> List[PromptVariant]:
+        """
+        Selection step: keep elite_keep top performers, fill the rest
+        of the population with mutations of the elite.
+        """
+        pop = self.populations.setdefault(agent_id, [])
+        if not pop:
+            return pop
+        pop.sort(key=lambda v: (-v.score, -v.samples))
+        elite = pop[:self.elite_keep]
+        children: List[PromptVariant] = []
+        gen = max((v.generation for v in pop), default=0) + 1
+        slots = max(0, self.population_size - len(elite))
+        i = 0
+        while len(children) < slots and elite:
+            parent = elite[i % len(elite)]
+            mutated = self._mutate(parent.text)
+            if not any(v.text == mutated for v in elite + children):
+                children.append(PromptVariant(text=mutated, generation=gen,
+                                              parent=parent.text[:80]))
+            i += 1
+            if i > slots * 4:
+                break   # mutation space exhausted
+        self.populations[agent_id] = elite + children
+        return self.populations[agent_id]
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
