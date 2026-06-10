@@ -4761,6 +4761,11 @@ class LatticeContextConfig:
     apply_voice_evolution:     bool        = True
     apply_profile_validation:  bool        = True
     strict_validation:         bool        = False     # warn-only on MINIMAL_GPU
+    # Sprint 19 — encryption at rest.  When passphrase is None or empty,
+    # stores keep plain JSON behavior.  Set via env LATTICED_PASSPHRASE
+    # or pass explicitly to LatticeContext.boot(passphrase=...).
+    passphrase:                Optional[str] = None
+    encrypt_at_rest:           bool        = False
 
 class LatticeContext:
     """
@@ -4770,6 +4775,20 @@ class LatticeContext:
     """
     def __init__(self, config: Optional[LatticeContextConfig] = None) -> None:
         self.config = config or LatticeContextConfig()
+
+        # Sprint 19 — install at-rest encryption BEFORE store .load() runs.
+        # Falls back to LATTICED_PASSPHRASE env var when not explicit.
+        passphrase = self.config.passphrase
+        if not passphrase and self.config.encrypt_at_rest:
+            passphrase = os.environ.get("LATTICED_PASSPHRASE") or None
+        if not self.config.encrypt_at_rest and not passphrase:
+            # Honor env-only opt-in: if the user just set the env var,
+            # turn encryption on automatically.
+            env_pp = os.environ.get("LATTICED_PASSPHRASE")
+            if env_pp:
+                passphrase = env_pp
+        install_encrypted_persistence(passphrase if passphrase else None)
+        self._passphrase_active = bool(passphrase)
 
         # Hardware profile + agent registry validation.
         self.profile = hardware_profile_detect(force_tier=self.config.tier_override)
@@ -5712,6 +5731,416 @@ def register_export_import_tools(server: "MCPServer", ctx: "LatticeContext") -> 
 
     server.register_tool("export_identity", _tool_export)
     server.register_tool("import_identity", _tool_import)
+
+# =====================================================================
+# SPRINT 19 — ENCRYPTION AT REST
+# =====================================================================
+# Optional disk-level encryption for the persistent JSON stores
+# (identity / business / snapshots / continuity / curiosity / voice /
+# prompt_evolution).  Opt-in: when LATTICED_PASSPHRASE is not set, the
+# stores keep using plain JSON exactly as before.
+#
+# Cryptography path:
+#   - Preferred: cryptography.fernet (AES-128-CBC + HMAC-SHA256).
+#     Key derived from passphrase via PBKDF2-HMAC-SHA256 with a per-file
+#     16-byte salt and KDF_ITERATIONS rounds.
+#   - Fallback: XOR + SHA256-derived stream key (NOT cryptographic, but
+#     keeps the API consistent).  Emits a one-time warning if used.
+#
+# Storage format (utf-8 JSON wrapper on disk):
+#   {
+#     "schema":      <int>,                          # ENCRYPTED_SCHEMA_VERSION
+#     "alg":         "fernet" | "xor-sha256",
+#     "salt_b64":    <base64>,
+#     "iter":        <int>,                          # KDF iterations (0 for xor)
+#     "ciphertext":  <base64>,                       # the encrypted JSON payload
+#   }
+#
+# Public entry points:
+#   encrypt_payload(plaintext, passphrase)  -> str (utf-8 JSON envelope)
+#   decrypt_payload(envelope, passphrase)   -> str (plaintext JSON)
+#   atomic_write_encrypted(path, plaintext, passphrase)
+#   atomic_read_encrypted(path, passphrase)  -> plaintext JSON  (or '' on missing)
+#   LatticeContextConfig.passphrase / .encrypt_at_rest
+#   LatticeContext.boot(passphrase=..., encrypt_at_rest=True)
+# =====================================================================
+
+import base64 as _b64
+import hashlib as _hashlib
+import secrets as _secrets
+
+ENCRYPTED_SCHEMA_VERSION = 1
+KDF_ITERATIONS = 200_000
+
+_XOR_FALLBACK_WARNED = False
+
+def _try_fernet_class():
+    try:
+        from cryptography.fernet import Fernet  # type: ignore
+        return Fernet
+    except Exception:
+        return None
+
+def _derive_key(passphrase: str, salt: bytes, iterations: int = KDF_ITERATIONS) -> bytes:
+    """PBKDF2-HMAC-SHA256 -> 32-byte key.  Used both for Fernet (b64 encoded)
+    and as the seed for the XOR fallback."""
+    if not isinstance(passphrase, str):
+        passphrase = str(passphrase or "")
+    return _hashlib.pbkdf2_hmac("sha256",
+                                  passphrase.encode("utf-8"),
+                                  salt,
+                                  iterations,
+                                  dklen=32)
+
+def _xor_stream(key: bytes, length: int) -> bytes:
+    """Generate `length` bytes by hashing the key with an increasing counter.
+    This is NOT cryptographically secure — it's a stand-in so the API works
+    end-to-end without the cryptography package installed."""
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        h = _hashlib.sha256(key + counter.to_bytes(8, "big")).digest()
+        out.extend(h)
+        counter += 1
+    return bytes(out[:length])
+
+def encrypt_payload(plaintext: str, passphrase: str) -> str:
+    """Return a JSON envelope (utf-8 string) holding the encrypted payload."""
+    if passphrase is None or passphrase == "":
+        raise ValueError("encrypt_payload requires a non-empty passphrase")
+
+    salt = _secrets.token_bytes(16)
+    pt   = (plaintext or "").encode("utf-8")
+    Fernet = _try_fernet_class()
+    if Fernet is not None:
+        key = _derive_key(passphrase, salt)
+        fkey = _b64.urlsafe_b64encode(key)
+        token = Fernet(fkey).encrypt(pt)
+        env = {
+            "schema":     ENCRYPTED_SCHEMA_VERSION,
+            "alg":        "fernet",
+            "salt_b64":   _b64.b64encode(salt).decode("ascii"),
+            "iter":       KDF_ITERATIONS,
+            "ciphertext": _b64.b64encode(token).decode("ascii"),
+        }
+    else:
+        global _XOR_FALLBACK_WARNED
+        if not _XOR_FALLBACK_WARNED:
+            logger.warning(
+                "cryptography.fernet not available — using XOR-SHA256 fallback "
+                "for at-rest encryption.  Install 'cryptography' for real security."
+            )
+            _XOR_FALLBACK_WARNED = True
+        key = _derive_key(passphrase, salt, iterations=max(1, KDF_ITERATIONS // 100))
+        stream = _xor_stream(key, len(pt))
+        ct = bytes(b ^ s for b, s in zip(pt, stream))
+        # Bind a HMAC-SHA256 over the ciphertext so wrong-passphrase decrypts fail loudly.
+        mac = _hashlib.sha256(key + ct).digest()[:16]
+        env = {
+            "schema":     ENCRYPTED_SCHEMA_VERSION,
+            "alg":        "xor-sha256",
+            "salt_b64":   _b64.b64encode(salt).decode("ascii"),
+            "iter":       max(1, KDF_ITERATIONS // 100),
+            "ciphertext": _b64.b64encode(ct).decode("ascii"),
+            "mac_b64":    _b64.b64encode(mac).decode("ascii"),
+        }
+    return json.dumps(env, separators=(",", ":"))
+
+class DecryptError(Exception):
+    pass
+
+def decrypt_payload(envelope: str, passphrase: str) -> str:
+    """Decrypt a JSON envelope from encrypt_payload.  Raises DecryptError
+    on wrong passphrase or tampered ciphertext."""
+    try:
+        env = json.loads(envelope)
+    except Exception as e:
+        raise DecryptError(f"envelope_parse_error:{e}")
+    if not isinstance(env, dict) or "alg" not in env or "ciphertext" not in env:
+        raise DecryptError("invalid_envelope")
+    try:
+        salt = _b64.b64decode(env["salt_b64"])
+        ct   = _b64.b64decode(env["ciphertext"])
+        iters = int(env.get("iter", KDF_ITERATIONS))
+    except Exception as e:
+        raise DecryptError(f"envelope_decode_error:{e}")
+
+    if env["alg"] == "fernet":
+        Fernet = _try_fernet_class()
+        if Fernet is None:
+            raise DecryptError("cryptography_missing_for_fernet_envelope")
+        key = _derive_key(passphrase, salt, iterations=iters)
+        fkey = _b64.urlsafe_b64encode(key)
+        try:
+            return Fernet(fkey).decrypt(ct).decode("utf-8")
+        except Exception as e:
+            raise DecryptError(f"fernet_decrypt_failed:{type(e).__name__}")
+
+    if env["alg"] == "xor-sha256":
+        key = _derive_key(passphrase, salt, iterations=iters)
+        try:
+            expected_mac = _b64.b64decode(env.get("mac_b64", ""))
+        except Exception:
+            expected_mac = b""
+        mac = _hashlib.sha256(key + ct).digest()[:16]
+        # Constant-time compare.
+        if len(mac) != len(expected_mac) or not _secrets.compare_digest(mac, expected_mac):
+            raise DecryptError("xor_mac_mismatch")
+        stream = _xor_stream(key, len(ct))
+        pt = bytes(b ^ s for b, s in zip(ct, stream))
+        try:
+            return pt.decode("utf-8")
+        except Exception:
+            raise DecryptError("xor_utf8_decode_failed")
+
+    raise DecryptError(f"unknown_alg:{env.get('alg')}")
+
+# ---------- file helpers --------------------------------------------
+def _looks_like_envelope(raw: str) -> bool:
+    if not raw or raw[0] != "{":
+        return False
+    try:
+        env = json.loads(raw)
+        return isinstance(env, dict) \
+               and env.get("schema") == ENCRYPTED_SCHEMA_VERSION \
+               and "ciphertext" in env
+    except Exception:
+        return False
+
+def atomic_write_encrypted(path: Path, plaintext: str, passphrase: str) -> None:
+    """Write encrypted payload to `path` via tmp + os.replace."""
+    envelope = encrypt_payload(plaintext, passphrase)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(envelope, encoding="utf-8")
+    os.replace(tmp, path)
+
+def atomic_read_encrypted(path: Path, passphrase: str) -> str:
+    """Read either an encrypted envelope (decrypted with passphrase) OR a
+    plain JSON file (backward-compat).  Missing file -> empty string."""
+    if not path.exists():
+        return ""
+    raw = path.read_text(encoding="utf-8")
+    if _looks_like_envelope(raw):
+        return decrypt_payload(raw, passphrase)
+    return raw   # legacy plain file
+
+# ---------- mixin applied to existing stores -------------------------
+def install_encrypted_persistence(passphrase: Optional[str]) -> None:
+    """
+    Patch IdentityStore / BusinessStore / SnapshotStore / EngagementLedger /
+    ContinuityStore / VoiceEvolutionEngine / PromptEvolutionEngine .save() and
+    .load() to encrypt at rest when passphrase is truthy.
+
+    When passphrase is None or empty, this is a no-op -- the stores keep
+    their plain-JSON behavior (LatticeContext default).  Calling this twice
+    is safe -- the second call rewrites the overrides with the new key.
+    """
+    if not passphrase:
+        # Restore default (no-op) state -- we only ever set the helpers when
+        # a passphrase is active; absence means plain stores.
+        for cls in (IdentityStore, BusinessStore, SnapshotStore,
+                    EngagementLedger, ContinuityStore,
+                    VoiceEvolutionEngine, PromptEvolutionEngine):
+            if hasattr(cls, "_lat_orig_save"):
+                cls.save = cls._lat_orig_save                  # type: ignore[attr-defined]
+                cls.load = cls._lat_orig_load                  # type: ignore[attr-defined]
+                delattr(cls, "_lat_orig_save")
+                delattr(cls, "_lat_orig_load")
+        return
+
+    # Capture originals once.
+    for cls in (IdentityStore, BusinessStore, SnapshotStore,
+                EngagementLedger, ContinuityStore,
+                VoiceEvolutionEngine, PromptEvolutionEngine):
+        if not hasattr(cls, "_lat_orig_save"):
+            cls._lat_orig_save = cls.save                       # type: ignore[attr-defined]
+            cls._lat_orig_load = cls.load                       # type: ignore[attr-defined]
+
+    pp = passphrase
+
+    def _encrypted_save_identity(self):
+        self.doc.updated = time.time()
+        atomic_write_encrypted(self.path, self.doc.to_json(), pp)
+
+    def _encrypted_load_identity(self):
+        try:
+            raw = atomic_read_encrypted(self.path, pp)
+        except DecryptError as e:
+            logger.warning(f"encrypted load failed at {self.path}: {e}")
+            return self
+        if raw:
+            try:
+                self.doc = IdentityDocument.from_json(raw)
+            except Exception as e:
+                logger.warning(f"encrypted identity load failed: {e}")
+        return self
+
+    IdentityStore.save = _encrypted_save_identity              # type: ignore[assignment]
+    IdentityStore.load = _encrypted_load_identity              # type: ignore[assignment]
+
+    def _encrypted_save_business(self):
+        payload = {
+            "active_id": self.active_id,
+            "profiles": {bid: asdict(bp) for bid, bp in self.profiles.items()},
+        }
+        atomic_write_encrypted(self.path,
+                                 json.dumps(payload, indent=2, default=str), pp)
+
+    def _encrypted_load_business(self):
+        try:
+            raw = atomic_read_encrypted(self.path, pp)
+        except DecryptError as e:
+            logger.warning(f"encrypted load failed at {self.path}: {e}")
+            return self
+        if not raw:
+            return self
+        try:
+            data = json.loads(raw)
+            self.active_id = data.get("active_id")
+            for bid, profile_raw in (data.get("profiles") or {}).items():
+                bp = BusinessProfile(
+                    business_id=profile_raw.get("business_id", bid),
+                    display_name=profile_raw.get("display_name", bid),
+                    legal_entity=profile_raw.get("legal_entity"),
+                    role=profile_raw.get("role"),
+                    domains_in_scope=list(profile_raw.get("domains_in_scope", [])),
+                    north_stars=[NorthStar(**n) for n in profile_raw.get("north_stars", [])],
+                    rules=[ConstitutionalRule(**r) for r in profile_raw.get("rules", [])],
+                    facts=[IdentityFact(**f) for f in profile_raw.get("facts", [])],
+                    created=float(profile_raw.get("created", time.time())),
+                    metadata=dict(profile_raw.get("metadata", {})),
+                )
+                self.profiles[bp.business_id] = bp
+        except Exception as e:
+            logger.warning(f"encrypted business load failed: {e}")
+        return self
+
+    BusinessStore.save = _encrypted_save_business              # type: ignore[assignment]
+    BusinessStore.load = _encrypted_load_business              # type: ignore[assignment]
+
+    def _encrypted_save_snapshots(self):
+        if len(self.snapshots) > MAX_SNAPSHOTS:
+            ordered = sorted(self.snapshots.items(),
+                              key=lambda kv: kv[1].captured_at)
+            self.snapshots = dict(ordered[-MAX_SNAPSHOTS:])
+        payload = {"snapshots": {l: asdict(s) for l, s in self.snapshots.items()}}
+        atomic_write_encrypted(self.path,
+                                 json.dumps(payload, indent=2, default=str), pp)
+
+    def _encrypted_load_snapshots(self):
+        try:
+            raw = atomic_read_encrypted(self.path, pp)
+        except DecryptError as e:
+            logger.warning(f"encrypted load failed at {self.path}: {e}")
+            return self
+        if not raw:
+            return self
+        try:
+            data = json.loads(raw)
+            for label, raw_snap in (data.get("snapshots") or {}).items():
+                self.snapshots[label] = SelfSnapshot(**raw_snap)
+        except Exception as e:
+            logger.warning(f"encrypted snapshot load failed: {e}")
+        return self
+
+    SnapshotStore.save = _encrypted_save_snapshots             # type: ignore[assignment]
+    SnapshotStore.load = _encrypted_load_snapshots             # type: ignore[assignment]
+
+    def _encrypted_save_ledger(self):
+        payload = {"entries": [asdict(e) for e in self.entries]}
+        atomic_write_encrypted(self.path,
+                                 json.dumps(payload, indent=2, default=str), pp)
+
+    def _encrypted_load_ledger(self):
+        try:
+            raw = atomic_read_encrypted(self.path, pp)
+        except DecryptError as e:
+            logger.warning(f"encrypted load failed at {self.path}: {e}")
+            return self
+        if not raw:
+            return self
+        try:
+            data = json.loads(raw)
+            self.entries = [CuriosityEngagement(**e) for e in data.get("entries", [])]
+        except Exception as e:
+            logger.warning(f"encrypted ledger load failed: {e}")
+        return self
+
+    EngagementLedger.save = _encrypted_save_ledger             # type: ignore[assignment]
+    EngagementLedger.load = _encrypted_load_ledger             # type: ignore[assignment]
+
+    def _encrypted_save_continuity(self):
+        payload = {"tokens": [asdict(t) for t in self.tokens[-MAX_CONTINUITY_TOKENS:]]}
+        atomic_write_encrypted(self.path,
+                                 json.dumps(payload, indent=2, default=str), pp)
+
+    def _encrypted_load_continuity(self):
+        try:
+            raw = atomic_read_encrypted(self.path, pp)
+        except DecryptError as e:
+            logger.warning(f"encrypted load failed at {self.path}: {e}")
+            return self
+        if not raw:
+            return self
+        try:
+            data = json.loads(raw)
+            self.tokens = [ContinuityToken(**t) for t in data.get("tokens", [])]
+        except Exception as e:
+            logger.warning(f"encrypted continuity load failed: {e}")
+        return self
+
+    ContinuityStore.save = _encrypted_save_continuity          # type: ignore[assignment]
+    ContinuityStore.load = _encrypted_load_continuity          # type: ignore[assignment]
+
+    def _encrypted_save_voice(self):
+        payload = {"profiles": {aid: asdict(p) for aid, p in self.profiles.items()}}
+        atomic_write_encrypted(self.path,
+                                 json.dumps(payload, indent=2, default=str), pp)
+
+    def _encrypted_load_voice(self):
+        try:
+            raw = atomic_read_encrypted(self.path, pp)
+        except DecryptError as e:
+            logger.warning(f"encrypted load failed at {self.path}: {e}")
+            return self
+        if not raw:
+            return self
+        try:
+            data = json.loads(raw)
+            self.profiles = {aid: VoiceProfile(**v)
+                              for aid, v in (data.get("profiles") or {}).items()}
+        except Exception as e:
+            logger.warning(f"encrypted voice load failed: {e}")
+        return self
+
+    VoiceEvolutionEngine.save = _encrypted_save_voice          # type: ignore[assignment]
+    VoiceEvolutionEngine.load = _encrypted_load_voice          # type: ignore[assignment]
+
+    def _encrypted_save_prompt_evo(self):
+        payload = {"populations": {a: [asdict(v) for v in vs]
+                                     for a, vs in self.populations.items()}}
+        atomic_write_encrypted(self.path,
+                                 json.dumps(payload, indent=2, default=str), pp)
+
+    def _encrypted_load_prompt_evo(self):
+        try:
+            raw = atomic_read_encrypted(self.path, pp)
+        except DecryptError as e:
+            logger.warning(f"encrypted load failed at {self.path}: {e}")
+            return self
+        if not raw:
+            return self
+        try:
+            data = json.loads(raw)
+            self.populations = {a: [PromptVariant(**v) for v in vs]
+                                  for a, vs in (data.get("populations") or {}).items()}
+        except Exception as e:
+            logger.warning(f"encrypted prompt evolution load failed: {e}")
+        return self
+
+    PromptEvolutionEngine.save = _encrypted_save_prompt_evo    # type: ignore[assignment]
+    PromptEvolutionEngine.load = _encrypted_load_prompt_evo    # type: ignore[assignment]
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
