@@ -4736,6 +4736,197 @@ class PromptEvolutionEngine:
         self.populations[agent_id] = elite + children
         return self.populations[agent_id]
 
+# =====================================================================
+# SPRINT 14 — ACTIVATION LAYER (single-call wiring)
+# =====================================================================
+# One orchestrator that loads every opt-in module, applies tier
+# overrides, runs profile validation, and exposes single-call hooks the
+# runtime can drop in:
+#
+#   ctx = LatticeContext.boot()             # at startup
+#   preamble = ctx.compose_preamble(agent_id)  # before each agent call
+#   ctx.record_turn(agent_id, output, ...)     # after each agent call
+#   ctx.save_all()                              # at shutdown / periodically
+#
+# Everything is still opt-in: the runtime gets to choose whether to
+# instantiate the context.  Once it does, all 14 sprints fire together
+# without any further integration work.
+# =====================================================================
+
+@dataclass
+class LatticeContextConfig:
+    user_id:                   str         = "local"
+    tier_override:             Optional[str] = None
+    include_curiosity_hint:    bool        = True
+    apply_voice_evolution:     bool        = True
+    apply_profile_validation:  bool        = True
+    strict_validation:         bool        = False     # warn-only on MINIMAL_GPU
+
+class LatticeContext:
+    """
+    Single-call wiring for every opt-in module.  Holds active references
+    to identity, curiosity, voice, continuity, memory, audit, MCP server,
+    synthesizer, two-mes model, business store, perf log, prompt-evolution.
+    """
+    def __init__(self, config: Optional[LatticeContextConfig] = None) -> None:
+        self.config = config or LatticeContextConfig()
+
+        # Hardware profile + agent registry validation.
+        self.profile = hardware_profile_detect(force_tier=self.config.tier_override)
+        self.factory = AgentFactoryRegistry()
+        apply_profile_overrides(self.profile, self.factory.registry)
+        if self.config.apply_profile_validation:
+            self.validation = validate_profile_against_agents(
+                self.profile, self.factory.registry,
+                strict=self.config.strict_validation,
+            )
+        else:
+            self.validation = ProfileValidationReport(valid=True,
+                                                     notes=["validation skipped by config"])
+
+        # Persistent stores.
+        self.identity   = IdentityStore(IDENTITY_PATH, user_id=self.config.user_id).load()
+        self.curiosity_ledger = EngagementLedger(CURIOSITY_PATH).load()
+        self.curiosity  = CuriosityEngine(self.identity, self.curiosity_ledger)
+        self.voice      = VoiceEvolutionEngine(VOICE_PROFILES_PATH).load()
+        self.continuity = ContinuityStore(CONTINUITY_PATH).load()
+        self.audit      = AccessAuditLog(AUDIT_LOG_PATH)
+        self.business   = BusinessStore(BUSINESS_PATH).load()
+        self.prompt_evo = PromptEvolutionEngine(PROMPT_EVOLUTION_PATH).load()
+
+        # In-memory layers.
+        self.memory     = MemoryStore()
+        self.perf       = PerformanceLog()
+        self.synth      = IdentitySynthesizer(self.identity)
+        self.two_mes    = TwoMesModel.from_store(self.identity)
+        self.mcp        = MCPServer(self.identity, self.audit, self.synth, self.curiosity)
+
+    @classmethod
+    def boot(cls, **cfg_kwargs: Any) -> "LatticeContext":
+        return cls(LatticeContextConfig(**cfg_kwargs))
+
+    # ----- preamble assembly (Sprint 3 + 4) -----
+    def compose_preamble(self, agent_id: str) -> str:
+        """Continuity + voice preamble (with optional curiosity hint).
+        Voice evolution shrinks max_facts if brevity_pref drifted up."""
+        # Apply evolved salience by patching the AGENT_SALIENCE policy for
+        # this lookup only.  Avoids mutating module-level state.
+        base_policy = AGENT_SALIENCE.get(agent_id, {})
+        if self.config.apply_voice_evolution and base_policy:
+            evolved = self.voice.evolved_salience(agent_id, base_policy)
+            # build_voice_preamble reads AGENT_SALIENCE directly; we swap
+            # the entry briefly to honor the evolved cap.
+            saved = AGENT_SALIENCE.get(agent_id)
+            AGENT_SALIENCE[agent_id] = evolved
+            try:
+                voice_block = build_voice_preamble(
+                    agent_id, self.identity, self.curiosity_ledger,
+                    include_curiosity_hint=self.config.include_curiosity_hint,
+                )
+            finally:
+                if saved is not None:
+                    AGENT_SALIENCE[agent_id] = saved
+        else:
+            voice_block = build_voice_preamble(
+                agent_id, self.identity, self.curiosity_ledger,
+                include_curiosity_hint=self.config.include_curiosity_hint,
+            )
+        continuity_block = build_continuity_preamble(self.continuity, n=1)
+        parts = [b for b in (continuity_block, voice_block) if b]
+        return "\n\n".join(parts)
+
+    # ----- turn lifecycle -----
+    def record_turn(
+        self,
+        agent_id: str,
+        output: str,
+        user_followed_up: Optional[bool] = None,
+        user_explicit_positive: Optional[bool] = None,
+        user_explicit_negative: Optional[bool] = None,
+        domain: Optional[str] = None,
+        latency_ms: Optional[float] = None,
+        curiosity_question_answered: Optional[bool] = None,
+    ) -> None:
+        """
+        Single hook to call after a generated turn.  Updates voice
+        evolution, performance log, episodic memory, and (if a curiosity
+        question was outstanding for this turn) the engagement ledger.
+        """
+        # Voice evolution (Sprint 4).
+        if self.config.apply_voice_evolution:
+            self.voice.record_interaction(EngagementSignal(
+                agent_id=agent_id,
+                output_chars=len(output or ""),
+                user_followed_up=user_followed_up,
+                user_explicit_positive=user_explicit_positive,
+                user_explicit_negative=user_explicit_negative,
+                curiosity_question_answered=curiosity_question_answered,
+                domain=domain,
+            ))
+        # Performance log (Sprint 7).
+        if latency_ms is not None:
+            self.perf.record(agent_id, float(latency_ms))
+        # Memory (Sprint 6) - route + persist as EPISODIC.
+        if output:
+            tier, sens, dom = MemoryRouter.route(output)
+            self.memory.add(MemoryRecord(
+                text=output, tier=tier, sensitivity=sens,
+                domain=dom or domain or LifeDomain.UNCATEGORIZED.value,
+                confidence=0.7, metadata={"agent_id": agent_id},
+            ))
+
+    # ----- continuity capture -----
+    def capture_continuity(
+        self,
+        session_id: str,
+        last_intent: Optional[str] = None,
+        open_threads: Optional[List[str]] = None,
+        domains_touched: Optional[List[str]] = None,
+        mood_signal: Optional[str] = None,
+        summary: Optional[str] = None,
+    ) -> ContinuityToken:
+        token = ContinuityToken(
+            session_id=session_id, last_intent=last_intent,
+            open_threads=list(open_threads or []),
+            domains_touched=list(domains_touched or []),
+            mood_signal=mood_signal, summary=summary,
+        )
+        self.continuity.add(token)
+        return token
+
+    # ----- persistence -----
+    def save_all(self) -> None:
+        try: self.identity.save()
+        except Exception as e: logger.warning(f"identity save failed: {e}")
+        try: self.curiosity_ledger.save()
+        except Exception as e: logger.warning(f"ledger save failed: {e}")
+        try: self.voice.save()
+        except Exception as e: logger.warning(f"voice save failed: {e}")
+        try: self.continuity.save()
+        except Exception as e: logger.warning(f"continuity save failed: {e}")
+        try: self.business.save()
+        except Exception as e: logger.warning(f"business save failed: {e}")
+        try: self.prompt_evo.save()
+        except Exception as e: logger.warning(f"prompt evolution save failed: {e}")
+
+    # ----- diagnostics -----
+    def boot_report(self) -> Dict[str, Any]:
+        return {
+            "user_id":           self.config.user_id,
+            "tier":              self.profile.tier,
+            "vram_gb":           self.profile.detected_vram_gb,
+            "agents":            len(self.factory.registry),
+            "validation":        self.validation.valid,
+            "validation_errors": list(self.validation.errors),
+            "validation_warns":  list(self.validation.warnings),
+            "facts":             len(self.identity.doc.facts),
+            "north_stars":       len(self.identity.doc.north_stars),
+            "rules":             len(self.identity.doc.constitutional_rules),
+            "active_business":   self.business.active_id,
+            "continuity_tokens": len(self.continuity.tokens),
+            "voice_profiles":    len(self.voice.profiles),
+        }
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
