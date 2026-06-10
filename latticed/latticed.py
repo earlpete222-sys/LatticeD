@@ -4800,6 +4800,9 @@ class LatticeContext:
         self.synth      = IdentitySynthesizer(self.identity)
         self.two_mes    = TwoMesModel.from_store(self.identity)
         self.mcp        = MCPServer(self.identity, self.audit, self.synth, self.curiosity)
+        # Sprint 17 — auto-register extended tool/resource surface +
+        # bind a SnapshotStore to ctx so drift_report can be called from MCP.
+        self.snapshots  = register_extended_mcp_surface(self.mcp, self)
 
     @classmethod
     def boot(cls, **cfg_kwargs: Any) -> "LatticeContext":
@@ -4908,6 +4911,8 @@ class LatticeContext:
         except Exception as e: logger.warning(f"business save failed: {e}")
         try: self.prompt_evo.save()
         except Exception as e: logger.warning(f"prompt evolution save failed: {e}")
+        try: self.snapshots.save()
+        except Exception as e: logger.warning(f"snapshots save failed: {e}")
 
     # ----- diagnostics -----
     def boot_report(self) -> Dict[str, Any]:
@@ -5131,6 +5136,257 @@ class MCPStdioBridge:
                     await writer.drain()
                 except Exception:
                     pass
+
+# =====================================================================
+# SPRINT 17 — EXPANDED MCP TOOL SURFACE
+# =====================================================================
+# Exposes the deeper intelligence layers (Sprints 5/10/11/12) through
+# MCP so external clients can call them.  Adds:
+#
+#   snapshots persistence (SnapshotStore) -> drift over time
+#
+#   tools/call:
+#     capture_snapshot          freeze a present-self snapshot
+#     detect_drift              compare two snapshots by label
+#     tension_domains           rank where coaching has leverage
+#     get_recombined_insights   cross-domain fact bridges
+#     extract_aspects           structured attributes from text
+#     predict_engagement        likely response rate for a prompt
+#     route_business_fact       personal vs business routing
+#     get_continuity            recent session tokens
+#
+#   resources/read:
+#     identity://tension                top tension domains
+#     identity://aspects                aspect index (name -> values)
+#     identity://drift/<a>/<b>          drift report by snapshot labels
+#     identity://continuity             recent continuity tokens
+#     business://list                   all business profiles
+#     business://active                 current active business
+#
+# Wired by register_extended_mcp_surface(server, ctx).
+# =====================================================================
+
+SNAPSHOTS_PATH = STORAGE_DIR / "snapshots.json"
+MAX_SNAPSHOTS = 50
+
+class SnapshotStore:
+    """Disk-backed labelled SelfSnapshots so drift can be computed across
+    sessions."""
+    def __init__(self, path: Path = SNAPSHOTS_PATH) -> None:
+        self.path: Path = path
+        self.snapshots: Dict[str, SelfSnapshot] = {}
+
+    def load(self) -> "SnapshotStore":
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                for label, raw in (data.get("snapshots") or {}).items():
+                    self.snapshots[label] = SelfSnapshot(**raw)
+            except Exception as e:
+                logger.warning(f"snapshot load failed: {e}")
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Trim to most-recent MAX_SNAPSHOTS by captured_at.
+        if len(self.snapshots) > MAX_SNAPSHOTS:
+            ordered = sorted(self.snapshots.items(),
+                             key=lambda kv: kv[1].captured_at)
+            self.snapshots = dict(ordered[-MAX_SNAPSHOTS:])
+        payload = {"snapshots": {l: asdict(s) for l, s in self.snapshots.items()}}
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def put(self, label: str, snap: SelfSnapshot) -> None:
+        self.snapshots[label] = snap
+
+    def get(self, label: str) -> Optional[SelfSnapshot]:
+        return self.snapshots.get(label)
+
+    def labels(self) -> List[str]:
+        return sorted(self.snapshots.keys(),
+                      key=lambda l: self.snapshots[l].captured_at)
+
+
+# ---------- registration helper -------------------------------------
+def register_extended_mcp_surface(
+    server: "MCPServer",
+    ctx: "LatticeContext",
+    snapshots: Optional[SnapshotStore] = None,
+) -> SnapshotStore:
+    """
+    Register the Sprint 17 tools and resources on an existing MCPServer.
+    `ctx` provides identity, voice, ledger, business, snapshots.
+    """
+    snaps = snapshots or SnapshotStore().load()
+
+    # ---- tools ----
+    def _tool_capture_snapshot(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        label = str(params.get("label") or f"snap-{int(time.time())}")
+        snap = capture_present(ctx.identity, label=label)
+        snaps.put(label, snap)
+        try:
+            snaps.save()
+        except Exception as e:
+            logger.warning(f"snapshot save failed: {e}")
+        return {"ok": True, "label": label,
+                "fact_count": snap.fact_count,
+                "domains": list(snap.domain_fact_counts.keys())}
+
+    def _tool_detect_drift(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        earlier_label = params.get("earlier") or params.get("from")
+        later_label   = params.get("later")   or params.get("to")
+        if not earlier_label or not later_label:
+            return {"ok": False, "error": "missing_labels",
+                    "available": snaps.labels()}
+        e = snaps.get(earlier_label)
+        l = snaps.get(later_label)
+        if not e or not l:
+            return {"ok": False, "error": "unknown_label",
+                    "available": snaps.labels()}
+        rep = drift_report(e, l)
+        return {"ok": True, "summary": rep.summary,
+                "fact_delta": rep.fact_delta,
+                "new_domains": rep.new_domains,
+                "lost_domains": rep.lost_domains,
+                "confidence_changes": rep.confidence_changes,
+                "earliest_at": rep.earliest_at,
+                "latest_at": rep.latest_at}
+
+    def _tool_tension_domains(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        model = TwoMesModel.from_store(ctx.identity)
+        threshold = float(params.get("threshold", 0.4))
+        tens = high_tension_domains(model, threshold=threshold)
+        return {"ok": True, "domains": [{"domain": d, "tension": round(s, 3)}
+                                          for d, s in tens]}
+
+    def _tool_recombined(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        top_k = int(params.get("top_k", 5))
+        ins = recombine_memory(ctx.identity, top_k=top_k)
+        return {"ok": True, "insights": [
+            {"domain_a": i.domain_a, "domain_b": i.domain_b,
+             "fact_a": i.fact_a, "fact_b": i.fact_b,
+             "link_terms": i.link_terms, "score": i.score, "note": i.note}
+            for i in ins
+        ]}
+
+    def _tool_extract_aspects(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        text = str(params.get("text", ""))
+        if not text:
+            return {"ok": False, "error": "empty_text"}
+        asps = extract_aspects(text)
+        return {"ok": True, "aspects": [
+            {"name": a.name, "value": a.value, "confidence": a.confidence,
+             "domain": a.domain}
+            for a in asps
+        ]}
+
+    def _tool_predict_engagement(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        prompt = str(params.get("prompt", ""))
+        if not prompt:
+            return {"ok": False, "error": "empty_prompt"}
+        pred = predict_engagement(
+            prompt, ctx.identity,
+            ledger=ctx.curiosity_ledger,
+            voice=ctx.voice,
+            agent_id=str(params.get("agent_id", "fast_mentor")),
+        )
+        return {"ok": True,
+                "estimated_response_rate": round(pred.estimated_response_rate, 3),
+                "likely_domain": pred.likely_domain,
+                "notes": pred.notes}
+
+    def _tool_route_business_fact(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        text = str(params.get("text", ""))
+        if not text:
+            return {"ok": False, "error": "empty_text"}
+        route, bid = route_fact(text, ctx.business)
+        return {"ok": True, "route": route, "business_id": bid}
+
+    def _tool_get_continuity(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        n = int(params.get("n", 3))
+        tokens = ctx.continuity.latest(n)
+        return {"ok": True, "tokens": [asdict(t) for t in tokens]}
+
+    server.register_tool("capture_snapshot",         _tool_capture_snapshot)
+    server.register_tool("detect_drift",             _tool_detect_drift)
+    server.register_tool("tension_domains",          _tool_tension_domains)
+    server.register_tool("get_recombined_insights",  _tool_recombined)
+    server.register_tool("extract_aspects",          _tool_extract_aspects)
+    server.register_tool("predict_engagement",       _tool_predict_engagement)
+    server.register_tool("route_business_fact",      _tool_route_business_fact)
+    server.register_tool("get_continuity",           _tool_get_continuity)
+
+    # ---- resources ----
+    def _res_tension(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        model = TwoMesModel.from_store(ctx.identity)
+        tens = high_tension_domains(model)
+        return {"ok": True,
+                "domains": [{"domain": d, "tension": round(s, 3)}
+                              for d, s in tens]}
+
+    def _res_aspects(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        idx = AspectIndex.from_store(ctx.identity)
+        return {"ok": True, "names": idx.names(),
+                "counts": {n: len(idx.get(n)) for n in idx.names()}}
+
+    def _res_drift(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        suffix = params.get("_suffix") or ""
+        parts = [p for p in suffix.split("/") if p]
+        if len(parts) < 2:
+            return {"ok": False, "error": "expected_two_labels",
+                    "available": snaps.labels()}
+        e = snaps.get(parts[0]); l = snaps.get(parts[1])
+        if not e or not l:
+            return {"ok": False, "error": "unknown_label",
+                    "available": snaps.labels()}
+        rep = drift_report(e, l)
+        return {"ok": True, "summary": rep.summary,
+                "fact_delta": rep.fact_delta,
+                "new_domains": rep.new_domains,
+                "lost_domains": rep.lost_domains,
+                "confidence_changes": rep.confidence_changes}
+
+    def _res_continuity(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        n = int(params.get("n", 5))
+        return {"ok": True, "tokens": [asdict(t) for t in ctx.continuity.latest(n)]}
+
+    def _res_business_list(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True,
+                "active_id": ctx.business.active_id,
+                "profiles": [
+                    {"business_id": bp.business_id,
+                     "display_name": bp.display_name,
+                     "legal_entity": bp.legal_entity,
+                     "role": bp.role,
+                     "fact_count": len(bp.facts),
+                     "north_star_count": len(bp.north_stars)}
+                    for bp in ctx.business.profiles.values()
+                ]}
+
+    def _res_business_active(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        bp = ctx.business.active()
+        if not bp:
+            return {"ok": True, "active": None}
+        return {"ok": True, "active": {
+            "business_id": bp.business_id,
+            "display_name": bp.display_name,
+            "legal_entity": bp.legal_entity,
+            "role": bp.role,
+            "domains_in_scope": bp.domains_in_scope,
+            "fact_count": len(bp.facts),
+            "north_star_count": len(bp.north_stars),
+        }}
+
+    server.register_resource("identity://tension",     _res_tension)
+    server.register_resource("identity://aspects",     _res_aspects)
+    server.register_resource("identity://drift",       _res_drift)   # +/<a>/<b>
+    server.register_resource("identity://continuity",  _res_continuity)
+    server.register_resource("business://list",        _res_business_list)
+    server.register_resource("business://active",      _res_business_active)
+
+    return snaps
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
