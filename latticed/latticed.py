@@ -4324,6 +4324,161 @@ def recombine_memory(
     insights.sort(key=lambda x: -x.score)
     return insights[:top_k]
 
+# =====================================================================
+# SPRINT 12 — BUSINESS MODE
+# =====================================================================
+# An optional persona layer over identity.  A user can run one or many
+# businesses; each gets its own scoped IdentityStore-equivalent so
+# business advice doesn't leak personal data and vice versa.
+#
+# Public entry points:
+#   BusinessProfile             one business entity (LLC, brand, project)
+#   BusinessStore               disk-backed registry of profiles +
+#                               currently-active selection
+#   detect_business_intent(text)  did the user just speak as the business?
+#   route_fact(text, store)       returns ('personal', None) or
+#                               ('business', business_id) for downstream
+#                               write targeting.
+# =====================================================================
+
+@dataclass
+class BusinessProfile:
+    business_id:        str
+    display_name:       str
+    legal_entity:       Optional[str]               = None      # 'LLC', 'C-corp', 'sole prop'
+    role:               Optional[str]               = None      # 'founder', 'owner', 'contractor'
+    domains_in_scope:   List[str]                   = field(default_factory=lambda: [LifeDomain.BUSINESS.value, LifeDomain.FINANCIAL.value])
+    north_stars:        List[NorthStar]             = field(default_factory=list)
+    rules:              List[ConstitutionalRule]    = field(default_factory=list)
+    facts:              List[IdentityFact]          = field(default_factory=list)
+    created:            float                       = field(default_factory=lambda: time.time())
+    metadata:           Dict[str, Any]              = field(default_factory=dict)
+
+BUSINESS_PATH = STORAGE_DIR / "business.json"
+
+# Keywords that mark a turn as business-context-shaped.
+_BUSINESS_INTENT_TERMS = [
+    "our company", "our team", "our product", "our customers", "our client",
+    "the business", "the company", "our startup", "our pricing", "our launch",
+    "our revenue", "our runway", "investor", "vc", "fundraise", "burn rate",
+    "ltv", "cac", "p&l", "roadmap",
+    "as a founder", "as ceo", "my llc", "my c-corp", "my company",
+]
+
+class BusinessStore:
+    """Disk-backed registry of business profiles + active selection."""
+    def __init__(self, path: Path = BUSINESS_PATH) -> None:
+        self.path: Path = path
+        self.profiles: Dict[str, BusinessProfile] = {}
+        self.active_id: Optional[str] = None
+
+    def load(self) -> "BusinessStore":
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                self.active_id = data.get("active_id")
+                for bid, raw in (data.get("profiles") or {}).items():
+                    bp = BusinessProfile(
+                        business_id=raw.get("business_id", bid),
+                        display_name=raw.get("display_name", bid),
+                        legal_entity=raw.get("legal_entity"),
+                        role=raw.get("role"),
+                        domains_in_scope=list(raw.get("domains_in_scope", [])),
+                        north_stars=[NorthStar(**n) for n in raw.get("north_stars", [])],
+                        rules=[ConstitutionalRule(**r) for r in raw.get("rules", [])],
+                        facts=[IdentityFact(**f) for f in raw.get("facts", [])],
+                        created=float(raw.get("created", time.time())),
+                        metadata=dict(raw.get("metadata", {})),
+                    )
+                    self.profiles[bp.business_id] = bp
+            except Exception as e:
+                logger.warning(f"business store load failed: {e}")
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "active_id": self.active_id,
+            "profiles": {bid: asdict(bp) for bid, bp in self.profiles.items()},
+        }
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def register(self, profile: BusinessProfile, set_active: bool = False) -> None:
+        self.profiles[profile.business_id] = profile
+        if set_active or self.active_id is None:
+            self.active_id = profile.business_id
+
+    def set_active(self, business_id: Optional[str]) -> None:
+        if business_id is None or business_id in self.profiles:
+            self.active_id = business_id
+
+    def active(self) -> Optional[BusinessProfile]:
+        if self.active_id is None:
+            return None
+        return self.profiles.get(self.active_id)
+
+    def add_fact(self, business_id: str, text: str, **kw: Any) -> Optional[IdentityFact]:
+        bp = self.profiles.get(business_id)
+        if not bp:
+            return None
+        dom = kw.get("domain") or classify_domain(text)
+        sens = kw.get("sensitivity") or SensitivityRouter.classify_text(text)
+        # Dedup
+        norm = " ".join(text.lower().split())
+        for f in bp.facts:
+            if " ".join(f.text.lower().split()) == norm:
+                f.seen_count += 1
+                f.last_seen = time.time()
+                f.confidence = min(1.0, f.confidence + 0.05)
+                return f
+        fact = IdentityFact(text=text, domain=dom, sensitivity=sens,
+                            confidence=float(kw.get("confidence", 0.7)),
+                            source=kw.get("source", "business_mode"))
+        bp.facts.append(fact)
+        return fact
+
+    def add_north_star(self, business_id: str, text: str,
+                       domain: Optional[str] = None, weight: float = 1.0) -> Optional[NorthStar]:
+        bp = self.profiles.get(business_id)
+        if not bp:
+            return None
+        ns = NorthStar(text=text, domain=domain or LifeDomain.BUSINESS.value, weight=weight)
+        bp.north_stars.append(ns)
+        return ns
+
+# ---------- routing -----------------------------------------------------
+def detect_business_intent(text: str) -> float:
+    """0..1 score that this text is business-context-shaped."""
+    if not text:
+        return 0.0
+    lo = text.lower()
+    hits = sum(1 for t in _BUSINESS_INTENT_TERMS if t in lo)
+    if not hits:
+        return 0.0
+    return min(1.0, 0.3 + 0.2 * hits)   # 1 hit -> 0.5, 2 -> 0.7, 3+ -> 0.9..
+
+def route_fact(text: str, business_store: BusinessStore, intent_threshold: float = 0.4) -> Tuple[str, Optional[str]]:
+    """
+    Decide where a fact about the user should land.  Returns
+    ('personal', None) or ('business', business_id).
+
+    Routing logic:
+      1. If no active business -> personal.
+      2. If business intent score >= threshold -> active business.
+      3. If domain is BUSINESS -> active business.
+      4. Otherwise -> personal.
+    """
+    active = business_store.active()
+    if not active:
+        return ("personal", None)
+    intent = detect_business_intent(text)
+    domain = classify_domain(text)
+    if intent >= intent_threshold or domain == LifeDomain.BUSINESS.value:
+        return ("business", active.business_id)
+    return ("personal", None)
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
