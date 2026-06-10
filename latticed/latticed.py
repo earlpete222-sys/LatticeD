@@ -1905,7 +1905,7 @@ class LifeDomain(str, Enum):
 # semantic embedding pipeline (Chroma) can override at runtime; this is
 # the deterministic baseline that works without one.
 DOMAIN_KEYWORDS: Dict[str, List[str]] = {
-    LifeDomain.CAREER.value:        ["job", "boss", "career", "promotion", "salary", "raise", "interview", "resume", "coworker"],
+    LifeDomain.CAREER.value:        ["job", "boss", "career", "promotion", "raise", "interview", "resume", "coworker", "work as", "designer", "engineer", "manager", "agency", "office", "team"],
     LifeDomain.BUSINESS.value:      ["company", "startup", "client", "revenue", "product", "founder", "launch", "customer", "ltd", "llc"],
     LifeDomain.FINANCIAL.value:     ["budget", "savings", "debt", "rent", "mortgage", "401k", "ira", "invest", "expense", "income", "loan", "salary", "paycheck", "afford", "$"],
     LifeDomain.HEALTH.value:        ["sleep", "exercise", "doctor", "diet", "stress", "anxiety", "tired", "workout", "work out", "weight", "therapy", "gym", "run", "fitness"],
@@ -1954,10 +1954,14 @@ class Sensitivity(str, Enum):
 # Heuristic patterns the SensitivityRouter uses to seed-tag incoming text
 # when no explicit tag is provided.  Conservative on purpose: false-high
 # is preferable to false-low for personal data.
+_SENSITIVITY_PATTERNS_SECRET: List[str] = [
+    r"\bpassword\b", r"\bpasscode\b", r"\bapi[_ -]?key\b",
+    r"\bprivate[_ ]?key\b", r"\bsecret[_ ]?key\b", r"\baccess[_ ]?token\b",
+]
 _SENSITIVITY_PATTERNS_HIGH: List[str] = [
     r"\bssn\b", r"\bsocial security\b", r"\b\d{3}-\d{2}-\d{4}\b",            # SSN
     r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b",                              # credit card-ish
-    r"\bpassword\b", r"\bpasscode\b", r"\bpin\b",
+    r"\bpin\b",
     r"\bmedical\b", r"\bdiagnos(is|ed)\b", r"\bprescription\b", r"\bdosage\b",
     r"\btherapist\b", r"\bsuicid", r"\bself[- ]harm\b",
 ]
@@ -2146,6 +2150,9 @@ class SensitivityRouter:
         if not text:
             return Sensitivity.LOW.value
         lo = text.lower()
+        for pat in _SENSITIVITY_PATTERNS_SECRET:
+            if re.search(pat, lo):
+                return Sensitivity.SECRET.value
         for pat in _SENSITIVITY_PATTERNS_HIGH:
             if re.search(pat, lo):
                 return Sensitivity.HIGH.value
@@ -3136,6 +3143,175 @@ class IdentitySynthesizer:
             summary = self.synthesize_domain(dom)
             if summary.fact_count > 0:
                 self.store.doc.domain_summaries[dom] = summary.narrative
+
+# =====================================================================
+# SPRINT 6 — MEMORY ARCHITECTURE ADVANCES
+# =====================================================================
+# A tiered memory model on top of the existing belief_graph + ChromaDB.
+#
+#   WORKING   in-conversation scratch (held in process state)
+#   EPISODIC  per-turn record with decay (45-day half-life)
+#   SEMANTIC  consolidated, deduped, low-decay general knowledge
+#   IDENTITY  durable identity facts (delegated to IdentityStore)
+#
+# Public entry points (all opt-in):
+#   MemoryRecord                a tier-tagged, decayable memory cell
+#   apply_decay(record, now)    confidence with exponential half-life
+#   MemoryRouter.route(text)    picks the right tier + sensitivity tag
+#   MemoryStore.add(record)     dedupe + consolidate hint
+#   MemoryStore.search(query)   tier-aware retrieval (recency * decay)
+#   MemoryStore.consolidate()   episodic -> semantic when seen_count ≥ 3
+#   MemoryStore.purge_expired() drops records below MIN_LIVE_CONFIDENCE
+# =====================================================================
+
+class MemoryTier(str, Enum):
+    WORKING  = "working"
+    EPISODIC = "episodic"
+    SEMANTIC = "semantic"
+    IDENTITY = "identity"
+
+# Per-tier half-life (days).  WORKING is in-RAM-only; IDENTITY is handled
+# elsewhere and listed here for completeness.
+TIER_HALFLIFE_DAYS: Dict[str, float] = {
+    MemoryTier.WORKING.value:  0.0,        # ephemeral
+    MemoryTier.EPISODIC.value: 45.0,
+    MemoryTier.SEMANTIC.value: 365.0,
+    MemoryTier.IDENTITY.value: 1825.0,     # ~5 years before any decay matters
+}
+MIN_LIVE_CONFIDENCE = 0.05
+CONSOLIDATION_FLOOR = 3   # seen_count required to promote episodic -> semantic
+
+@dataclass
+class MemoryRecord:
+    text: str
+    tier: str                                       = MemoryTier.EPISODIC.value
+    sensitivity: str                                = Sensitivity.MEDIUM.value
+    domain: str                                     = LifeDomain.UNCATEGORIZED.value
+    confidence: float                               = 0.7
+    seen_count: int                                 = 1
+    created: float                                  = field(default_factory=lambda: time.time())
+    last_seen: float                                = field(default_factory=lambda: time.time())
+    metadata: Dict[str, Any]                        = field(default_factory=dict)
+
+def apply_decay(record: MemoryRecord, now: Optional[float] = None) -> float:
+    """
+    Exponential half-life decay.  Returns the EFFECTIVE confidence at
+    `now` without mutating the record.  WORKING tier never persists so
+    its effective confidence is whatever the record carries.
+    """
+    now = now if now is not None else time.time()
+    halflife_days = TIER_HALFLIFE_DAYS.get(record.tier, 45.0)
+    if halflife_days <= 0:
+        return record.confidence
+    age_days = max(0.0, (now - record.last_seen) / 86400.0)
+    factor = 0.5 ** (age_days / halflife_days)
+    return max(0.0, record.confidence * factor)
+
+class MemoryRouter:
+    """
+    Picks the right tier + sensitivity tag for incoming text.
+    Heuristic baseline; ChromaDB-similarity overrides are plug-ins
+    that the runtime can layer on later.
+    """
+
+    @staticmethod
+    def route(text: str, hint_tier: Optional[str] = None) -> Tuple[str, str, str]:
+        """Returns (tier, sensitivity, domain)."""
+        sensitivity = SensitivityRouter.classify_text(text)
+        domain      = classify_domain(text)
+
+        # SECRET content never goes beyond WORKING.
+        if sensitivity == Sensitivity.SECRET.value:
+            return MemoryTier.WORKING.value, sensitivity, domain
+
+        # Identity-shaped statements ("I am...", "I have...", "I want...")
+        # route to IDENTITY when the domain is meaningful.
+        is_identity_shaped = bool(re.match(r"\s*i\s+(am|have|live|work|like|love|hate|want|believe)", text.lower()))
+        if hint_tier:
+            return hint_tier, sensitivity, domain
+        if is_identity_shaped and domain != LifeDomain.UNCATEGORIZED.value:
+            return MemoryTier.IDENTITY.value, sensitivity, domain
+        # Default everything else to EPISODIC.
+        return MemoryTier.EPISODIC.value, sensitivity, domain
+
+class MemoryStore:
+    """
+    Tiered in-memory store.  Persistence is handled by the existing
+    SQLite belief_graph + ChromaDB at the runtime layer — this class is
+    the logical model the runtime will eventually delegate to.
+    """
+    def __init__(self) -> None:
+        self.records: List[MemoryRecord] = []
+
+    def add(self, record: MemoryRecord) -> MemoryRecord:
+        norm = " ".join(record.text.lower().split())
+        for r in self.records:
+            if " ".join(r.text.lower().split()) == norm and r.tier == record.tier:
+                r.seen_count += 1
+                r.last_seen   = time.time()
+                r.confidence  = min(1.0, r.confidence + 0.05)
+                return r
+        self.records.append(record)
+        return record
+
+    def search(
+        self, query: str, limit: int = 5,
+        tiers: Optional[Iterable[str]] = None,
+        max_sensitivity: Optional[str] = None,
+    ) -> List[Tuple[MemoryRecord, float]]:
+        """
+        Lexical search; returns (record, score) sorted by score desc.
+        score = (token-overlap) * effective_confidence.
+        Filter by tier + sensitivity ceiling for privacy-aware retrieval.
+        """
+        order = {s.value: i for i, s in enumerate(
+            [Sensitivity.LOW, Sensitivity.MEDIUM, Sensitivity.HIGH, Sensitivity.SECRET])}
+        ceiling = order.get(max_sensitivity, 3) if max_sensitivity else 3
+        qtokens = set(re.findall(r"[a-zA-Z]+", query.lower()))
+        if not qtokens:
+            return []
+        tier_set = set(tiers) if tiers else None
+        scored: List[Tuple[MemoryRecord, float]] = []
+        for r in self.records:
+            if tier_set and r.tier not in tier_set:
+                continue
+            if order.get(r.sensitivity, 1) > ceiling:
+                continue
+            rtokens = set(re.findall(r"[a-zA-Z]+", r.text.lower()))
+            if not rtokens:
+                continue
+            overlap = len(qtokens & rtokens) / max(len(qtokens | rtokens), 1)
+            if overlap == 0.0:
+                continue
+            score = overlap * apply_decay(r)
+            if score > 0:
+                scored.append((r, score))
+        scored.sort(key=lambda x: -x[1])
+        return scored[:limit]
+
+    def consolidate(self) -> int:
+        """
+        Promote stable episodic memories to semantic when seen_count
+        >= CONSOLIDATION_FLOOR.  Returns the number of promotions.
+        """
+        promoted = 0
+        for r in self.records:
+            if (r.tier == MemoryTier.EPISODIC.value
+                    and r.seen_count >= CONSOLIDATION_FLOOR
+                    and apply_decay(r) > 0.5):
+                r.tier = MemoryTier.SEMANTIC.value
+                r.metadata["consolidated_at"] = time.time()
+                promoted += 1
+        return promoted
+
+    def purge_expired(self) -> int:
+        """Drop records whose effective confidence has fallen below the floor."""
+        before = len(self.records)
+        self.records = [
+            r for r in self.records
+            if r.tier == MemoryTier.WORKING.value or apply_decay(r) >= MIN_LIVE_CONFIDENCE
+        ]
+        return before - len(self.records)
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
