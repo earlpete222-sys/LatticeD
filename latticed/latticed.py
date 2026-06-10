@@ -2960,6 +2960,183 @@ class VoiceEvolutionEngine:
         # default=True means "ask unless score has clearly drifted below 0.7"
         return score >= 0.7 if default else score >= 1.3
 
+# =====================================================================
+# SPRINT 5 — IDENTITY SYNTHESIS LAYER
+# =====================================================================
+# Synthesizes the raw IdentityFact stream into a coherent, queryable
+# user portrait.  Deterministic baseline (theme clustering by keyword
+# overlap; contradiction detection by verb opposition).  Sprint 7 will
+# layer LLM-generated narrative summaries on top using the same data
+# structures.
+#
+# Public entry points:
+#   IdentitySynthesizer(store)
+#     .synthesize_domain(domain)   -> DomainSummary
+#     .synthesize_portrait()       -> UserPortrait    (across all domains)
+#     .detect_contradictions()     -> List[Contradiction]
+#     .write_back_summaries()      -> updates store.doc.domain_summaries
+# =====================================================================
+
+@dataclass
+class DomainSummary:
+    domain: str
+    fact_count: int                                 = 0
+    avg_confidence: float                           = 0.0
+    themes: List[str]                               = field(default_factory=list)
+    representative_facts: List[str]                 = field(default_factory=list)
+    narrative: str                                  = ""
+
+@dataclass
+class Contradiction:
+    domain: str
+    fact_a: str
+    fact_b: str
+    reason: str
+    score: float                                    = 0.5
+
+@dataclass
+class UserPortrait:
+    generated_at: float                             = field(default_factory=lambda: time.time())
+    domains: Dict[str, DomainSummary]               = field(default_factory=dict)
+    north_stars: List[str]                          = field(default_factory=list)
+    rules: List[str]                                = field(default_factory=list)
+    contradictions: List[Contradiction]             = field(default_factory=list)
+    one_line_summary: str                           = ""
+
+# Verbs that, paired across two facts in the same domain, suggest
+# contradiction.  Conservative — we surface a soft signal, never claim
+# certainty.
+_OPPOSING_VERB_PAIRS: List[Tuple[str, str]] = [
+    ("love",  "hate"),   ("like",  "dislike"),
+    ("want",  "avoid"),  ("enjoy", "dread"),
+    ("am",    "am not"), ("do",    "don't"),
+    ("have",  "don't have"),
+]
+
+# Stopwords for theme keyword extraction.
+_THEME_STOPWORDS = set(
+    "i me my we us our the a an and or but if of in on at to for with from "
+    "is am are was were be been being do does did don dont have has had this "
+    "that those these as by it about not no yes you your they them their".split()
+)
+
+class IdentitySynthesizer:
+    """Builds DomainSummary / UserPortrait from an IdentityStore."""
+
+    def __init__(self, store: "IdentityStore") -> None:
+        self.store = store
+
+    # ----- theme extraction -----
+    @staticmethod
+    def _extract_themes(texts: List[str], top_k: int = 5) -> List[str]:
+        freq: Dict[str, int] = {}
+        for t in texts:
+            for w in re.findall(r"[a-zA-Z][a-zA-Z'-]+", t.lower()):
+                if w in _THEME_STOPWORDS or len(w) <= 2:
+                    continue
+                freq[w] = freq.get(w, 0) + 1
+        # Themes are words appearing in at least 2 facts (or the most
+        # frequent if fewer facts).
+        if len(texts) >= 2:
+            promoted = {w: c for w, c in freq.items() if c >= 2}
+            if promoted:
+                return [w for w, _ in sorted(promoted.items(), key=lambda kv: -kv[1])[:top_k]]
+        return [w for w, _ in sorted(freq.items(), key=lambda kv: -kv[1])[:top_k]]
+
+    # ----- per-domain -----
+    def synthesize_domain(self, domain: str) -> DomainSummary:
+        facts = self.store.facts_for_domain(domain)
+        s = DomainSummary(domain=domain, fact_count=len(facts))
+        if not facts:
+            return s
+        s.avg_confidence = sum(f.confidence for f in facts) / len(facts)
+        texts = [f.text for f in facts]
+        s.themes = self._extract_themes(texts)
+        ranked = sorted(facts, key=lambda f: (-(f.confidence), -(f.seen_count)))
+        s.representative_facts = [f.text for f in ranked[:3]]
+        # Compact narrative — deterministic, no LLM required.
+        s.narrative = self._narrate(domain, s)
+        return s
+
+    @staticmethod
+    def _narrate(domain: str, s: DomainSummary) -> str:
+        if not s.representative_facts:
+            return ""
+        themes = (" / ".join(s.themes[:3])).strip()
+        themes_part = f" Themes: {themes}." if themes else ""
+        conf = f" (avg confidence {s.avg_confidence:.2f})"
+        lead = s.representative_facts[0].rstrip(".")
+        more = len(s.representative_facts) - 1
+        more_part = f" Plus {more} more attested fact{'s' if more > 1 else ''}." if more > 0 else ""
+        return f"[{domain}] {lead}.{more_part}{themes_part}{conf}"
+
+    # ----- contradictions -----
+    def detect_contradictions(self) -> List[Contradiction]:
+        out: List[Contradiction] = []
+        seen_pairs: set = set()
+        for dom_enum in LifeDomain:
+            dom = dom_enum.value
+            if dom == LifeDomain.UNCATEGORIZED.value:
+                continue
+            facts = self.store.facts_for_domain(dom)
+            for i, f1 in enumerate(facts):
+                for f2 in facts[i + 1:]:
+                    key = tuple(sorted([f1.text, f2.text]))
+                    if key in seen_pairs:
+                        continue
+                    seen_pairs.add(key)
+                    lo1, lo2 = f1.text.lower(), f2.text.lower()
+                    for pos, neg in _OPPOSING_VERB_PAIRS:
+                        if (pos in lo1 and neg in lo2) or (neg in lo1 and pos in lo2):
+                            # Boost when subject keywords overlap too.
+                            shared = set(re.findall(r"[a-zA-Z]+", lo1)) & set(re.findall(r"[a-zA-Z]+", lo2))
+                            shared -= _THEME_STOPWORDS
+                            score = 0.4 + min(0.5, 0.1 * len(shared))
+                            out.append(Contradiction(
+                                domain=dom, fact_a=f1.text, fact_b=f2.text,
+                                reason=f"opposing markers: '{pos}' vs '{neg}'",
+                                score=score,
+                            ))
+                            break
+        return sorted(out, key=lambda c: -c.score)
+
+    # ----- portrait -----
+    def synthesize_portrait(self) -> UserPortrait:
+        port = UserPortrait()
+        for dom_enum in LifeDomain:
+            dom = dom_enum.value
+            if dom == LifeDomain.UNCATEGORIZED.value:
+                continue
+            summary = self.synthesize_domain(dom)
+            if summary.fact_count > 0:
+                port.domains[dom] = summary
+        port.north_stars = [n.text for n in self.store.active_north_stars()[:5]]
+        port.rules       = [r.text for r in self.store.active_rules()[:5]]
+        port.contradictions = self.detect_contradictions()
+        port.one_line_summary = self._compose_one_liner(port)
+        return port
+
+    @staticmethod
+    def _compose_one_liner(port: UserPortrait) -> str:
+        if not port.domains:
+            return "Identity portrait is empty — no attested facts yet."
+        ranked = sorted(port.domains.values(), key=lambda d: -d.fact_count)
+        top = ranked[:3]
+        bits = [f"{d.domain}({d.fact_count})" for d in top]
+        ns_bit = f"; north stars: {len(port.north_stars)}" if port.north_stars else ""
+        contra_bit = f"; {len(port.contradictions)} contradiction(s)" if port.contradictions else ""
+        return f"User portrait: {len(port.domains)} active domain(s) — " + ", ".join(bits) + ns_bit + contra_bit + "."
+
+    # ----- write back -----
+    def write_back_summaries(self) -> None:
+        for dom_enum in LifeDomain:
+            dom = dom_enum.value
+            if dom == LifeDomain.UNCATEGORIZED.value:
+                continue
+            summary = self.synthesize_domain(dom)
+            if summary.fact_count > 0:
+                self.store.doc.domain_summaries[dom] = summary.narrative
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
