@@ -2249,6 +2249,355 @@ def _patched_agent_factory_init(self):
 
 AgentFactoryRegistry.__init__ = _patched_agent_factory_init  # type: ignore[method-assign]
 
+# =====================================================================
+# SPRINT 2 — CURIOSITY ENGINE (INFORMATION-THEORETIC)
+# =====================================================================
+# The system's active learner.  Reads gaps in the IdentityDocument and
+# proposes questions whose expected information gain about the user is
+# highest, with a strict budget so the user never feels surveyed.
+#
+# Architecture:
+#   GapType                 — taxonomy of identity ambiguity
+#   IdentityGap             — one detected gap with a score
+#   CuriosityEngagement     — one asked question + outcome
+#   EngagementLedger        — persistent record of asked questions and
+#                             response rates per domain
+#   CuriosityEngine         — gap detection, information-gain scoring,
+#                             question selection under a session budget
+#
+# Information-theoretic framing:
+#   For each domain D with N facts of average confidence c, define
+#     uncertainty(D) = 1 / (N * c + 0.5)
+#     H(D) = log2(1 + uncertainty(D))
+#   Answering a well-targeted question moves us to (N+1, c+epsilon).
+#   Expected information gain = H_before - H_after.  This is the
+#   InfoPO-inspired objective the engine maximizes when choosing the
+#   next question to ask.
+#
+# Budget:
+#   Default 1 active outstanding curiosity question per hour.  No more
+#   than 3 questions per 24h regardless of gap pressure.  Configurable
+#   via CuriosityEngine(max_per_hour, max_per_day).
+#
+# Engagement signal:
+#   record_response(answered, response_excerpt) updates the ledger so
+#   the engine can learn which domains the user engages with vs which
+#   they skip — future sprints can shape question phrasing per domain
+#   based on observed answer rate.
+# =====================================================================
+
+# ─── Taxonomy ──────────────────────────────────────────────────────────
+class GapType(str, Enum):
+    LOW_COVERAGE   = "low_coverage"     # fewer than COVERAGE_FLOOR facts in domain
+    LOW_CONFIDENCE = "low_confidence"   # average confidence in domain below 0.55
+    CONFLICTING    = "conflicting"      # facts contain contradictory keywords
+    NO_NORTH_STAR  = "no_north_star"    # active in domain but no anchoring goal
+    STALE_DOMAIN   = "stale_domain"     # last_seen > STALE_DAYS ago
+
+# Tunables
+COVERAGE_FLOOR    = 3
+CONFIDENCE_FLOOR  = 0.55
+STALE_DAYS        = 30.0
+
+# Question templates per (domain, gap_type).  Short, friend-tone, never
+# clinical.  Templates chosen on a single axis so the engine can reason
+# about expected information gain without LLM lookups (deterministic
+# baseline; later sprints can layer LLM-generated variants on top).
+_TEMPLATES_LOW_COVERAGE: Dict[str, List[str]] = {
+    LifeDomain.CAREER.value:        ["What do you do for work these days?", "What part of your job energizes you most?"],
+    LifeDomain.BUSINESS.value:      ["Are you running anything of your own — side project, business, anything?", "What's the current shape of your business?"],
+    LifeDomain.FINANCIAL.value:     ["What's the single biggest money question on your mind right now?", "How would you describe your current financial situation in one line?"],
+    LifeDomain.HEALTH.value:        ["How have you been feeling physically lately?", "What's your relationship with sleep right now?"],
+    LifeDomain.RELATIONSHIPS.value: ["Who are the few people closest to you right now?", "Who do you turn to when things get hard?"],
+    LifeDomain.GROWTH.value:        ["What are you learning or working on improving lately?", "If you could be sharper at one skill in six months, what would it be?"],
+    LifeDomain.LIFESTYLE.value:     ["What does a good week look like for you?", "What do you do when you actually get free time?"],
+    LifeDomain.SPIRITUAL.value:     ["What gives your week meaning beyond the daily grind?", "When you think about why you do what you do, what comes up?"],
+}
+_TEMPLATES_LOW_CONFIDENCE: Dict[str, List[str]] = {
+    d: [f"Can I check something I think I heard from you — does this still feel accurate for your {d}?"]
+    for d in [m.value for m in LifeDomain if m != LifeDomain.UNCATEGORIZED]
+}
+_TEMPLATES_NO_NORTH_STAR: Dict[str, List[str]] = {
+    d: [f"If you could pick one thing you want to be true about your {d} a year from now, what would it be?"]
+    for d in [m.value for m in LifeDomain if m != LifeDomain.UNCATEGORIZED]
+}
+_TEMPLATES_STALE: Dict[str, List[str]] = {
+    d: [f"It's been a while since we talked about your {d} — anything moving there?"]
+    for d in [m.value for m in LifeDomain if m != LifeDomain.UNCATEGORIZED]
+}
+_TEMPLATES_CONFLICTING: Dict[str, List[str]] = {
+    d: [f"I'm holding two things about your {d} that don't quite line up — can I read them back to make sure I have it right?"]
+    for d in [m.value for m in LifeDomain if m != LifeDomain.UNCATEGORIZED]
+}
+
+QUESTION_TEMPLATES: Dict[Tuple[str, str], List[str]] = {}
+for _domain, _qs in _TEMPLATES_LOW_COVERAGE.items():
+    QUESTION_TEMPLATES[(_domain, GapType.LOW_COVERAGE.value)] = _qs
+for _domain, _qs in _TEMPLATES_LOW_CONFIDENCE.items():
+    QUESTION_TEMPLATES[(_domain, GapType.LOW_CONFIDENCE.value)] = _qs
+for _domain, _qs in _TEMPLATES_NO_NORTH_STAR.items():
+    QUESTION_TEMPLATES[(_domain, GapType.NO_NORTH_STAR.value)] = _qs
+for _domain, _qs in _TEMPLATES_STALE.items():
+    QUESTION_TEMPLATES[(_domain, GapType.STALE_DOMAIN.value)] = _qs
+for _domain, _qs in _TEMPLATES_CONFLICTING.items():
+    QUESTION_TEMPLATES[(_domain, GapType.CONFLICTING.value)] = _qs
+
+# ─── Data structures ───────────────────────────────────────────────────
+@dataclass
+class IdentityGap:
+    domain: str
+    gap_type: str
+    score: float                                  # 0..1, higher = more uncertainty
+    details: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class CuriosityEngagement:
+    question: str
+    domain: str
+    gap_type: str
+    asked_at: float                               = field(default_factory=lambda: time.time())
+    answered: Optional[bool]                      = None
+    answered_at: Optional[float]                  = None
+    response_excerpt: Optional[str]               = None
+    expected_information_gain: float              = 0.0
+    metadata: Dict[str, Any]                      = field(default_factory=dict)
+
+CURIOSITY_PATH = STORAGE_DIR / "curiosity.json"
+
+class EngagementLedger:
+    """
+    Persistent record of curiosity engagements.  JSON on disk so the
+    engine remembers across restarts what it has already asked and what
+    the user actually engaged with.
+    """
+    def __init__(self, path: Path = CURIOSITY_PATH) -> None:
+        self.path: Path = path
+        self.entries: List[CuriosityEngagement] = []
+
+    def load(self) -> "EngagementLedger":
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                self.entries = [CuriosityEngagement(**e) for e in data.get("entries", [])]
+            except Exception as e:
+                logger.warning(f"engagement ledger load failed at {self.path}: {e}")
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"entries": [asdict(e) for e in self.entries]}
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def add(self, entry: CuriosityEngagement) -> None:
+        self.entries.append(entry)
+
+    def already_asked(self, question: str) -> bool:
+        norm = " ".join((question or "").lower().split())
+        return any(" ".join(e.question.lower().split()) == norm for e in self.entries)
+
+    def recent_in_window(self, window_seconds: float) -> List[CuriosityEngagement]:
+        cutoff = time.time() - window_seconds
+        return [e for e in self.entries if e.asked_at >= cutoff]
+
+    def response_rate(self, domain: Optional[str] = None) -> float:
+        """
+        Fraction of asked questions that received a response.
+        None for domain = global rate; otherwise per-domain.
+        """
+        pool = [e for e in self.entries if (domain is None or e.domain == domain)]
+        if not pool:
+            return 0.0
+        answered = sum(1 for e in pool if e.answered)
+        return answered / len(pool)
+
+# ─── Curiosity Engine ──────────────────────────────────────────────────
+class CuriosityEngine:
+    """
+    Detects identity gaps and selects the highest-expected-gain question
+    under a per-session budget.
+
+    Inputs:
+        store           IdentityStore — gap oracle
+        ledger          EngagementLedger — what we've already asked
+        max_per_hour    soft cap on outstanding questions (default 1)
+        max_per_day     hard cap regardless of pressure (default 3)
+    """
+
+    def __init__(
+        self,
+        store: "IdentityStore",
+        ledger: Optional["EngagementLedger"] = None,
+        max_per_hour: int = 1,
+        max_per_day: int  = 3,
+    ) -> None:
+        self.store        = store
+        self.ledger       = ledger or EngagementLedger()
+        self.max_per_hour = max_per_hour
+        self.max_per_day  = max_per_day
+
+    # ----- gap detection -----
+    def detect_gaps(self) -> List[IdentityGap]:
+        gaps: List[IdentityGap] = []
+        now = time.time()
+        for domain_enum in LifeDomain:
+            domain = domain_enum.value
+            if domain == LifeDomain.UNCATEGORIZED.value:
+                continue
+            facts = self.store.facts_for_domain(domain)
+            n = len(facts)
+
+            # Coverage
+            if n < COVERAGE_FLOOR:
+                score = 1.0 - (n / COVERAGE_FLOOR)
+                gaps.append(IdentityGap(
+                    domain=domain, gap_type=GapType.LOW_COVERAGE.value,
+                    score=score, details={"fact_count": n, "floor": COVERAGE_FLOOR},
+                ))
+
+            # Confidence
+            if facts:
+                avg = sum(f.confidence for f in facts) / n
+                if avg < CONFIDENCE_FLOOR:
+                    gaps.append(IdentityGap(
+                        domain=domain, gap_type=GapType.LOW_CONFIDENCE.value,
+                        score=1.0 - (avg / CONFIDENCE_FLOOR),
+                        details={"avg_confidence": avg, "floor": CONFIDENCE_FLOOR},
+                    ))
+
+            # North star
+            ns_in_domain = [n for n in self.store.doc.north_stars if n.domain == domain]
+            if facts and not ns_in_domain:
+                # Only worth asking once the user is clearly active in the domain.
+                gaps.append(IdentityGap(
+                    domain=domain, gap_type=GapType.NO_NORTH_STAR.value,
+                    score=0.6, details={"fact_count": n},
+                ))
+
+            # Staleness
+            if facts:
+                last = max(f.last_seen for f in facts)
+                age_days = (now - last) / 86400.0
+                if age_days > STALE_DAYS:
+                    gaps.append(IdentityGap(
+                        domain=domain, gap_type=GapType.STALE_DOMAIN.value,
+                        score=min(1.0, age_days / (STALE_DAYS * 2)),
+                        details={"age_days": age_days, "stale_after": STALE_DAYS},
+                    ))
+
+            # Conflict (lightweight heuristic: same domain, contradictory verbs)
+            if n >= 2:
+                texts = [f.text.lower() for f in facts]
+                positives = sum(1 for t in texts if " do " in t or " am " in t or " have " in t)
+                negatives = sum(1 for t in texts if " don't " in t or " not " in t or " no " in t)
+                if positives > 0 and negatives > 0:
+                    # Surfaced as a soft signal, not a high-confidence conflict claim.
+                    gaps.append(IdentityGap(
+                        domain=domain, gap_type=GapType.CONFLICTING.value,
+                        score=0.5,
+                        details={"positive_markers": positives, "negative_markers": negatives},
+                    ))
+
+        return sorted(gaps, key=lambda g: -g.score)
+
+    # ----- information theory -----
+    def domain_entropy(self, domain: str) -> float:
+        """
+        H(D) = log2(1 + uncertainty(D)), uncertainty = 1 / (N * c + 0.5).
+        Empty domain -> high entropy.  Many high-confidence facts -> low.
+        """
+        facts = self.store.facts_for_domain(domain)
+        n = len(facts)
+        if n == 0:
+            return math.log2(1.0 + 1.0 / 0.5)   # = log2(3) ≈ 1.585
+        avg_conf = sum(f.confidence for f in facts) / n
+        uncertainty = 1.0 / (n * avg_conf + 0.5)
+        return math.log2(1.0 + uncertainty)
+
+    def expected_information_gain(self, gap: IdentityGap) -> float:
+        """
+        Approximate H_before - H_after for asking a question targeting
+        this gap.  Assumes a successful answer adds 1 fact at confidence
+        0.7 to the domain.  Higher gap.score boosts the estimate so
+        coverage gaps weigh more than soft-signal conflicts.
+        """
+        h_before = self.domain_entropy(gap.domain)
+        facts = self.store.facts_for_domain(gap.domain)
+        n  = len(facts)
+        cb = sum(f.confidence for f in facts) / n if n else 0.0
+        n2 = n + 1
+        cb2 = ((cb * n) + 0.7) / n2 if n else 0.7
+        uncertainty_after = 1.0 / (n2 * cb2 + 0.5)
+        h_after = math.log2(1.0 + uncertainty_after)
+        raw = max(0.0, h_before - h_after)
+        return raw * (0.5 + 0.5 * gap.score)
+
+    # ----- question generation -----
+    def question_candidates_for_gap(self, gap: IdentityGap) -> List[str]:
+        return list(QUESTION_TEMPLATES.get((gap.domain, gap.gap_type), []))
+
+    def fresh_candidates_for_gap(self, gap: IdentityGap) -> List[str]:
+        return [q for q in self.question_candidates_for_gap(gap)
+                if not self.ledger.already_asked(q)]
+
+    # ----- budget -----
+    def _budget_available(self) -> Tuple[bool, str]:
+        hour = self.ledger.recent_in_window(3600.0)
+        day  = self.ledger.recent_in_window(86400.0)
+        # Outstanding = asked but not yet answered (or skipped).
+        outstanding_hour = sum(1 for e in hour if e.answered is None)
+        if outstanding_hour >= self.max_per_hour:
+            return False, f"hourly budget reached: {outstanding_hour}/{self.max_per_hour} outstanding"
+        if len(day) >= self.max_per_day:
+            return False, f"daily budget reached: {len(day)}/{self.max_per_day} asked in 24h"
+        return True, "ok"
+
+    # ----- selection -----
+    def select_next_question(self) -> Optional[Tuple[str, IdentityGap, float]]:
+        ok, _ = self._budget_available()
+        if not ok:
+            return None
+        gaps = self.detect_gaps()
+        if not gaps:
+            return None
+        # Highest expected information gain wins.
+        scored: List[Tuple[float, IdentityGap, str]] = []
+        for gap in gaps:
+            cands = self.fresh_candidates_for_gap(gap)
+            if not cands:
+                continue
+            gain = self.expected_information_gain(gap)
+            scored.append((gain, gap, cands[0]))
+        if not scored:
+            return None
+        scored.sort(key=lambda t: -t[0])
+        gain, gap, question = scored[0]
+        return question, gap, gain
+
+    # ----- lifecycle hooks -----
+    def record_question_asked(
+        self, question: str, gap: IdentityGap, expected_gain: float,
+    ) -> CuriosityEngagement:
+        entry = CuriosityEngagement(
+            question=question, domain=gap.domain, gap_type=gap.gap_type,
+            expected_information_gain=expected_gain,
+        )
+        self.ledger.add(entry)
+        return entry
+
+    def record_response(
+        self, question: str, answered: bool, response_excerpt: Optional[str] = None,
+    ) -> Optional[CuriosityEngagement]:
+        norm = " ".join((question or "").lower().split())
+        for e in reversed(self.ledger.entries):
+            if " ".join(e.question.lower().split()) == norm and e.answered is None:
+                e.answered = answered
+                e.answered_at = time.time()
+                e.response_excerpt = (response_excerpt or "")[:400]
+                return e
+        return None
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
