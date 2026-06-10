@@ -1905,7 +1905,7 @@ class LifeDomain(str, Enum):
 # semantic embedding pipeline (Chroma) can override at runtime; this is
 # the deterministic baseline that works without one.
 DOMAIN_KEYWORDS: Dict[str, List[str]] = {
-    LifeDomain.CAREER.value:        ["job", "boss", "career", "promotion", "raise", "interview", "resume", "coworker", "work as", "designer", "engineer", "manager", "agency", "office", "team"],
+    LifeDomain.CAREER.value:        ["job", "boss", "career", "promotion", "raise", "interview", "resume", "coworker", "work as", "for work", "at work", "your work", "your job", "designer", "engineer", "manager", "agency", "office", "team"],
     LifeDomain.BUSINESS.value:      ["company", "startup", "client", "revenue", "product", "founder", "launch", "customer", "ltd", "llc"],
     LifeDomain.FINANCIAL.value:     ["budget", "savings", "debt", "rent", "mortgage", "401k", "ira", "invest", "expense", "income", "loan", "salary", "paycheck", "afford", "$"],
     LifeDomain.HEALTH.value:        ["sleep", "exercise", "doctor", "diet", "stress", "anxiety", "tired", "workout", "work out", "weight", "therapy", "gym", "run", "fitness"],
@@ -3997,6 +3997,186 @@ class MCPServer:
     @staticmethod
     def _res_rules(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "rules": [asdict(r) for r in srv.identity.active_rules()]}
+
+# =====================================================================
+# SPRINT 10 — TWO MES MODEL + PREDICTIVE MODELING
+# =====================================================================
+# Holds two models of the user side by side:
+#   present_self      "who the user is right now" (facts as observed)
+#   aspirational_self "who they want to become" (north stars + values)
+#
+# Tension is signal: the gap between present and aspirational is where
+# coaching/advice has the most leverage.  Predictive modeling estimates
+# how the user is likely to react to a given prompt based on observed
+# pattern (response_rate per domain, voice profile, salient north stars).
+#
+# Public entry points:
+#   SelfSnapshot              one frozen view of self at time T
+#   TwoMesModel               container holding present + aspirational
+#   tension_score(present, aspirational, domain) -> 0..1
+#   predict_engagement(prompt, store, ledger, voice) -> EngagementPrediction
+#   drift_report(snapshots) -> DriftReport (how identity has shifted)
+# =====================================================================
+
+@dataclass
+class SelfSnapshot:
+    """A frozen view of identity at a moment in time."""
+    label: str                                       # 'present' | 'aspirational' | 't0' etc.
+    captured_at: float                               = field(default_factory=lambda: time.time())
+    domain_fact_counts: Dict[str, int]               = field(default_factory=dict)
+    domain_avg_confidence: Dict[str, float]          = field(default_factory=dict)
+    north_star_domains: List[str]                    = field(default_factory=list)
+    north_star_weights: Dict[str, float]             = field(default_factory=dict)   # domain -> sum(weight)
+    fact_count: int                                  = 0
+    summary: str                                     = ""
+
+def capture_present(store: "IdentityStore", label: str = "present") -> SelfSnapshot:
+    snap = SelfSnapshot(label=label)
+    for d_enum in LifeDomain:
+        d = d_enum.value
+        if d == LifeDomain.UNCATEGORIZED.value:
+            continue
+        facts = store.facts_for_domain(d)
+        if facts:
+            snap.domain_fact_counts[d] = len(facts)
+            snap.domain_avg_confidence[d] = sum(f.confidence for f in facts) / len(facts)
+    snap.fact_count = sum(snap.domain_fact_counts.values())
+    snap.summary = (f"present-self: {len(snap.domain_fact_counts)} active domain(s), "
+                    f"{snap.fact_count} fact(s).")
+    return snap
+
+def capture_aspirational(store: "IdentityStore", label: str = "aspirational") -> SelfSnapshot:
+    """
+    Aspirational self is built from north stars: where the user wants to
+    invest weight, and which domains they've explicitly identified as
+    growth targets.
+    """
+    snap = SelfSnapshot(label=label)
+    for ns in store.active_north_stars():
+        dom = ns.domain or LifeDomain.UNCATEGORIZED.value
+        if dom == LifeDomain.UNCATEGORIZED.value:
+            continue
+        snap.north_star_domains.append(dom)
+        snap.north_star_weights[dom] = snap.north_star_weights.get(dom, 0.0) + max(ns.weight, 0.0)
+    snap.summary = (f"aspirational-self: {len(set(snap.north_star_domains))} domain(s) "
+                    f"with north stars, total weight={sum(snap.north_star_weights.values()):.2f}.")
+    return snap
+
+@dataclass
+class TwoMesModel:
+    present:      SelfSnapshot
+    aspirational: SelfSnapshot
+
+    @classmethod
+    def from_store(cls, store: "IdentityStore") -> "TwoMesModel":
+        return cls(present=capture_present(store), aspirational=capture_aspirational(store))
+
+def tension_score(model: TwoMesModel, domain: str) -> float:
+    """
+    0..1.  HIGH score = user has strong aspiration in this domain but
+    weak present footprint there (or low-confidence facts).  Where
+    coaching has most leverage.
+    """
+    asp_weight = model.aspirational.north_star_weights.get(domain, 0.0)
+    if asp_weight <= 0.0:
+        return 0.0
+    pres_n   = model.present.domain_fact_counts.get(domain, 0)
+    pres_avg = model.present.domain_avg_confidence.get(domain, 0.0)
+    pres_footprint = (pres_n * pres_avg) / 5.0   # normalize; 5 high-conf facts ~ saturation
+    pres_footprint = min(pres_footprint, 1.0)
+    asp_norm = min(asp_weight / 2.0, 1.0)        # weight 2.0 ~ saturation
+    return max(0.0, min(1.0, asp_norm * (1.0 - pres_footprint)))
+
+def high_tension_domains(model: TwoMesModel, threshold: float = 0.4) -> List[Tuple[str, float]]:
+    out: List[Tuple[str, float]] = []
+    for d_enum in LifeDomain:
+        d = d_enum.value
+        if d == LifeDomain.UNCATEGORIZED.value:
+            continue
+        s = tension_score(model, d)
+        if s >= threshold:
+            out.append((d, s))
+    out.sort(key=lambda kv: -kv[1])
+    return out
+
+# ---------- Predictive modeling --------------------------------------
+@dataclass
+class EngagementPrediction:
+    estimated_response_rate: float                   = 0.0   # 0..1
+    likely_domain:          str                      = LifeDomain.UNCATEGORIZED.value
+    notes:                  List[str]                = field(default_factory=list)
+
+def predict_engagement(
+    prompt: str,
+    store: "IdentityStore",
+    ledger: Optional["EngagementLedger"] = None,
+    voice: Optional["VoiceEvolutionEngine"] = None,
+    agent_id: str = "fast_mentor",
+) -> EngagementPrediction:
+    """
+    Heuristic: estimate how likely the user is to engage with a prompt.
+    Composes three signals:
+      1. inferred domain from the prompt
+      2. ledger's per-domain response rate (priors from real history)
+      3. voice profile's domain_curiosity multiplier
+    """
+    pred = EngagementPrediction()
+    domain = classify_domain(prompt)
+    pred.likely_domain = domain
+    if domain == LifeDomain.UNCATEGORIZED.value:
+        pred.notes.append("no domain signal - default 0.5")
+        pred.estimated_response_rate = 0.5
+        return pred
+
+    base = 0.5
+    if ledger is not None:
+        # Per-domain ledger history (Sprint 2 EngagementLedger).
+        per_domain = [e for e in ledger.entries if e.domain == domain]
+        if per_domain:
+            answered = sum(1 for e in per_domain if e.answered)
+            base = answered / len(per_domain)
+            pred.notes.append(f"ledger rate(domain={domain})={base:.2f} over {len(per_domain)} prior")
+
+    if voice is not None:
+        p = voice.profile_for(agent_id)
+        mult = p.domain_curiosity.get(domain, 1.0) * p.curiosity_mult
+        base *= mult
+        pred.notes.append(f"voice mult(domain={domain})={mult:.2f}")
+
+    # Boost when prompt hits a north-star domain.
+    if any(ns.domain == domain and ns.weight > 1.0 for ns in store.active_north_stars()):
+        base *= 1.15
+        pred.notes.append("north-star aligned: +15%")
+
+    pred.estimated_response_rate = max(0.0, min(1.0, base))
+    return pred
+
+# ---------- Drift report ---------------------------------------------
+@dataclass
+class DriftReport:
+    earliest_at:   float                             = 0.0
+    latest_at:     float                             = 0.0
+    fact_delta:    int                               = 0
+    new_domains:   List[str]                         = field(default_factory=list)
+    lost_domains:  List[str]                         = field(default_factory=list)
+    confidence_changes: Dict[str, float]             = field(default_factory=dict)
+    summary:       str                               = ""
+
+def drift_report(earlier: SelfSnapshot, later: SelfSnapshot) -> DriftReport:
+    r = DriftReport(earliest_at=earlier.captured_at, latest_at=later.captured_at)
+    r.fact_delta = later.fact_count - earlier.fact_count
+    e_domains = set(earlier.domain_fact_counts.keys())
+    l_domains = set(later.domain_fact_counts.keys())
+    r.new_domains  = sorted(l_domains - e_domains)
+    r.lost_domains = sorted(e_domains - l_domains)
+    for d in (e_domains & l_domains):
+        delta = later.domain_avg_confidence.get(d, 0.0) - earlier.domain_avg_confidence.get(d, 0.0)
+        if abs(delta) >= 0.05:
+            r.confidence_changes[d] = round(delta, 3)
+    r.summary = (f"drift {r.fact_delta:+d} facts, +{len(r.new_domains)} new domain(s), "
+                 f"-{len(r.lost_domains)} lost, "
+                 f"{len(r.confidence_changes)} confidence shift(s).")
+    return r
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
