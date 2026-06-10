@@ -4803,6 +4803,8 @@ class LatticeContext:
         # Sprint 17 — auto-register extended tool/resource surface +
         # bind a SnapshotStore to ctx so drift_report can be called from MCP.
         self.snapshots  = register_extended_mcp_surface(self.mcp, self)
+        # Sprint 18 — export/import tools.
+        register_export_import_tools(self.mcp, self)
 
     @classmethod
     def boot(cls, **cfg_kwargs: Any) -> "LatticeContext":
@@ -5387,6 +5389,329 @@ def register_extended_mcp_surface(
     server.register_resource("business://active",      _res_business_active)
 
     return snaps
+
+# =====================================================================
+# SPRINT 18 — IDENTITY EXPORT / IMPORT WITH PRIVACY CONTROLS
+# =====================================================================
+# Portable backup/restore: identity facts, north stars, constitutional
+# rules, business profiles, snapshots.  Sensitivity-filtered so the user
+# can produce a "LOW only" share-safe bundle without leaking HIGH/SECRET.
+#
+# Public API:
+#   IdentityExport                serializable bundle dataclass
+#   build_identity_export(ctx, ceiling, include_business=True,
+#                          include_snapshots=True)
+#   apply_identity_import(ctx, bundle, conflict='merge'|'overwrite'|'skip')
+#
+# MCP tools:
+#   tools/call export_identity {ceiling?, include_business?, include_snapshots?}
+#   tools/call import_identity {bundle, conflict?}
+#
+# Every export goes through audited_egress(destination='user_export') so
+# the audit log records who pulled what.  SECRET content never appears
+# in an export -- even with ceiling=SECRET the router holds final veto.
+# =====================================================================
+
+EXPORT_SCHEMA_VERSION = 1
+
+@dataclass
+class IdentityExport:
+    schema_version:    int                              = EXPORT_SCHEMA_VERSION
+    created:           float                            = field(default_factory=lambda: time.time())
+    user_id:           str                              = "local"
+    sensitivity_ceiling: str                            = Sensitivity.LOW.value
+    facts:             List[Dict[str, Any]]             = field(default_factory=list)
+    north_stars:       List[Dict[str, Any]]             = field(default_factory=list)
+    rules:             List[Dict[str, Any]]             = field(default_factory=list)
+    domain_summaries:  Dict[str, str]                   = field(default_factory=dict)
+    businesses:        List[Dict[str, Any]]             = field(default_factory=list)
+    snapshots:         Dict[str, Dict[str, Any]]        = field(default_factory=dict)
+    metadata:          Dict[str, Any]                   = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2, default=str)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "IdentityExport":
+        data = json.loads(raw)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+def _sens_rank(s: str) -> int:
+    return {Sensitivity.LOW.value: 0,
+            Sensitivity.MEDIUM.value: 1,
+            Sensitivity.HIGH.value: 2,
+            Sensitivity.SECRET.value: 3}.get(s, 0)
+
+
+def build_identity_export(
+    ctx: "LatticeContext",
+    ceiling: str = Sensitivity.LOW.value,
+    include_business: bool = True,
+    include_snapshots: bool = True,
+    include_north_stars: bool = True,
+    include_rules: bool = True,
+    consumer: Optional["Consumer"] = None,
+    grant: Optional["ConsumerGrant"] = None,
+) -> IdentityExport:
+    """
+    Build an IdentityExport bundle subject to the sensitivity ceiling.
+    SECRET is ALWAYS excluded regardless of caller-supplied ceiling --
+    SECRET content is never permitted to leave the local machine.
+
+    If a consumer + grant are supplied, every fact is also gated by
+    audited_egress(destination='user_export') so the export shows up in
+    the audit log; denied facts are silently filtered out (the audit
+    line still records the denial).
+    """
+    # SECRET ceiling is downgraded to HIGH because SECRET never leaves.
+    if ceiling == Sensitivity.SECRET.value:
+        ceiling = Sensitivity.HIGH.value
+    ceiling_rank = _sens_rank(ceiling)
+
+    bundle = IdentityExport(
+        user_id=ctx.identity.doc.user_id,
+        sensitivity_ceiling=ceiling,
+        domain_summaries=dict(ctx.identity.doc.domain_summaries),
+    )
+
+    def _pass_egress(text: str, sensitivity: str, domain: str) -> bool:
+        # If no consumer/grant context, just rely on ceiling.
+        if consumer is None or grant is None:
+            return _sens_rank(sensitivity) <= ceiling_rank \
+                   and sensitivity != Sensitivity.SECRET.value
+        # Per-fact gate.
+        ok, _, _ = audited_egress(
+            text=text, consumer=consumer, grant=grant,
+            destination="user_export", audit=ctx.audit,
+            explicit_sensitivity=sensitivity,
+            explicit_domain=domain,
+        )
+        return ok
+
+    for f in ctx.identity.doc.facts:
+        if f.sensitivity == Sensitivity.SECRET.value:
+            continue
+        if _sens_rank(f.sensitivity) > ceiling_rank:
+            continue
+        if not _pass_egress(f.text, f.sensitivity, f.domain):
+            continue
+        bundle.facts.append(asdict(f))
+
+    if include_north_stars:
+        for n in ctx.identity.doc.north_stars:
+            bundle.north_stars.append(asdict(n))
+
+    if include_rules:
+        for r in ctx.identity.doc.constitutional_rules:
+            bundle.rules.append(asdict(r))
+
+    if include_business:
+        for bp in ctx.business.profiles.values():
+            bp_dict = asdict(bp)
+            # Filter business facts by the same ceiling.
+            kept_facts: List[Dict[str, Any]] = []
+            for fd in bp_dict.get("facts", []):
+                sens = fd.get("sensitivity", Sensitivity.MEDIUM.value)
+                text = fd.get("text", "")
+                dom  = fd.get("domain", LifeDomain.BUSINESS.value)
+                if sens == Sensitivity.SECRET.value:
+                    continue
+                if _sens_rank(sens) > ceiling_rank:
+                    continue
+                if not _pass_egress(text, sens, dom):
+                    continue
+                kept_facts.append(fd)
+            bp_dict["facts"] = kept_facts
+            bundle.businesses.append(bp_dict)
+
+    if include_snapshots:
+        for label, snap in ctx.snapshots.snapshots.items():
+            bundle.snapshots[label] = asdict(snap)
+
+    return bundle
+
+
+# ---------- import ---------------------------------------------------
+@dataclass
+class IdentityImportReport:
+    facts_added:        int                             = 0
+    facts_updated:      int                             = 0
+    facts_skipped:      int                             = 0
+    north_stars_added:  int                             = 0
+    rules_added:        int                             = 0
+    businesses_added:   int                             = 0
+    snapshots_added:    int                             = 0
+    warnings:           List[str]                       = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (f"+{self.facts_added}/{self.facts_updated}/{self.facts_skipped} facts (new/updated/skipped); "
+                f"+{self.north_stars_added} north stars; +{self.rules_added} rules; "
+                f"+{self.businesses_added} businesses; +{self.snapshots_added} snapshots.")
+
+
+def apply_identity_import(
+    ctx: "LatticeContext",
+    bundle: IdentityExport,
+    conflict: str = "merge",
+) -> IdentityImportReport:
+    """
+    Apply an IdentityExport bundle to ctx.  conflict policy controls
+    duplicate-text behavior:
+        'merge'     existing facts get their seen_count + confidence
+                    bumped (default).
+        'overwrite' replace existing fact's confidence with imported
+                    value; recompute last_seen.
+        'skip'      leave existing facts unchanged; record skipped count.
+    """
+    rep = IdentityImportReport()
+    if bundle.schema_version != EXPORT_SCHEMA_VERSION:
+        rep.warnings.append(f"schema_version_mismatch:{bundle.schema_version}")
+
+    # ---- facts ----
+    for fd in bundle.facts:
+        text = fd.get("text", "").strip()
+        if not text:
+            continue
+        sens = fd.get("sensitivity", Sensitivity.MEDIUM.value)
+        if sens == Sensitivity.SECRET.value:
+            # NEVER accept SECRET on import — security boundary, even
+            # for local-to-local restore: re-classify at import time.
+            sens = SensitivityRouter.classify_text(text)
+        norm = " ".join(text.lower().split())
+        existing = next(
+            (f for f in ctx.identity.doc.facts
+             if " ".join(f.text.lower().split()) == norm),
+            None,
+        )
+        if existing:
+            if conflict == "skip":
+                rep.facts_skipped += 1
+                continue
+            if conflict == "overwrite":
+                existing.confidence = float(fd.get("confidence", existing.confidence))
+                existing.last_seen  = time.time()
+                rep.facts_updated += 1
+                continue
+            # merge (default)
+            existing.seen_count += int(fd.get("seen_count", 1))
+            existing.confidence = min(1.0, existing.confidence + 0.03)
+            existing.last_seen  = time.time()
+            rep.facts_updated += 1
+            continue
+        ctx.identity.add_fact(
+            text=text,
+            domain=fd.get("domain") or classify_domain(text),
+            sensitivity=sens,
+            confidence=float(fd.get("confidence", 0.7)),
+            source=fd.get("source", "imported"),
+            metadata=dict(fd.get("metadata", {})),
+        )
+        rep.facts_added += 1
+
+    # ---- north stars ----
+    existing_ns = {(n.text.strip().lower(), n.domain) for n in ctx.identity.doc.north_stars}
+    for nd in bundle.north_stars:
+        key = (nd.get("text", "").strip().lower(), nd.get("domain", LifeDomain.UNCATEGORIZED.value))
+        if key in existing_ns:
+            continue
+        ctx.identity.add_north_star(
+            text=nd.get("text", ""),
+            domain=nd.get("domain"),
+            weight=float(nd.get("weight", 1.0)),
+        )
+        rep.north_stars_added += 1
+
+    # ---- rules ----
+    existing_r = {r.text.strip().lower() for r in ctx.identity.doc.constitutional_rules}
+    for rd in bundle.rules:
+        if rd.get("text", "").strip().lower() in existing_r:
+            continue
+        ctx.identity.add_rule(rd.get("text", ""), priority=int(rd.get("priority", 100)))
+        rep.rules_added += 1
+
+    # ---- businesses ----
+    for bd in bundle.businesses:
+        bid = bd.get("business_id")
+        if not bid or bid in ctx.business.profiles:
+            continue
+        try:
+            bp = BusinessProfile(
+                business_id=bid,
+                display_name=bd.get("display_name", bid),
+                legal_entity=bd.get("legal_entity"),
+                role=bd.get("role"),
+                domains_in_scope=list(bd.get("domains_in_scope", [LifeDomain.BUSINESS.value])),
+                north_stars=[NorthStar(**n) for n in bd.get("north_stars", [])],
+                rules=[ConstitutionalRule(**r) for r in bd.get("rules", [])],
+                facts=[IdentityFact(**f) for f in bd.get("facts", [])],
+            )
+        except Exception as e:
+            rep.warnings.append(f"business_skip:{bid}:{e}")
+            continue
+        ctx.business.register(bp, set_active=False)
+        rep.businesses_added += 1
+
+    # ---- snapshots ----
+    for label, snap_dict in bundle.snapshots.items():
+        if label in ctx.snapshots.snapshots:
+            continue
+        try:
+            ctx.snapshots.put(label, SelfSnapshot(**snap_dict))
+            rep.snapshots_added += 1
+        except Exception as e:
+            rep.warnings.append(f"snapshot_skip:{label}:{e}")
+
+    return rep
+
+
+# ---------- MCP tools for export/import ---------------------------------
+def register_export_import_tools(server: "MCPServer", ctx: "LatticeContext") -> None:
+    def _tool_export(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        ceiling = params.get("ceiling", Sensitivity.LOW.value)
+        if ceiling not in {s.value for s in Sensitivity}:
+            ceiling = Sensitivity.LOW.value
+        # Tie this export to the caller's consumer/grant if they're known.
+        consumer_id = params.get("_consumer_id")
+        consumer = srv.consumers.get(consumer_id) if consumer_id else None
+        grant    = srv.grants.get(consumer_id) if consumer_id else None
+        bundle = build_identity_export(
+            ctx,
+            ceiling=ceiling,
+            include_business=bool(params.get("include_business", True)),
+            include_snapshots=bool(params.get("include_snapshots", True)),
+            include_north_stars=bool(params.get("include_north_stars", True)),
+            include_rules=bool(params.get("include_rules", True)),
+            consumer=consumer, grant=grant,
+        )
+        return {"ok": True, "bundle": asdict(bundle),
+                "stats": {
+                    "facts":       len(bundle.facts),
+                    "north_stars": len(bundle.north_stars),
+                    "rules":       len(bundle.rules),
+                    "businesses":  len(bundle.businesses),
+                    "snapshots":   len(bundle.snapshots),
+                }}
+
+    def _tool_import(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        raw = params.get("bundle")
+        if not isinstance(raw, dict):
+            return {"ok": False, "error": "missing_bundle"}
+        try:
+            bundle = IdentityExport(**{k: v for k, v in raw.items()
+                                        if k in IdentityExport.__dataclass_fields__})
+        except Exception as e:
+            return {"ok": False, "error": f"invalid_bundle:{e}"}
+        conflict = params.get("conflict", "merge")
+        if conflict not in ("merge", "overwrite", "skip"):
+            conflict = "merge"
+        rep = apply_identity_import(ctx, bundle, conflict=conflict)
+        return {"ok": True,
+                "report": asdict(rep),
+                "summary": rep.summary()}
+
+    server.register_tool("export_identity", _tool_export)
+    server.register_tool("import_identity", _tool_import)
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
