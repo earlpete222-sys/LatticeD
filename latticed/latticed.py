@@ -3775,6 +3775,229 @@ def audited_egress(
     audit.append(entry)
     return True, "ok", entry
 
+# =====================================================================
+# SPRINT 9 — MCP SERVER (THE STRATEGIC MOAT)
+# =====================================================================
+# An in-process MCP-style server exposing user-model data through a
+# controlled, audited interface.  ANY consumer (an external LLM, a CLI
+# tool, a future cloud bridge) goes through this surface — not directly
+# at the IdentityStore.
+#
+# Protocol (JSON-RPC-shaped):
+#   tools/list   tools/call   resources/list   resources/read
+#
+# Resources are namespaced under identity:// URIs:
+#   identity://portrait                 -> UserPortrait one-liner + counts
+#   identity://summary/<domain>         -> DomainSummary narrative
+#   identity://north_stars              -> active north stars
+#   identity://rules                    -> active constitutional rules
+#
+# Tools:
+#   add_fact, list_facts_in_domain, ask_curiosity_question
+#
+# EVERY request goes through audited_egress.  Consumers without an
+# active grant get a deny + audit row, never a bare error.
+# =====================================================================
+
+@dataclass
+class MCPRequest:
+    method:        str                                   # tools/list, tools/call, etc.
+    consumer_id:   str
+    params:        Dict[str, Any]                        = field(default_factory=dict)
+    request_id:    str                                   = field(default_factory=lambda: str(int(time.time() * 1000)))
+
+@dataclass
+class MCPResponse:
+    request_id:    str
+    ok:            bool
+    result:        Any                                   = None
+    error:         Optional[str]                         = None
+    audit_entry:   Optional[AccessAuditEntry]            = None
+
+MCPHandler = Callable[[Dict[str, Any], "MCPServer"], Any]
+
+class MCPServer:
+    """
+    In-process MCP-style server.  The network surface (stdio/HTTP) is a
+    thin transcode on top — Sprint 13 ships one in the launch assets.
+    All business logic lives here.
+    """
+    def __init__(
+        self,
+        identity_store: "IdentityStore",
+        audit_log: Optional["AccessAuditLog"] = None,
+        synthesizer: Optional["IdentitySynthesizer"] = None,
+        curiosity:   Optional["CuriosityEngine"] = None,
+    ) -> None:
+        self.identity   = identity_store
+        self.audit      = audit_log or AccessAuditLog()
+        self.synth      = synthesizer or IdentitySynthesizer(identity_store)
+        self.curiosity  = curiosity
+        self.consumers: Dict[str, Consumer] = {}
+        self.grants:    Dict[str, ConsumerGrant] = {}
+        self.tools:     Dict[str, MCPHandler] = {}
+        self.resources: Dict[str, Callable[["MCPServer", Dict[str, Any]], Any]] = {}
+
+        # Register built-ins.
+        self.register_tool("add_fact",                  self._tool_add_fact)
+        self.register_tool("list_facts_in_domain",      self._tool_list_facts)
+        self.register_tool("ask_curiosity_question",    self._tool_curiosity)
+        self.register_resource("identity://portrait",   self._res_portrait)
+        self.register_resource("identity://summary",    self._res_summary)
+        self.register_resource("identity://north_stars",self._res_north_stars)
+        self.register_resource("identity://rules",      self._res_rules)
+
+    # ----- registration -----
+    def register_consumer(self, consumer: Consumer, grant: ConsumerGrant) -> None:
+        self.consumers[consumer.consumer_id] = consumer
+        self.grants[consumer.consumer_id]    = grant
+
+    def register_tool(self, name: str, handler: MCPHandler) -> None:
+        self.tools[name] = handler
+
+    def register_resource(self, uri: str, handler: Callable[["MCPServer", Dict[str, Any]], Any]) -> None:
+        self.resources[uri] = handler
+
+    # ----- dispatch -----
+    def handle(self, req: MCPRequest) -> MCPResponse:
+        consumer = self.consumers.get(req.consumer_id)
+        grant    = self.grants.get(req.consumer_id)
+        if not consumer or not grant:
+            entry = AccessAuditEntry(
+                consumer_id=req.consumer_id, decision="deny",
+                reason="unknown_consumer", destination="mcp",
+            )
+            self.audit.append(entry)
+            return MCPResponse(request_id=req.request_id, ok=False,
+                               error="unknown_consumer", audit_entry=entry)
+
+        try:
+            if req.method == "tools/list":
+                return MCPResponse(req.request_id, True, result=sorted(self.tools.keys()))
+            if req.method == "resources/list":
+                return MCPResponse(req.request_id, True, result=sorted(self.resources.keys()))
+            if req.method == "tools/call":
+                tool_name = req.params.get("name")
+                handler = self.tools.get(tool_name)
+                if not handler:
+                    return MCPResponse(req.request_id, False, error=f"unknown_tool:{tool_name}")
+                # Audit before executing — produced text is what we gate on.
+                preview = json.dumps(req.params, default=str)[:400]
+                ok, reason, entry = audited_egress(
+                    preview, consumer, grant, "mcp", self.audit,
+                    explicit_sensitivity=Sensitivity.LOW.value,
+                    explicit_domain=LifeDomain.UNCATEGORIZED.value,
+                )
+                if not ok:
+                    return MCPResponse(req.request_id, False, error=reason, audit_entry=entry)
+                result = handler(req.params, self)
+                return MCPResponse(req.request_id, True, result=result, audit_entry=entry)
+            if req.method == "resources/read":
+                uri = req.params.get("uri", "")
+                # Match exact or prefix (for templated URIs).
+                handler = self.resources.get(uri)
+                params  = dict(req.params)
+                if not handler:
+                    for prefix, h in self.resources.items():
+                        if uri.startswith(prefix.rstrip("/") + "/"):
+                            handler = h
+                            params["_suffix"] = uri[len(prefix.rstrip("/")) + 1:]
+                            break
+                if not handler:
+                    return MCPResponse(req.request_id, False, error=f"unknown_resource:{uri}")
+                preview_text = uri
+                ok, reason, entry = audited_egress(
+                    preview_text, consumer, grant, "mcp", self.audit,
+                    explicit_sensitivity=Sensitivity.LOW.value,
+                    explicit_domain=LifeDomain.UNCATEGORIZED.value,
+                )
+                if not ok:
+                    return MCPResponse(req.request_id, False, error=reason, audit_entry=entry)
+                result = handler(self, params)
+                return MCPResponse(req.request_id, True, result=result, audit_entry=entry)
+            return MCPResponse(req.request_id, False, error=f"unknown_method:{req.method}")
+        except Exception as e:
+            return MCPResponse(req.request_id, False, error=f"exception:{type(e).__name__}:{e}")
+
+    # ----- helpers: filter by grant -----
+    def _grant_allows_domain(self, consumer_id: str, domain: str) -> bool:
+        g = self.grants.get(consumer_id)
+        if not g:
+            return False
+        return (not g.allowed_domains) or (domain in g.allowed_domains)
+
+    def _grant_sens_ok(self, consumer_id: str, sensitivity: str) -> bool:
+        g = self.grants.get(consumer_id)
+        if not g:
+            return False
+        order = {s.value: i for i, s in enumerate(
+            [Sensitivity.LOW, Sensitivity.MEDIUM, Sensitivity.HIGH, Sensitivity.SECRET])}
+        return order.get(sensitivity, 0) <= order.get(g.sensitivity_ceiling, 0)
+
+    # ----- built-in tools -----
+    def _tool_add_fact(self, params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        text = str(params.get("text", "")).strip()
+        if not text:
+            return {"ok": False, "error": "empty_text"}
+        fact = self.identity.add_fact(
+            text=text,
+            domain=params.get("domain"),
+            sensitivity=params.get("sensitivity"),
+            confidence=float(params.get("confidence", 0.7)),
+            source=params.get("source", "mcp_consumer"),
+        )
+        return {"ok": True, "fact": asdict(fact)}
+
+    def _tool_list_facts(self, params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        domain = params.get("domain", LifeDomain.UNCATEGORIZED.value)
+        consumer_id = params.get("_consumer_id") or ""
+        if consumer_id and not self._grant_allows_domain(consumer_id, domain):
+            return {"ok": False, "error": "domain_out_of_scope"}
+        facts = self.identity.facts_for_domain(domain)
+        if consumer_id:
+            facts = [f for f in facts if self._grant_sens_ok(consumer_id, f.sensitivity)]
+        return {"ok": True, "facts": [asdict(f) for f in facts]}
+
+    def _tool_curiosity(self, params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        if not self.curiosity:
+            return {"ok": False, "error": "curiosity_engine_not_available"}
+        sel = self.curiosity.select_next_question()
+        if not sel:
+            return {"ok": True, "question": None}
+        q, gap, gain = sel
+        self.curiosity.record_question_asked(q, gap, gain)
+        return {"ok": True, "question": q, "domain": gap.domain,
+                "gap_type": gap.gap_type, "expected_gain": gain}
+
+    # ----- built-in resources -----
+    @staticmethod
+    def _res_portrait(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        port = srv.synth.synthesize_portrait()
+        return {
+            "one_line_summary": port.one_line_summary,
+            "domain_counts":   {d: s.fact_count for d, s in port.domains.items()},
+            "north_star_count": len(port.north_stars),
+            "rule_count":       len(port.rules),
+            "contradictions":   len(port.contradictions),
+        }
+
+    @staticmethod
+    def _res_summary(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        suffix = params.get("_suffix") or params.get("domain")
+        if not suffix:
+            return {"ok": False, "error": "missing_domain"}
+        s = srv.synth.synthesize_domain(suffix)
+        return {"ok": True, "domain": suffix, "narrative": s.narrative,
+                "fact_count": s.fact_count, "themes": s.themes}
+
+    @staticmethod
+    def _res_north_stars(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True, "north_stars": [asdict(n) for n in srv.identity.active_north_stars()]}
+
+    @staticmethod
+    def _res_rules(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True, "rules": [asdict(r) for r in srv.identity.active_rules()]}
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
