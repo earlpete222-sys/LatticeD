@@ -4824,6 +4824,9 @@ class LatticeContext:
         self.snapshots  = register_extended_mcp_surface(self.mcp, self)
         # Sprint 18 — export/import tools.
         register_export_import_tools(self.mcp, self)
+        # Sprint 20 — diagnostics surface + introspection.
+        self.diagnostics = Diagnostics(self)
+        register_diagnostics_surface(self.mcp, self)
 
     @classmethod
     def boot(cls, **cfg_kwargs: Any) -> "LatticeContext":
@@ -6141,6 +6144,289 @@ def install_encrypted_persistence(passphrase: Optional[str]) -> None:
 
     PromptEvolutionEngine.save = _encrypted_save_prompt_evo    # type: ignore[assignment]
     PromptEvolutionEngine.load = _encrypted_load_prompt_evo    # type: ignore[assignment]
+
+# =====================================================================
+# SPRINT 20 — DIAGNOSTICS + SELF-INTROSPECTION
+# =====================================================================
+# A unified report aggregator answering "how is LatticeD doing?".
+# Composes:
+#   boot_report      tier, vram, validation, fact/star/rule counts
+#   perf_summary     p50/p90/p99 per node; slowest nodes
+#   audit_summary    counts by decision/destination over a window
+#   identity_summary fact counts per domain + curiosity gaps
+#   engagement_summary  global + per-domain response rates
+#   voice_summary    drift per agent (brevity, warmth, curiosity)
+#   tension_summary  high-tension domains from Two Mes Model
+#   business_summary active business + profile counts
+#   encryption_status whether at-rest encryption is on
+#
+# Public API:
+#   Diagnostics(ctx).snapshot()  -> dict
+#   Diagnostics(ctx).render()    -> str (human-readable text report)
+#   register_diagnostics_surface(server, ctx)  -> MCP tools + resources
+#
+# Auto-registered on LatticeContext boot.
+# =====================================================================
+
+class Diagnostics:
+    """Composes a live snapshot of system state for self-introspection."""
+
+    def __init__(self, ctx: "LatticeContext") -> None:
+        self.ctx = ctx
+
+    # ----- individual sections -----
+    def perf_summary(self) -> Dict[str, Any]:
+        plog = self.ctx.perf
+        nodes = sorted({s.node for s in plog.samples})
+        per_node = {n: plog.aggregate(n) for n in nodes}
+        return {
+            "total_samples":  len(plog.samples),
+            "nodes":          nodes,
+            "per_node":       per_node,
+            "slowest":        plog.slowest_nodes(top_k=5),
+            "global":         plog.aggregate(),
+        }
+
+    def audit_summary(self, window_seconds: float = 24 * 3600.0) -> Dict[str, Any]:
+        rows = self.ctx.audit.read_all()
+        cutoff = time.time() - window_seconds
+        recent = [r for r in rows if r.timestamp >= cutoff]
+        decisions: Dict[str, int] = {}
+        destinations: Dict[str, int] = {}
+        consumers:    Dict[str, int] = {}
+        for r in recent:
+            decisions[r.decision]       = decisions.get(r.decision, 0) + 1
+            destinations[r.destination] = destinations.get(r.destination, 0) + 1
+            consumers[r.consumer_id]    = consumers.get(r.consumer_id, 0) + 1
+        return {
+            "window_seconds":   window_seconds,
+            "total":            len(rows),
+            "in_window":        len(recent),
+            "by_decision":      decisions,
+            "by_destination":   destinations,
+            "by_consumer":      consumers,
+        }
+
+    def identity_summary(self) -> Dict[str, Any]:
+        store = self.ctx.identity
+        gaps = self.ctx.curiosity.detect_gaps()
+        gap_by_type: Dict[str, int] = {}
+        for g in gaps:
+            gap_by_type[g.gap_type] = gap_by_type.get(g.gap_type, 0) + 1
+        return {
+            "facts":                  len(store.doc.facts),
+            "north_stars":            len(store.doc.north_stars),
+            "constitutional_rules":   len(store.doc.constitutional_rules),
+            "domain_summaries":       len(store.doc.domain_summaries),
+            "facts_per_domain": {
+                d.value: len(store.facts_for_domain(d.value))
+                for d in LifeDomain if d != LifeDomain.UNCATEGORIZED
+            },
+            "open_gaps":              len(gaps),
+            "gaps_by_type":           gap_by_type,
+        }
+
+    def engagement_summary(self) -> Dict[str, Any]:
+        ledger = self.ctx.curiosity_ledger
+        per_domain: Dict[str, float] = {}
+        for d in LifeDomain:
+            if d == LifeDomain.UNCATEGORIZED:
+                continue
+            per_domain[d.value] = round(ledger.response_rate(d.value), 3)
+        return {
+            "total_questions":   len(ledger.entries),
+            "global_rate":       round(ledger.response_rate(), 3),
+            "per_domain_rate":   per_domain,
+            "outstanding_hour":  sum(1 for e in ledger.recent_in_window(3600.0)
+                                       if e.answered is None),
+            "asked_24h":         len(ledger.recent_in_window(86400.0)),
+        }
+
+    def voice_summary(self) -> Dict[str, Any]:
+        voice = self.ctx.voice
+        out: Dict[str, Any] = {}
+        for aid, p in voice.profiles.items():
+            out[aid] = {
+                "brevity_pref":     round(p.brevity_pref, 3),
+                "warmth_pref":      round(p.warmth_pref, 3),
+                "curiosity_mult":   round(p.curiosity_mult, 3),
+                "interactions":     p.interaction_count,
+            }
+        return {"agents_with_drift": len(voice.profiles), "profiles": out}
+
+    def tension_summary(self) -> Dict[str, Any]:
+        model = TwoMesModel.from_store(self.ctx.identity)
+        top = high_tension_domains(model)
+        return {"high_tension_domains":
+                  [{"domain": d, "tension": round(s, 3)} for d, s in top]}
+
+    def business_summary(self) -> Dict[str, Any]:
+        bs = self.ctx.business
+        return {
+            "active_id":       bs.active_id,
+            "profile_count":   len(bs.profiles),
+            "profiles":        [
+                {"business_id": bid,
+                 "fact_count": len(bp.facts),
+                 "north_star_count": len(bp.north_stars)}
+                for bid, bp in bs.profiles.items()
+            ],
+        }
+
+    def encryption_status(self) -> Dict[str, Any]:
+        return {
+            "at_rest_active":  bool(getattr(self.ctx, "_passphrase_active", False)),
+            "library":         "fernet" if _try_fernet_class() else "xor-fallback",
+        }
+
+    # ----- composite -----
+    def snapshot(self) -> Dict[str, Any]:
+        boot = self.ctx.boot_report()
+        return {
+            "generated_at":         time.time(),
+            "boot":                 boot,
+            "perf":                 self.perf_summary(),
+            "audit_24h":            self.audit_summary(),
+            "identity":             self.identity_summary(),
+            "engagement":           self.engagement_summary(),
+            "voice":                self.voice_summary(),
+            "tension":              self.tension_summary(),
+            "business":             self.business_summary(),
+            "encryption":           self.encryption_status(),
+        }
+
+    def render(self) -> str:
+        snap = self.snapshot()
+        lines: List[str] = []
+        lines.append("=" * 64)
+        lines.append("LatticeD diagnostics")
+        lines.append("=" * 64)
+        b = snap["boot"]
+        lines.append(f"user        : {b['user_id']}")
+        lines.append(f"tier        : {b['tier']} (vram {b['vram_gb']} GB)")
+        lines.append(f"agents      : {b['agents']}    validation: {'VALID' if b['validation'] else 'INVALID'}")
+        if b.get("validation_warns"):
+            for w in b["validation_warns"][:3]:
+                lines.append(f"  WARN: {w}")
+        enc = snap["encryption"]
+        lines.append(f"encryption  : {'ON' if enc['at_rest_active'] else 'off'}  (lib={enc['library']})")
+        lines.append("")
+
+        # identity
+        ident = snap["identity"]
+        lines.append(f"identity    : {ident['facts']} fact(s), "
+                     f"{ident['north_stars']} north star(s), "
+                     f"{ident['constitutional_rules']} rule(s); "
+                     f"{ident['open_gaps']} open gap(s)")
+        active_doms = [(d, c) for d, c in ident["facts_per_domain"].items() if c > 0]
+        for dom, count in sorted(active_doms, key=lambda kv: -kv[1])[:5]:
+            lines.append(f"  - {dom:15s} : {count}")
+        if not active_doms:
+            lines.append("  - (no facts yet)")
+        lines.append("")
+
+        # tension
+        tens = snap["tension"]["high_tension_domains"]
+        if tens:
+            lines.append("high-tension domains (aspirations exceed footprint):")
+            for t in tens[:3]:
+                lines.append(f"  - {t['domain']:15s} tension={t['tension']:.2f}")
+            lines.append("")
+
+        # engagement
+        eng = snap["engagement"]
+        lines.append(f"engagement  : {eng['total_questions']} curiosity question(s); "
+                     f"rate={eng['global_rate']:.2f}; "
+                     f"outstanding(1h)={eng['outstanding_hour']}; asked(24h)={eng['asked_24h']}")
+        lines.append("")
+
+        # voice
+        vc = snap["voice"]
+        if vc["profiles"]:
+            lines.append(f"voice drift : {vc['agents_with_drift']} agent(s) with observations")
+            for aid, prof in list(vc["profiles"].items())[:5]:
+                lines.append(
+                    f"  - {aid:18s} brevity={prof['brevity_pref']:.2f} "
+                    f"warmth={prof['warmth_pref']:.2f} "
+                    f"curiosity={prof['curiosity_mult']:.2f} "
+                    f"({prof['interactions']} sample(s))"
+                )
+            lines.append("")
+
+        # perf
+        p = snap["perf"]
+        lines.append(f"perf        : {p['total_samples']} sample(s) across {len(p['nodes'])} node(s)")
+        for node, ms in (p["slowest"] or [])[:3]:
+            lines.append(f"  - {node:18s} mean={ms:.0f} ms")
+        lines.append("")
+
+        # audit
+        a = snap["audit_24h"]
+        lines.append(f"audit (24h) : {a['in_window']} event(s) / {a['total']} lifetime")
+        for k, v in (a["by_decision"] or {}).items():
+            lines.append(f"  - {k:7s} : {v}")
+        if a["by_consumer"]:
+            for k, v in a["by_consumer"].items():
+                lines.append(f"  - consumer {k:20s}: {v} event(s)")
+        lines.append("")
+
+        # business
+        bz = snap["business"]
+        lines.append(f"business    : active={bz['active_id'] or '-'}, profiles={bz['profile_count']}")
+        for prof in bz["profiles"][:3]:
+            lines.append(f"  - {prof['business_id']:14s} facts={prof['fact_count']} "
+                         f"north_stars={prof['north_star_count']}")
+        lines.append("=" * 64)
+        return "\n".join(lines)
+
+
+# ---------- MCP wiring -------------------------------------------------
+def register_diagnostics_surface(server: "MCPServer", ctx: "LatticeContext") -> None:
+    diag = Diagnostics(ctx)
+
+    def _tool_get_diagnostics(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        sections = params.get("sections")
+        if sections is None:
+            snap = diag.snapshot()
+        else:
+            avail = {
+                "boot":       ctx.boot_report,
+                "perf":       diag.perf_summary,
+                "audit_24h":  diag.audit_summary,
+                "identity":   diag.identity_summary,
+                "engagement": diag.engagement_summary,
+                "voice":      diag.voice_summary,
+                "tension":    diag.tension_summary,
+                "business":   diag.business_summary,
+                "encryption": diag.encryption_status,
+            }
+            snap = {}
+            for s in sections:
+                if s in avail:
+                    snap[s] = avail[s]()
+        return {"ok": True, "diagnostics": snap}
+
+    def _tool_render_diagnostics(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        return {"ok": True, "text": diag.render()}
+
+    server.register_tool("get_diagnostics",    _tool_get_diagnostics)
+    server.register_tool("render_diagnostics", _tool_render_diagnostics)
+
+    def _res(section_fn):
+        def _h(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+            return {"ok": True, "section": section_fn()}
+        return _h
+
+    server.register_resource("diagnostics://full",
+        lambda srv, params: {"ok": True, "snapshot": diag.snapshot()})
+    server.register_resource("diagnostics://perf",       _res(diag.perf_summary))
+    server.register_resource("diagnostics://audit",      _res(diag.audit_summary))
+    server.register_resource("diagnostics://identity",   _res(diag.identity_summary))
+    server.register_resource("diagnostics://engagement", _res(diag.engagement_summary))
+    server.register_resource("diagnostics://voice",      _res(diag.voice_summary))
+    server.register_resource("diagnostics://tension",    _res(diag.tension_summary))
+    server.register_resource("diagnostics://business",   _res(diag.business_summary))
+    server.register_resource("diagnostics://encryption", _res(diag.encryption_status))
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
