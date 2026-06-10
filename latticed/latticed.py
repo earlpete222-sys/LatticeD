@@ -637,11 +637,15 @@ def json_repair_middleware(raw_output: str, fallback_key: str = "verdict") -> di
 # SPRINT 0 — MODEL INTELLIGENCE LAYER
 # =====================================================================
 #
-# STATUS: Foundation in place (this commit). Next steps for next session:
-#   1. Extend every existing AgentSpec in AgentFactoryRegistry to declare
-#      capabilities_required, adversarial_pair, consensus_requirement,
-#      and model_pool_per_tier — preserving exact current behavior on
-#      MINIMAL_GPU profile.  Pattern documented in this header.
+# STATUS: Foundation + capability declarations in place. Next steps:
+#   1. [DONE] Every AgentSpec in AgentFactoryRegistry declares
+#      capabilities_required, adversarial_pair (where applicable),
+#      consensus_requirement, and model_pool_per_tier.  MINIMAL_GPU
+#      behavior preserved bit-for-bit; runtime still reads model_name.
+#      Known compromise: quant_architect_explore's pool declares the
+#      deepseek-r1 family for true cross-family adversarial diversity,
+#      but model_name still points to MODEL_SYNTHESIS until Step 2's
+#      profile loader migrates the runtime to pool-based selection.
 #   2. Build profile YAML loader (profiles/minimal_gpu.yaml, standard.yaml,
 #      high.yaml) and hardware_profile_detect() function at startup.
 #   3. Implement run_behavioral_fingerprint() — runs at first startup,
@@ -833,7 +837,21 @@ class AgentFactoryRegistry:
                         "intent": {"type": "string", "enum": ["TASK", "RESEARCH", "SHELL", "PERSONAL", "CHAT"]}
                     },
                     "required": ["intent"]
-                }
+                },
+                capabilities_required={
+                    Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+                },
+                capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+                consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_SYNTHESIS],
+                    ModelTier.STANDARD.value:    ["qwen2.5-coder:7b"],
+                    ModelTier.HIGH.value:        ["qwen2.5-coder:14b"],
+                    ModelTier.ENTERPRISE.value:  ["qwen2.5-coder:32b"],
+                },
+                scales_with=ModelTier.STANDARD.value,
+                preferred_tier=ModelTier.STANDARD.value,
             ),
             "fast_mentor": AgentSpec(
                 agent_id="fast_mentor",
@@ -878,7 +896,22 @@ class AgentFactoryRegistry:
                     "VOICE: Warm, direct, curious. Address the user as 'you'. Match their energy — a "
                     "four-word message gets a one-sentence reply with a question. Be brief.\n\n"
                     "Write the response only. Stop after the question mark."
-                )
+                ),
+                capabilities_required={
+                    Capability.EMOTIONAL_INTELLIGENCE.value: CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value:  CapabilityLevel.STRONG.value,
+                    Capability.BRIEF_RESPONSES.value:        CapabilityLevel.STRONG.value,
+                },
+                capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+                consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_REASONING],
+                    ModelTier.STANDARD.value:    ["deepseek-r1:7b"],
+                    ModelTier.HIGH.value:        ["deepseek-r1:14b"],
+                    ModelTier.ENTERPRISE.value:  ["deepseek-r1:32b"],
+                },
+                scales_with=ModelTier.STANDARD.value,
+                preferred_tier=ModelTier.STANDARD.value,
             ),
             "quant_architect": AgentSpec(
                 agent_id="quant_architect",
@@ -922,6 +955,23 @@ class AgentFactoryRegistry:
                     "insurance products should not appear unless the user specifically asked about them.\n\n"
                     "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
+                capabilities_required={
+                    Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.STRONG.value,
+                    Capability.MATH_REASONING.value:        CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+                },
+                capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+                adversarial_pair="quant_architect_explore",
+                consensus_requirement=ConsensusRequirement.PAIR_AGREEMENT.value,
+                minimum_models_must_agree=2,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_SYNTHESIS],
+                    ModelTier.STANDARD.value:    ["qwen2.5-coder:7b"],
+                    ModelTier.HIGH.value:        ["qwen2.5-coder:14b"],
+                    ModelTier.ENTERPRISE.value:  ["qwen2.5-coder:32b"],
+                },
+                scales_with=ModelTier.STANDARD.value,
+                preferred_tier=ModelTier.HIGH.value,
             ),
             "factual_auditor": AgentSpec(
                 agent_id="factual_auditor",
@@ -943,7 +993,23 @@ class AgentFactoryRegistry:
                         "critique":          {"type": "string"}
                     },
                     "required": ["validation_status", "critique"]
-                }
+                },
+                capabilities_required={
+                    Capability.NUANCED_CRITIQUE.value:      CapabilityLevel.STRONG.value,
+                    Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+                },
+                capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+                adversarial_pair="quant_architect",
+                consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_REASONING],
+                    ModelTier.STANDARD.value:    ["deepseek-r1:7b"],
+                    ModelTier.HIGH.value:        ["deepseek-r1:14b"],
+                    ModelTier.ENTERPRISE.value:  ["deepseek-r1:32b"],
+                },
+                scales_with=ModelTier.HIGH.value,
+                preferred_tier=ModelTier.HIGH.value,
             ),
             "life_coach": AgentSpec(
                 agent_id="life_coach",
@@ -960,7 +1026,23 @@ class AgentFactoryRegistry:
                     "Draw on conversation history to personalize your response. Identify the core emotional or "
                     "personal need behind the request and address it directly. Be a coach and mentor — not a "
                     "generic assistant. Respond with warmth, depth, and genuine care."
-                )
+                ),
+                capabilities_required={
+                    Capability.EMOTIONAL_INTELLIGENCE.value: CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value:  CapabilityLevel.STRONG.value,
+                    Capability.NUANCED_CRITIQUE.value:       CapabilityLevel.MODERATE.value,
+                    Capability.REASONING.value:              CapabilityLevel.MODERATE.value,
+                },
+                capabilities_avoid=[Capability.BRIEF_RESPONSES.value],
+                consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_REASONING],
+                    ModelTier.STANDARD.value:    ["deepseek-r1:7b"],
+                    ModelTier.HIGH.value:        ["deepseek-r1:14b"],
+                    ModelTier.ENTERPRISE.value:  ["deepseek-r1:32b"],
+                },
+                scales_with=ModelTier.HIGH.value,
+                preferred_tier=ModelTier.HIGH.value,
             ),
             "fact_extractor": AgentSpec(
                 agent_id="fact_extractor",
@@ -984,7 +1066,22 @@ class AgentFactoryRegistry:
                         }
                     },
                     "required": ["facts"]
-                }
+                },
+                capabilities_required={
+                    Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.STRONG.value,
+                    Capability.FACTUAL_RECALL.value:        CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+                },
+                capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+                consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_SYNTHESIS],
+                    ModelTier.STANDARD.value:    ["qwen2.5-coder:7b"],
+                    ModelTier.HIGH.value:        ["qwen2.5-coder:14b"],
+                    ModelTier.ENTERPRISE.value:  ["qwen2.5-coder:32b"],
+                },
+                scales_with=ModelTier.STANDARD.value,
+                preferred_tier=ModelTier.STANDARD.value,
             ),
             "quant_architect_explore": AgentSpec(
                 agent_id="quant_architect_explore",
@@ -1028,6 +1125,31 @@ class AgentFactoryRegistry:
                     "insurance products should not appear unless the user specifically asked about them.\n\n"
                     "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
+                capabilities_required={
+                    Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.STRONG.value,
+                    Capability.MATH_REASONING.value:        CapabilityLevel.STRONG.value,
+                    Capability.CREATIVE_GENERATION.value:   CapabilityLevel.MODERATE.value,
+                    Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+                },
+                adversarial_pair="quant_architect",
+                consensus_requirement=ConsensusRequirement.PAIR_AGREEMENT.value,
+                minimum_models_must_agree=2,
+                # Pool declares CROSS-FAMILY target: the conservative variant
+                # uses qwen2.5-coder, so the exploratory variant should use the
+                # deepseek-r1 family to satisfy the two-model adversarial
+                # principle.  The current model_name=MODEL_SYNTHESIS preserves
+                # bit-for-bit behavior on MINIMAL_GPU until the profile loader
+                # (Sprint 0 Step 2) migrates the runtime to pool-based model
+                # selection.  The profile validator (Step 4) will flag the
+                # current same-family pairing as a known MINIMAL_GPU compromise.
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_REASONING],
+                    ModelTier.STANDARD.value:    ["deepseek-r1:7b"],
+                    ModelTier.HIGH.value:        ["deepseek-r1:14b"],
+                    ModelTier.ENTERPRISE.value:  ["deepseek-r1:32b"],
+                },
+                scales_with=ModelTier.STANDARD.value,
+                preferred_tier=ModelTier.HIGH.value,
             ),
             "grounding_extractor": AgentSpec(
                 agent_id="grounding_extractor",
@@ -1057,7 +1179,23 @@ class AgentFactoryRegistry:
                         }
                     },
                     "required": ["facts"]
-                }
+                },
+                capabilities_required={
+                    Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.STRONG.value,
+                    Capability.FACTUAL_RECALL.value:        CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+                    Capability.LONG_CONTEXT.value:          CapabilityLevel.MODERATE.value,
+                },
+                capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+                consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_SYNTHESIS],
+                    ModelTier.STANDARD.value:    ["qwen2.5-coder:7b"],
+                    ModelTier.HIGH.value:        ["qwen2.5-coder:14b"],
+                    ModelTier.ENTERPRISE.value:  ["qwen2.5-coder:32b"],
+                },
+                scales_with=ModelTier.STANDARD.value,
+                preferred_tier=ModelTier.STANDARD.value,
             ),
             "research_synthesizer": AgentSpec(
                 agent_id="research_synthesizer",
@@ -1085,7 +1223,27 @@ class AgentFactoryRegistry:
                     "EXAMPLE OF FORBIDDEN BEHAVIOR:\n"
                     "  Facts say: '2024 IRA limit: $7,000'\n"
                     "  WRONG output: '• The limit is $23,500' ← DO NOT DO THIS — $23,500 is not in the facts"
-                )
+                ),
+                capabilities_required={
+                    Capability.FACTUAL_RECALL.value:        CapabilityLevel.STRONG.value,
+                    Capability.REFUSAL_DISCIPLINE.value:    CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+                    Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.MODERATE.value,
+                },
+                capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+                consensus_requirement=ConsensusRequirement.TRIANGULATION_REQUIRED.value,
+                minimum_models_must_agree=2,
+                # Research synthesis makes factual claims with stakes — at HIGH+
+                # tiers the pool intentionally includes BOTH families so the
+                # triangulation pass can compare answers across model lineages.
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_SYNTHESIS],
+                    ModelTier.STANDARD.value:    ["qwen2.5-coder:7b", "deepseek-r1:7b"],
+                    ModelTier.HIGH.value:        ["qwen2.5-coder:14b", "deepseek-r1:14b"],
+                    ModelTier.ENTERPRISE.value:  ["qwen2.5-coder:32b", "deepseek-r1:32b", "llama3.3:70b"],
+                },
+                scales_with=ModelTier.HIGH.value,
+                preferred_tier=ModelTier.HIGH.value,
             ),
             "system_guardian": AgentSpec(
                 agent_id="system_guardian",
@@ -1104,7 +1262,27 @@ class AgentFactoryRegistry:
                         "decision": {"type": "string", "enum": ["APPROVE", "REJECT"]}
                     },
                     "required": ["decision"]
-                }
+                },
+                capabilities_required={
+                    Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.STRONG.value,
+                    Capability.REFUSAL_DISCIPLINE.value:    CapabilityLevel.STRONG.value,
+                    Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+                    Capability.NUANCED_CRITIQUE.value:      CapabilityLevel.MODERATE.value,
+                },
+                capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+                # Guardian's verdict gates user-facing output.  At HIGH+ tiers
+                # this is bumped to TRIANGULATION_REQUIRED via profile override
+                # (see Sprint 0 Step 5).  Default stays SINGLE_MODEL to preserve
+                # MINIMAL_GPU behavior exactly.
+                consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_SYNTHESIS],
+                    ModelTier.STANDARD.value:    ["qwen2.5-coder:7b"],
+                    ModelTier.HIGH.value:        ["qwen2.5-coder:14b", "deepseek-r1:14b"],
+                    ModelTier.ENTERPRISE.value:  ["qwen2.5-coder:32b", "deepseek-r1:32b"],
+                },
+                scales_with=ModelTier.HIGH.value,
+                preferred_tier=ModelTier.HIGH.value,
             ),
             "executive_arbiter": AgentSpec(
                 agent_id="executive_arbiter",
@@ -1117,7 +1295,21 @@ class AgentFactoryRegistry:
                     "You are LatticeD's Executive Arbiter — skilled in communication, leadership, "
                     "adaptability, and coaching. Synthesize the approved strategy into a clear, "
                     "actionable artifact the user can immediately apply. Write with authority and warmth."
-                )
+                ),
+                capabilities_required={
+                    Capability.INSTRUCTION_FOLLOWING.value:  CapabilityLevel.STRONG.value,
+                    Capability.EMOTIONAL_INTELLIGENCE.value: CapabilityLevel.MODERATE.value,
+                    Capability.STRUCTURED_OUTPUT.value:      CapabilityLevel.MODERATE.value,
+                },
+                consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+                model_pool_per_tier={
+                    ModelTier.MINIMAL_GPU.value: [MODEL_SYNTHESIS],
+                    ModelTier.STANDARD.value:    ["qwen2.5-coder:7b"],
+                    ModelTier.HIGH.value:        ["qwen2.5-coder:14b", "deepseek-r1:14b"],
+                    ModelTier.ENTERPRISE.value:  ["qwen2.5-coder:32b", "llama3.3:70b"],
+                },
+                scales_with=ModelTier.HIGH.value,
+                preferred_tier=ModelTier.HIGH.value,
             )
         }
 
