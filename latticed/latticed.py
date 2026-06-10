@@ -2791,6 +2791,175 @@ def build_continuity_preamble(store: "ContinuityStore", n: int = 1) -> str:
             lines.append("  - " + " | ".join(parts))
     return "\n".join(lines)
 
+# =====================================================================
+# SPRINT 4 — VOICE EVOLUTION ENGINE
+# =====================================================================
+# Per-agent voice parameters that adapt over time from engagement
+# signals.  When users engage more with brief, warm fast_mentor outputs,
+# the brevity preference inches up; when curiosity questions in a domain
+# go unanswered, that domain's curiosity multiplier drifts down.
+#
+# Persistent at runtime/storage/voice_profiles.json.  All evolution
+# is opt-in: the runtime calls record_interaction(...) and reads
+# evolved_salience(agent_id) only when ready.
+# =====================================================================
+
+@dataclass
+class EngagementSignal:
+    """A single observation about how an agent's output landed."""
+    agent_id: str
+    timestamp: float                      = field(default_factory=lambda: time.time())
+    output_chars: int                     = 0
+    user_followed_up: Optional[bool]      = None      # did the user reply within window?
+    user_explicit_positive: Optional[bool] = None     # 👍 / "thanks" / "perfect"
+    user_explicit_negative: Optional[bool] = None     # 👎 / "wrong" / "too long"
+    curiosity_question_answered: Optional[bool] = None
+    domain: Optional[str]                 = None
+    metadata: Dict[str, Any]              = field(default_factory=dict)
+
+@dataclass
+class VoiceProfile:
+    """
+    Learned per-agent voice parameters.  Centered at 1.0 (neutral);
+    drift bounded to [0.5, 2.0] so no single bad week can destroy voice.
+    """
+    agent_id: str
+    brevity_pref:        float            = 1.0     # >1 = user prefers shorter outputs
+    warmth_pref:         float            = 1.0     # >1 = user prefers warmer tone
+    curiosity_mult:      float            = 1.0     # >1 = ask more curiosity questions
+    domain_curiosity:    Dict[str, float] = field(default_factory=dict)  # per-domain multiplier
+    interaction_count:   int              = 0
+    last_updated:        float            = field(default_factory=lambda: time.time())
+    metadata:            Dict[str, Any]   = field(default_factory=dict)
+
+VOICE_PROFILES_PATH = STORAGE_DIR / "voice_profiles.json"
+VOICE_DRIFT_MIN  = 0.5
+VOICE_DRIFT_MAX  = 2.0
+VOICE_LEARN_RATE = 0.05   # per-signal nudge
+
+class VoiceEvolutionEngine:
+    """
+    Tracks engagement signals per agent and evolves a VoiceProfile.
+    Drift is bounded and slow — voices change over weeks, not minutes.
+    """
+    def __init__(self, path: Path = VOICE_PROFILES_PATH) -> None:
+        self.path: Path = path
+        self.profiles: Dict[str, VoiceProfile] = {}
+        self.signals: List[EngagementSignal] = []   # recent ring buffer
+
+    # ----- lifecycle -----
+    def load(self) -> "VoiceEvolutionEngine":
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                self.profiles = {
+                    aid: VoiceProfile(**v)
+                    for aid, v in data.get("profiles", {}).items()
+                }
+            except Exception as e:
+                logger.warning(f"voice profiles load failed at {self.path}: {e}")
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"profiles": {aid: asdict(p) for aid, p in self.profiles.items()}}
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    # ----- access -----
+    def profile_for(self, agent_id: str) -> VoiceProfile:
+        if agent_id not in self.profiles:
+            self.profiles[agent_id] = VoiceProfile(agent_id=agent_id)
+        return self.profiles[agent_id]
+
+    @staticmethod
+    def _clamp(x: float) -> float:
+        return max(VOICE_DRIFT_MIN, min(VOICE_DRIFT_MAX, x))
+
+    # ----- learning -----
+    def record_interaction(self, signal: EngagementSignal) -> VoiceProfile:
+        """
+        Nudge the agent's profile based on a single observation.
+        Effect sizes are small (VOICE_LEARN_RATE) so evolution is slow.
+        """
+        p = self.profile_for(signal.agent_id)
+        p.interaction_count += 1
+        p.last_updated = time.time()
+
+        # Brevity: positive feedback on a long output -> user tolerates length
+        # (brevity pref drifts DOWN); negative feedback on a long output ->
+        # brevity pref drifts UP.
+        if signal.output_chars and signal.user_explicit_positive:
+            if signal.output_chars > 600:
+                p.brevity_pref = self._clamp(p.brevity_pref - VOICE_LEARN_RATE)
+            elif signal.output_chars < 200:
+                p.brevity_pref = self._clamp(p.brevity_pref + VOICE_LEARN_RATE / 2)
+        if signal.user_explicit_negative and signal.output_chars and signal.output_chars > 400:
+            p.brevity_pref = self._clamp(p.brevity_pref + VOICE_LEARN_RATE * 2)
+
+        # Warmth: positive emoji/word feedback nudges warmth up.
+        if signal.user_explicit_positive:
+            p.warmth_pref = self._clamp(p.warmth_pref + VOICE_LEARN_RATE / 2)
+        if signal.user_explicit_negative:
+            p.warmth_pref = self._clamp(p.warmth_pref - VOICE_LEARN_RATE / 4)
+
+        # Curiosity: answered question -> bump global curiosity AND domain;
+        # unanswered question -> drop both.
+        if signal.curiosity_question_answered is True:
+            p.curiosity_mult = self._clamp(p.curiosity_mult + VOICE_LEARN_RATE)
+            if signal.domain:
+                p.domain_curiosity[signal.domain] = self._clamp(
+                    p.domain_curiosity.get(signal.domain, 1.0) + VOICE_LEARN_RATE * 2
+                )
+        elif signal.curiosity_question_answered is False:
+            p.curiosity_mult = self._clamp(p.curiosity_mult - VOICE_LEARN_RATE / 2)
+            if signal.domain:
+                p.domain_curiosity[signal.domain] = self._clamp(
+                    p.domain_curiosity.get(signal.domain, 1.0) - VOICE_LEARN_RATE
+                )
+
+        # User followed up at all = mild positive signal for the agent.
+        if signal.user_followed_up is True and signal.user_explicit_negative is not True:
+            p.warmth_pref = self._clamp(p.warmth_pref + VOICE_LEARN_RATE / 4)
+
+        # Keep a small recent-signal ring buffer (memory-only).
+        self.signals.append(signal)
+        if len(self.signals) > 200:
+            self.signals = self.signals[-200:]
+        return p
+
+    # ----- application -----
+    def evolved_salience(self, agent_id: str, base: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Apply the learned profile to a base AGENT_SALIENCE policy.
+        Heavy brevity_pref shrinks max_facts; high curiosity_mult is
+        used by callers to decide whether to weave a curiosity question.
+        """
+        p = self.profile_for(agent_id)
+        out = dict(base or {})
+        base_facts = int(out.get("max_facts", 0) or 0)
+        if base_facts > 0 and p.brevity_pref > 1.0:
+            shrink = 1.0 / p.brevity_pref
+            out["max_facts"] = max(1, int(round(base_facts * shrink)))
+        out["_voice_brevity_pref"]   = p.brevity_pref
+        out["_voice_warmth_pref"]    = p.warmth_pref
+        out["_voice_curiosity_mult"] = p.curiosity_mult
+        return out
+
+    def should_ask_curiosity(
+        self, agent_id: str, domain: Optional[str], default: bool = True,
+    ) -> bool:
+        """
+        Combine the global curiosity_mult and the domain-specific
+        multiplier to decide whether to weave a curiosity question this
+        turn.  Result is deterministic given the same profile state.
+        """
+        p = self.profile_for(agent_id)
+        score = p.curiosity_mult * (p.domain_curiosity.get(domain, 1.0) if domain else 1.0)
+        # default=True means "ask unless score has clearly drifted below 0.7"
+        return score >= 0.7 if default else score >= 1.3
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
