@@ -3024,7 +3024,10 @@ _OPPOSING_VERB_PAIRS: List[Tuple[str, str]] = [
 _THEME_STOPWORDS = set(
     "i me my we us our the a an and or but if of in on at to for with from "
     "is am are was were be been being do does did don dont have has had this "
-    "that those these as by it about not no yes you your they them their".split()
+    "that those these as by it about not no yes you your they them their "
+    # Generic emotion/desire verbs - poor cross-memory signal.
+    "love loves loved hate hates hated enjoy enjoys enjoyed like likes liked "
+    "want wants wanted feel feels felt think thinks thought".split()
 )
 
 class IdentitySynthesizer:
@@ -4177,6 +4180,149 @@ def drift_report(earlier: SelfSnapshot, later: SelfSnapshot) -> DriftReport:
                  f"-{len(r.lost_domains)} lost, "
                  f"{len(r.confidence_changes)} confidence shift(s).")
     return r
+
+# =====================================================================
+# SPRINT 11 — ASPECT EXTRACTION + CROSS-MEMORY RECOMBINATION
+# =====================================================================
+# Structured attribute extraction (deterministic regex + heuristics) and
+# combinatorial reasoning over facts spanning multiple life domains.
+#
+#   Aspect                       a name=value attribute pulled from text
+#   extract_aspects(text)        list of Aspects with confidence + source
+#   AspectIndex                  store + lookup aspects by name across facts
+#   RecombinedInsight            a derived observation linking two facts
+#                                from DIFFERENT domains
+#   recombine_memory(store)      finds N high-signal cross-domain links
+# =====================================================================
+
+@dataclass
+class Aspect:
+    name:           str
+    value:          str
+    source_text:    str
+    confidence:     float                           = 0.6
+    domain:         str                             = LifeDomain.UNCATEGORIZED.value
+    metadata:       Dict[str, Any]                  = field(default_factory=dict)
+
+# Aspect patterns: (name, regex with one capture group).  Conservative —
+# false-negative beats false-positive for identity attributes.
+_ASPECT_PATTERNS: List[Tuple[str, str]] = [
+    ("profession",     r"\b(?:i\s+(?:work|am)\s+(?:as\s+)?(?:an?\s+)?)([a-z][a-z -]{2,40})(?=\s+(?:at|for|in|with|on|and)\b|[.,;]|$)"),
+    ("employer",       r"\b(?:at|for)\s+(?:an?\s+|the\s+)?([A-Z][A-Za-z0-9 &-]{2,40}?)(?=[\s,.;]|$)"),
+    ("partner_status", r"\b(my (?:wife|husband|partner|girlfriend|boyfriend|fiance|fiancée))\b"),
+    ("children",       r"\b(?:i\s+have\s+|my\s+)(\d+\s+(?:kids?|children|sons?|daughters?))\b"),
+    ("location_hint",  r"\b(?:i\s+live\s+(?:in|near)\s+|i'm\s+from\s+)([a-zA-Z][a-zA-Z .'-]{2,40}?)(?=[\s,.;]|$)"),
+    ("hobby",          r"\b(?:i\s+(?:enjoy|love|like)\s+)([a-z][a-z -]{2,30}?)(?=[\s,.;]|$)"),
+    ("financial_goal", r"\b(?:saving for|paying off|building up)\s+([a-z][a-z $0-9-]{2,40}?)(?=[\s,.;]|$)"),
+    ("salary_band",    r"\b(?:earn|make|salary(?:\s+is)?)\s+\$?([\d.,]+\s*[kKmM]?)\b"),
+    ("health_routine", r"\b(?:i\s+(?:run|cycle|swim|lift|practice|do)\s+)([a-z][a-z 0-9-]{2,40}?)(?=[\s,.;]|$)"),
+    ("learning_goal",  r"\b(?:learning|studying|practicing)\s+([a-z][a-zA-Z .#+]{2,30}?)(?=[\s,.;]|$)"),
+]
+
+def extract_aspects(text: str) -> List[Aspect]:
+    """Pull structured aspects from a single text blob.  Deterministic."""
+    if not text:
+        return []
+    out: List[Aspect] = []
+    lo = text
+    for name, pattern in _ASPECT_PATTERNS:
+        for m in re.finditer(pattern, lo, flags=re.IGNORECASE):
+            val = m.group(1).strip().rstrip(".,;:")
+            if not val or len(val) < 2:
+                continue
+            out.append(Aspect(
+                name=name, value=val, source_text=text,
+                confidence=0.65,
+                domain=classify_domain(text),
+            ))
+    return out
+
+class AspectIndex:
+    """Aggregates aspects pulled from a corpus of texts (e.g., a store)."""
+    def __init__(self) -> None:
+        self.by_name: Dict[str, List[Aspect]] = {}
+
+    def add(self, asp: Aspect) -> None:
+        self.by_name.setdefault(asp.name, []).append(asp)
+
+    def add_all(self, aspects: Iterable[Aspect]) -> None:
+        for a in aspects:
+            self.add(a)
+
+    def get(self, name: str) -> List[Aspect]:
+        return list(self.by_name.get(name, []))
+
+    def names(self) -> List[str]:
+        return sorted(self.by_name.keys())
+
+    @classmethod
+    def from_store(cls, store: "IdentityStore") -> "AspectIndex":
+        idx = cls()
+        for f in store.doc.facts:
+            for a in extract_aspects(f.text):
+                a.domain = f.domain or a.domain
+                a.confidence = min(1.0, (a.confidence + f.confidence) / 2)
+                idx.add(a)
+        return idx
+
+# ---------- Cross-memory recombination -------------------------------
+@dataclass
+class RecombinedInsight:
+    domain_a:    str
+    domain_b:    str
+    fact_a:      str
+    fact_b:      str
+    link_terms:  List[str]                          = field(default_factory=list)
+    score:       float                              = 0.0
+    note:        str                                = ""
+
+def _content_tokens(text: str) -> set:
+    toks = set(re.findall(r"[a-zA-Z]{4,}", (text or "").lower()))
+    return {t for t in toks if t not in _THEME_STOPWORDS}
+
+def recombine_memory(
+    store: "IdentityStore",
+    top_k: int = 5,
+    min_score: float = 0.05,
+) -> List[RecombinedInsight]:
+    """
+    Find cross-domain fact pairs that share content tokens.  Higher
+    score = more shared content per pair.  Cross-domain means the two
+    facts live in different LifeDomain buckets — this is what the user
+    referred to as 'cross-memory recombination'.
+    """
+    by_dom: Dict[str, List["IdentityFact"]] = {}
+    for f in store.doc.facts:
+        if f.domain == LifeDomain.UNCATEGORIZED.value:
+            continue
+        by_dom.setdefault(f.domain, []).append(f)
+
+    insights: List[RecombinedInsight] = []
+    doms = list(by_dom.keys())
+    for i, dA in enumerate(doms):
+        for dB in doms[i + 1:]:
+            for fA in by_dom[dA]:
+                tokA = _content_tokens(fA.text)
+                if not tokA:
+                    continue
+                for fB in by_dom[dB]:
+                    tokB = _content_tokens(fB.text)
+                    shared = tokA & tokB
+                    if not shared:
+                        continue
+                    score = (len(shared) / max(len(tokA | tokB), 1)) * \
+                            ((fA.confidence + fB.confidence) / 2)
+                    if score < min_score:
+                        continue
+                    insights.append(RecombinedInsight(
+                        domain_a=dA, domain_b=dB,
+                        fact_a=fA.text, fact_b=fB.text,
+                        link_terms=sorted(shared),
+                        score=round(score, 3),
+                        note=f"Shared concepts span {dA} and {dB}: {', '.join(sorted(shared))}.",
+                    ))
+    insights.sort(key=lambda x: -x.score)
+    return insights[:top_k]
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
