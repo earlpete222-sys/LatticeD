@@ -2598,6 +2598,199 @@ class CuriosityEngine:
                 return e
         return None
 
+# =====================================================================
+# SPRINT 3 — AGENT VOICE CONTEXT + CONTINUITY TOKENS
+# =====================================================================
+# Rather than rewriting the existing agent system prompts (risky — the
+# user already iterated to good ones), Sprint 3 ships an additive PREAMBLE
+# layer that the runtime can prepend per turn.  Voice rewrites become
+# data, not code.
+#
+# Public entry points (all opt-in):
+#   build_voice_preamble(agent_id, store, ledger=None) -> str
+#       Selects identity facts, north stars, and constitutional rules
+#       relevant to the named agent; renders a compact preamble block
+#       suitable for prepending to the agent's system_prompt.
+#   weave_curiosity_question(response, question) -> str
+#       Cleanly appends a curiosity question to a generated response
+#       without breaking voice (single blank line + question, no header).
+#   ContinuityToken / ContinuityStore
+#       Short, structured per-session summary tokens persisted across
+#       restarts so the next session's preamble can include 1-2 lines
+#       of "what we last talked about" without dragging full transcripts.
+# =====================================================================
+
+# Per-agent salience map: which identity slices matter for that agent.
+# Tunables; future Voice Evolution sprint can rebalance these.
+AGENT_SALIENCE: Dict[str, Dict[str, Any]] = {
+    "fast_mentor":           {"facts_per_domain": 1, "domains": None,                   "north_stars": True,  "rules": True,  "max_facts": 4},
+    "life_coach":            {"facts_per_domain": 2, "domains": None,                   "north_stars": True,  "rules": True,  "max_facts": 8},
+    "quant_architect":       {"facts_per_domain": 3, "domains": [LifeDomain.FINANCIAL.value, LifeDomain.BUSINESS.value], "north_stars": True, "rules": True, "max_facts": 6},
+    "quant_architect_explore": {"facts_per_domain": 3, "domains": [LifeDomain.FINANCIAL.value, LifeDomain.BUSINESS.value], "north_stars": True, "rules": True, "max_facts": 6},
+    "executive_arbiter":     {"facts_per_domain": 1, "domains": None,                   "north_stars": True,  "rules": True,  "max_facts": 5},
+    "research_synthesizer":  {"facts_per_domain": 0, "domains": [],                     "north_stars": False, "rules": True,  "max_facts": 0},
+    "factual_auditor":       {"facts_per_domain": 0, "domains": [],                     "north_stars": False, "rules": False, "max_facts": 0},
+    "system_guardian":       {"facts_per_domain": 0, "domains": [],                     "north_stars": False, "rules": True,  "max_facts": 0},
+    "intent_router":         {"facts_per_domain": 0, "domains": [],                     "north_stars": False, "rules": False, "max_facts": 0},
+    "fact_extractor":        {"facts_per_domain": 0, "domains": [],                     "north_stars": False, "rules": False, "max_facts": 0},
+    "grounding_extractor":   {"facts_per_domain": 0, "domains": [],                     "north_stars": False, "rules": False, "max_facts": 0},
+    "biographer":            {"facts_per_domain": 0, "domains": [],                     "north_stars": False, "rules": True,  "max_facts": 0},
+}
+
+def _select_facts(store: "IdentityStore", policy: Dict[str, Any]) -> List["IdentityFact"]:
+    domains = policy.get("domains")
+    per     = int(policy.get("facts_per_domain", 0) or 0)
+    cap     = int(policy.get("max_facts", 0) or 0)
+    if per <= 0 or cap <= 0:
+        return []
+    if domains is None:
+        domains = [d.value for d in LifeDomain if d != LifeDomain.UNCATEGORIZED]
+    picked: List["IdentityFact"] = []
+    for dom in domains:
+        facts = sorted(store.facts_for_domain(dom),
+                       key=lambda f: (-(f.confidence), -(f.seen_count)))
+        picked.extend(facts[:per])
+    # Stable cap by confidence then recency.
+    picked.sort(key=lambda f: (-(f.confidence), -(f.last_seen)))
+    return picked[:cap]
+
+def build_voice_preamble(
+    agent_id: str,
+    store: "IdentityStore",
+    ledger: Optional["EngagementLedger"] = None,
+    include_curiosity_hint: bool = False,
+) -> str:
+    """
+    Render a compact identity-aware preamble for the named agent.
+    Returns "" when the agent should not see user identity at all
+    (router, auditor, guardian, etc.).
+    """
+    policy = AGENT_SALIENCE.get(agent_id)
+    if not policy:
+        return ""
+
+    lines: List[str] = []
+
+    # Constitutional rules outrank everything else.
+    if policy.get("rules"):
+        rules = store.active_rules()
+        if rules:
+            lines.append("USER GROUND RULES (always honor; outranks any inferred preference):")
+            for r in rules[:5]:
+                lines.append(f"  - {r.text.strip()}")
+
+    # North stars next.
+    if policy.get("north_stars"):
+        stars = store.active_north_stars()
+        if stars:
+            lines.append("USER NORTH STARS (anchor your voice to these):")
+            for n in stars[:5]:
+                tag = f"[{n.domain}] " if n.domain and n.domain != LifeDomain.UNCATEGORIZED.value else ""
+                lines.append(f"  - {tag}{n.text.strip()}")
+
+    # Facts.
+    facts = _select_facts(store, policy)
+    if facts:
+        lines.append("WHAT YOU KNOW ABOUT THE USER (do not quote verbatim):")
+        for f in facts:
+            tag = f"[{f.domain}] " if f.domain and f.domain != LifeDomain.UNCATEGORIZED.value else ""
+            lines.append(f"  - {tag}{f.text.strip()}")
+
+    if include_curiosity_hint and ledger is not None:
+        recent = ledger.recent_in_window(86400.0)
+        outstanding = [e for e in recent if e.answered is None]
+        if outstanding:
+            lines.append("OPEN CURIOSITY (an unanswered question from earlier — only revisit if the user reopens it):")
+            for e in outstanding[:2]:
+                lines.append(f"  - {e.question.strip()}")
+
+    return "\n".join(lines)
+
+def weave_curiosity_question(response: str, question: str) -> str:
+    """
+    Append a curiosity question to a response without breaking voice.
+    Single blank line separator; no header label.  Returns the response
+    unchanged if the question is empty or already present.
+    """
+    if not question:
+        return response or ""
+    base = (response or "").rstrip()
+    if question.strip().lower() in base.lower():
+        return base
+    return f"{base}\n\n{question.strip()}"
+
+# ─── Continuity Tokens ─────────────────────────────────────────────────
+@dataclass
+class ContinuityToken:
+    """
+    A compact per-session summary token.  Persisted across restarts so
+    the NEXT session's preamble can include 1-2 lines of context without
+    dragging full transcripts.
+    """
+    session_id: str
+    created: float                                     = field(default_factory=lambda: time.time())
+    last_intent: Optional[str]                         = None
+    open_threads: List[str]                            = field(default_factory=list)   # short phrases
+    domains_touched: List[str]                         = field(default_factory=list)
+    mood_signal: Optional[str]                         = None                          # one of: light, focused, heavy, mixed
+    summary: Optional[str]                             = None                          # <= 240 chars
+    metadata: Dict[str, Any]                           = field(default_factory=dict)
+
+CONTINUITY_PATH = STORAGE_DIR / "continuity.json"
+MAX_CONTINUITY_TOKENS = 20
+
+class ContinuityStore:
+    """Disk-backed ring buffer of ContinuityTokens."""
+    def __init__(self, path: Path = CONTINUITY_PATH) -> None:
+        self.path: Path = path
+        self.tokens: List[ContinuityToken] = []
+
+    def load(self) -> "ContinuityStore":
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                self.tokens = [ContinuityToken(**t) for t in data.get("tokens", [])]
+            except Exception as e:
+                logger.warning(f"continuity load failed at {self.path}: {e}")
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"tokens": [asdict(t) for t in self.tokens[-MAX_CONTINUITY_TOKENS:]]}
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def add(self, token: ContinuityToken) -> None:
+        self.tokens.append(token)
+        if len(self.tokens) > MAX_CONTINUITY_TOKENS:
+            self.tokens = self.tokens[-MAX_CONTINUITY_TOKENS:]
+
+    def latest(self, n: int = 1) -> List[ContinuityToken]:
+        return self.tokens[-n:] if self.tokens else []
+
+def build_continuity_preamble(store: "ContinuityStore", n: int = 1) -> str:
+    """
+    Render the last N continuity tokens into a tiny preamble block
+    suitable for prepending to fast_mentor / life_coach / executive_arbiter.
+    Returns "" if there's nothing to carry forward.
+    """
+    tokens = store.latest(n)
+    if not tokens:
+        return ""
+    lines = ["RECENT CONTEXT (from prior sessions — reference only if the user reopens it):"]
+    for t in tokens:
+        parts: List[str] = []
+        if t.summary:
+            parts.append(t.summary.strip())
+        if t.open_threads:
+            parts.append("open: " + "; ".join(t.open_threads[:3]))
+        if t.mood_signal:
+            parts.append(f"mood: {t.mood_signal}")
+        if parts:
+            lines.append("  - " + " | ".join(parts))
+    return "\n".join(lines)
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
