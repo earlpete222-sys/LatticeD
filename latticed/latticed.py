@@ -3536,6 +3536,245 @@ class SpeculativeBrancher:
             return float(len(b.output or "")) - weight * float(b.latency_ms or 0.0)
         return _score
 
+# =====================================================================
+# SPRINT 8 — MCP PRIVACY FOUNDATION
+# =====================================================================
+# Primitives the future MCP (Model Context Protocol) server depends on:
+#
+#   Consumer / ConsumerGrant   identifies an external agent/process
+#                              requesting data and what it may see
+#   AccessAuditEntry           one decision in an immutable trail
+#   AccessAuditLog             append-only persistent ledger
+#   PrivacyEnvelope            sealed transport unit carrying a payload
+#                              with sensitivity tag + obfuscation
+#   audited_egress             SensitivityRouter + Grant + audit in one call
+#
+# NOTE on cryptography:
+#   This module uses XOR-with-key obfuscation as a baseline so it has
+#   ZERO new dependencies.  This is FINE for in-process privacy
+#   compartmentalization but is NOT a cryptographic guarantee for
+#   off-machine transport.  Sprint 9 (MCP server) will swap in
+#   cryptography.fernet when the actual network surface ships.
+# =====================================================================
+
+@dataclass
+class Consumer:
+    """A registered external agent or process that can request data."""
+    consumer_id: str
+    display_name: str
+    public_note: str                                = ""    # human-readable purpose
+    created: float                                  = field(default_factory=lambda: time.time())
+
+@dataclass
+class ConsumerGrant:
+    """
+    What a consumer is permitted to read.  ANY of these can be empty;
+    an empty grant means "nothing allowed", not "everything allowed".
+    """
+    consumer_id: str
+    allowed_domains: List[str]                      = field(default_factory=list)  # LifeDomain values
+    sensitivity_ceiling: str                        = Sensitivity.LOW.value         # max sensitivity allowed
+    allowed_destinations: List[str]                 = field(default_factory=list)   # 'remote_api', 'user_export', ...
+    expires_at: Optional[float]                     = None
+    created: float                                  = field(default_factory=lambda: time.time())
+
+    def is_active(self, now: Optional[float] = None) -> bool:
+        now = now if now is not None else time.time()
+        return self.expires_at is None or now < self.expires_at
+
+@dataclass
+class AccessAuditEntry:
+    """One row in the immutable audit trail."""
+    timestamp:      float                           = field(default_factory=lambda: time.time())
+    consumer_id:    str                             = ""
+    domain:         str                             = LifeDomain.UNCATEGORIZED.value
+    sensitivity:    str                             = Sensitivity.LOW.value
+    destination:    str                             = "local"
+    decision:       str                             = "allow"           # 'allow' | 'deny'
+    reason:         str                             = ""
+    payload_chars:  int                             = 0
+    payload_digest: str                             = ""               # short hash; never the content
+
+AUDIT_LOG_PATH = STORAGE_DIR / "access_audit.jsonl"
+MAX_AUDIT_LINES = 10_000
+
+class AccessAuditLog:
+    """
+    Append-only audit log stored as JSON lines (one event per line) so
+    each write is atomic and the file is tail-friendly.  Optionally
+    rotates by line count.
+    """
+    def __init__(self, path: Path = AUDIT_LOG_PATH) -> None:
+        self.path: Path = path
+
+    def append(self, entry: AccessAuditEntry) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(entry), default=str) + "\n")
+
+    def read_all(self) -> List[AccessAuditEntry]:
+        if not self.path.exists():
+            return []
+        out: List[AccessAuditEntry] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(AccessAuditEntry(**json.loads(line)))
+            except Exception as e:
+                logger.warning(f"audit log parse skip: {e}")
+        return out
+
+    def filter(
+        self,
+        consumer_id: Optional[str] = None,
+        decision: Optional[str] = None,
+        since: Optional[float] = None,
+    ) -> List[AccessAuditEntry]:
+        out: List[AccessAuditEntry] = []
+        for e in self.read_all():
+            if consumer_id and e.consumer_id != consumer_id: continue
+            if decision    and e.decision    != decision:    continue
+            if since       and e.timestamp   <  since:       continue
+            out.append(e)
+        return out
+
+    def rotate_if_needed(self) -> int:
+        if not self.path.exists():
+            return 0
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        if len(lines) <= MAX_AUDIT_LINES:
+            return 0
+        kept = lines[-MAX_AUDIT_LINES:]
+        archive = self.path.with_suffix(self.path.suffix + f".rot.{int(time.time())}")
+        self.path.rename(archive)
+        self.path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        return len(lines) - len(kept)
+
+# ---------- PrivacyEnvelope (placeholder obfuscation) ------------------
+def _xor_obfuscate(payload: bytes, key: bytes) -> bytes:
+    if not key:
+        return payload
+    klen = len(key)
+    return bytes(b ^ key[i % klen] for i, b in enumerate(payload))
+
+@dataclass
+class PrivacyEnvelope:
+    """
+    A sealed transport unit.  Holds (sensitivity, domain, payload_b64)
+    where payload_b64 is base64-encoded XOR-obfuscated bytes.  See the
+    module note above — this is in-process compartmentalization, not
+    cryptography.
+    """
+    sensitivity: str
+    domain:      str
+    payload_b64: str
+    schema:      int                                = 1
+
+    @classmethod
+    def seal(cls, text: str, sensitivity: str, domain: str, key: bytes) -> "PrivacyEnvelope":
+        import base64
+        ob = _xor_obfuscate((text or "").encode("utf-8"), key)
+        return cls(sensitivity=sensitivity, domain=domain,
+                   payload_b64=base64.b64encode(ob).decode("ascii"))
+
+    def open(self, key: bytes) -> str:
+        import base64
+        raw = base64.b64decode(self.payload_b64.encode("ascii"))
+        return _xor_obfuscate(raw, key).decode("utf-8", errors="replace")
+
+# ---------- Audited egress (high-level entry point) --------------------
+def _short_digest(text: str) -> str:
+    import hashlib
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+
+def audited_egress(
+    text: str,
+    consumer: Consumer,
+    grant: ConsumerGrant,
+    destination: str,
+    audit: AccessAuditLog,
+    explicit_sensitivity: Optional[str] = None,
+    explicit_domain: Optional[str] = None,
+) -> Tuple[bool, str, AccessAuditEntry]:
+    """
+    Combine sensitivity classification + grant scope + SensitivityRouter
+    egress rules + audit log into ONE call sites use as the universal
+    gatekeeper for any data leaving the trust boundary.
+
+    Returns (allowed, reason, audit_entry).
+    """
+    sensitivity = explicit_sensitivity or SensitivityRouter.classify_text(text)
+    domain      = explicit_domain      or classify_domain(text)
+    order = {s.value: i for i, s in enumerate(
+        [Sensitivity.LOW, Sensitivity.MEDIUM, Sensitivity.HIGH, Sensitivity.SECRET])}
+
+    # 0. Grant must be active.
+    if not grant.is_active():
+        entry = AccessAuditEntry(
+            consumer_id=consumer.consumer_id, domain=domain, sensitivity=sensitivity,
+            destination=destination, decision="deny",
+            reason="grant_expired", payload_chars=len(text or ""),
+            payload_digest=_short_digest(text),
+        )
+        audit.append(entry)
+        return False, "grant_expired", entry
+
+    # 1. Grant scope checks.
+    if grant.allowed_domains and domain not in grant.allowed_domains:
+        entry = AccessAuditEntry(
+            consumer_id=consumer.consumer_id, domain=domain, sensitivity=sensitivity,
+            destination=destination, decision="deny",
+            reason=f"domain_out_of_scope:{domain}",
+            payload_chars=len(text or ""), payload_digest=_short_digest(text),
+        )
+        audit.append(entry)
+        return False, "domain_out_of_scope", entry
+
+    ceiling = order.get(grant.sensitivity_ceiling, 0)
+    requested = order.get(sensitivity, 0)
+    if requested > ceiling:
+        entry = AccessAuditEntry(
+            consumer_id=consumer.consumer_id, domain=domain, sensitivity=sensitivity,
+            destination=destination, decision="deny",
+            reason=f"above_ceiling:{sensitivity}>{grant.sensitivity_ceiling}",
+            payload_chars=len(text or ""), payload_digest=_short_digest(text),
+        )
+        audit.append(entry)
+        return False, "above_ceiling", entry
+
+    if grant.allowed_destinations and destination not in grant.allowed_destinations:
+        entry = AccessAuditEntry(
+            consumer_id=consumer.consumer_id, domain=domain, sensitivity=sensitivity,
+            destination=destination, decision="deny",
+            reason=f"destination_not_granted:{destination}",
+            payload_chars=len(text or ""), payload_digest=_short_digest(text),
+        )
+        audit.append(entry)
+        return False, "destination_not_granted", entry
+
+    # 2. SensitivityRouter still has the final structural veto.
+    router_ok, router_reason = SensitivityRouter.allow_egress(sensitivity, destination)
+    if not router_ok:
+        entry = AccessAuditEntry(
+            consumer_id=consumer.consumer_id, domain=domain, sensitivity=sensitivity,
+            destination=destination, decision="deny",
+            reason=f"router:{router_reason}",
+            payload_chars=len(text or ""), payload_digest=_short_digest(text),
+        )
+        audit.append(entry)
+        return False, f"router:{router_reason}", entry
+
+    # 3. Allowed.
+    entry = AccessAuditEntry(
+        consumer_id=consumer.consumer_id, domain=domain, sensitivity=sensitivity,
+        destination=destination, decision="allow", reason="passed_all_checks",
+        payload_chars=len(text or ""), payload_digest=_short_digest(text),
+    )
+    audit.append(entry)
+    return True, "ok", entry
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
