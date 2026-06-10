@@ -1855,6 +1855,400 @@ def surface_disagreement(
     lines.append("Treat any specific numbers, dates, or rules as unverified until cross-checked.")
     return "\n".join(lines)
 
+# =====================================================================
+# SPRINT 1 — PERSISTENT IDENTITY FOUNDATION + PRIVACY SEEDS
+# =====================================================================
+# A higher layer above the SQLite belief_graph: structured, versioned,
+# sensitivity-tagged identity state that survives across sessions and
+# answers "who is this user?" with explicit categories, not embeddings.
+#
+# Architecture:
+#   LifeDomain     — 8 explicit life domains, plus UNCATEGORIZED.
+#   Sensitivity    — 4 levels gating where data may travel.
+#   IdentityFact   — single attested claim about the user.
+#   NorthStar      — long-horizon value/goal that anchors agent voice.
+#   ConstitutionalRule — user-written behavior anchor (always honored).
+#   IdentityDocument   — the persistent identity blob, versioned.
+#   IdentityStore  — load/save JSON to runtime/storage/identity.json.
+#   SensitivityRouter  — gates outbound calls by tag (HIGH+ never leaves
+#                        the local machine; the MCP / cloud-burst layer
+#                        consults this router before egress).
+#
+# Public entry points (all inert until called):
+#   IdentityStore.load() / .save()
+#   IdentityStore.add_fact(...) / add_north_star(...) / add_rule(...)
+#   IdentityStore.facts_for_domain(domain)
+#   SensitivityRouter.allow_egress(tag, destination)
+#   SensitivityRouter.classify_text(text)            — heuristic seed
+#   biographer agent is registered in AgentFactoryRegistry but NOT
+#   wired into the pipeline yet (Sprint 3 lights it up).
+# =====================================================================
+
+# ─── Life Domains ──────────────────────────────────────────────────────
+class LifeDomain(str, Enum):
+    """
+    The 8 explicit life domains LatticeD tracks per user, plus a fallback
+    UNCATEGORIZED bucket.  Used to organize identity facts, north stars,
+    and reflection prompts.
+    """
+    CAREER        = "career"        # employment, role, professional trajectory
+    BUSINESS      = "business"      # ownership, ventures, products (distinct from Career)
+    FINANCIAL     = "financial"     # income, debt, savings, allocation goals
+    HEALTH        = "health"        # physical, mental, sleep, nutrition, fitness
+    RELATIONSHIPS = "relationships" # family, partner, friends, social fabric
+    GROWTH        = "growth"        # learning, skills, personal development
+    LIFESTYLE     = "lifestyle"     # hobbies, leisure, travel, daily texture
+    SPIRITUAL     = "spiritual"     # values, meaning, faith, philosophy
+    UNCATEGORIZED = "uncategorized"
+
+# Lightweight keyword cues used by classify_domain().  Hybrid signal: any
+# semantic embedding pipeline (Chroma) can override at runtime; this is
+# the deterministic baseline that works without one.
+DOMAIN_KEYWORDS: Dict[str, List[str]] = {
+    LifeDomain.CAREER.value:        ["job", "boss", "career", "promotion", "salary", "raise", "interview", "resume", "coworker"],
+    LifeDomain.BUSINESS.value:      ["company", "startup", "client", "revenue", "product", "founder", "launch", "customer", "ltd", "llc"],
+    LifeDomain.FINANCIAL.value:     ["budget", "savings", "debt", "rent", "mortgage", "401k", "ira", "invest", "expense", "income", "loan", "salary", "paycheck", "afford", "$"],
+    LifeDomain.HEALTH.value:        ["sleep", "exercise", "doctor", "diet", "stress", "anxiety", "tired", "workout", "work out", "weight", "therapy", "gym", "run", "fitness"],
+    LifeDomain.RELATIONSHIPS.value: ["wife", "husband", "partner", "girlfriend", "boyfriend", "friend", "mother", "father", "kid", "child", "family", "brother", "sister"],
+    LifeDomain.GROWTH.value:        ["learn", "study", "course", "book", "skill", "practice", "habit", "improve", "growth"],
+    LifeDomain.LIFESTYLE.value:     ["hobby", "travel", "vacation", "weekend", "park", "music", "movie", "game", "cook", "garden"],
+    LifeDomain.SPIRITUAL.value:     ["faith", "pray", "meditate", "purpose", "meaning", "values", "belief", "soul", "spirit"],
+}
+
+def classify_domain(text: str) -> str:
+    """
+    Deterministic keyword-based domain classifier.  Returns the
+    LifeDomain value with the most keyword hits; ties broken by domain
+    order.  Returns UNCATEGORIZED if no signal.
+    """
+    if not text:
+        return LifeDomain.UNCATEGORIZED.value
+    lo = text.lower()
+    scores: Dict[str, int] = {}
+    for dom, kws in DOMAIN_KEYWORDS.items():
+        s = sum(1 for kw in kws if kw in lo)
+        if s > 0:
+            scores[dom] = s
+    if not scores:
+        return LifeDomain.UNCATEGORIZED.value
+    return max(scores.items(), key=lambda kv: (kv[1], -list(DOMAIN_KEYWORDS).index(kv[0])))[0]
+
+# ─── Sensitivity Levels (Privacy Seeds) ────────────────────────────────
+class Sensitivity(str, Enum):
+    """
+    Where a piece of data is allowed to travel.
+
+    LOW    — fine to send to any remote API (e.g., weather, public facts).
+    MEDIUM — local-by-default; allowed to remote endpoints behind explicit
+             user-consented routes.
+    HIGH   — must stay on the user's local machine.  Cloud-API burst path
+             refuses to embed or transmit HIGH content.
+    SECRET — never written to disk in plaintext; never embedded; never
+             logged.  Held in memory only during the active turn.
+    """
+    LOW    = "low"
+    MEDIUM = "medium"
+    HIGH   = "high"
+    SECRET = "secret"
+
+# Heuristic patterns the SensitivityRouter uses to seed-tag incoming text
+# when no explicit tag is provided.  Conservative on purpose: false-high
+# is preferable to false-low for personal data.
+_SENSITIVITY_PATTERNS_HIGH: List[str] = [
+    r"\bssn\b", r"\bsocial security\b", r"\b\d{3}-\d{2}-\d{4}\b",            # SSN
+    r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b",                              # credit card-ish
+    r"\bpassword\b", r"\bpasscode\b", r"\bpin\b",
+    r"\bmedical\b", r"\bdiagnos(is|ed)\b", r"\bprescription\b", r"\bdosage\b",
+    r"\btherapist\b", r"\bsuicid", r"\bself[- ]harm\b",
+]
+_SENSITIVITY_PATTERNS_MEDIUM: List[str] = [
+    r"\bsalary\b", r"\bincome\b", r"\bnet worth\b", r"\bdebt\b", r"\bmortgage\b",
+    r"\bemail\b", r"\bphone number\b", r"\baddress\b",
+    r"\bwife\b", r"\bhusband\b", r"\bpartner\b", r"\bgirlfriend\b", r"\bboyfriend\b",
+    r"\bkids?\b", r"\bchildren\b", r"\bfamily\b",
+]
+
+# ─── Identity Data Structures ──────────────────────────────────────────
+IDENTITY_SCHEMA_VERSION = 1
+
+@dataclass
+class IdentityFact:
+    """A single attested claim about the user."""
+    text: str
+    domain: str                           = LifeDomain.UNCATEGORIZED.value
+    sensitivity: str                      = Sensitivity.MEDIUM.value
+    confidence: float                     = 0.7
+    source: str                           = "user_stated"      # user_stated | inferred | imported
+    first_seen: float                     = field(default_factory=lambda: time.time())
+    last_seen:  float                     = field(default_factory=lambda: time.time())
+    seen_count: int                       = 1
+    metadata:   Dict[str, Any]            = field(default_factory=dict)
+
+@dataclass
+class NorthStar:
+    """
+    A long-horizon value or goal that anchors agent voice across all
+    sessions.  Examples: 'be a present father', 'financial independence
+    by 50', 'always tell the truth even when it costs me'.
+    """
+    text: str
+    domain: str                           = LifeDomain.UNCATEGORIZED.value
+    weight: float                         = 1.0     # 0.0..2.0 — informs influence
+    created: float                        = field(default_factory=lambda: time.time())
+    last_referenced: Optional[float]      = None
+    metadata: Dict[str, Any]              = field(default_factory=dict)
+
+@dataclass
+class ConstitutionalRule:
+    """
+    A user-written behavior rule the framework MUST honor.  Constitutional
+    rules outrank inferred preferences, agent suggestions, and even the
+    Identity Document's own facts when in conflict.
+    """
+    text: str
+    priority: int                         = 100    # higher = stronger
+    created: float                        = field(default_factory=lambda: time.time())
+    metadata: Dict[str, Any]              = field(default_factory=dict)
+
+@dataclass
+class IdentityDocument:
+    """The persistent identity blob — versioned, JSON-serializable."""
+    schema_version: int                                     = IDENTITY_SCHEMA_VERSION
+    user_id: str                                            = "local"
+    created: float                                          = field(default_factory=lambda: time.time())
+    updated: float                                          = field(default_factory=lambda: time.time())
+    facts: List[IdentityFact]                               = field(default_factory=list)
+    north_stars: List[NorthStar]                            = field(default_factory=list)
+    constitutional_rules: List[ConstitutionalRule]          = field(default_factory=list)
+    domain_summaries: Dict[str, str]                        = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2, default=str)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "IdentityDocument":
+        data = json.loads(raw)
+        return cls(
+            schema_version=int(data.get("schema_version", IDENTITY_SCHEMA_VERSION)),
+            user_id=str(data.get("user_id", "local")),
+            created=float(data.get("created", time.time())),
+            updated=float(data.get("updated", time.time())),
+            facts=[IdentityFact(**f) for f in data.get("facts", [])],
+            north_stars=[NorthStar(**n) for n in data.get("north_stars", [])],
+            constitutional_rules=[ConstitutionalRule(**r) for r in data.get("constitutional_rules", [])],
+            domain_summaries=dict(data.get("domain_summaries", {})),
+        )
+
+IDENTITY_PATH = STORAGE_DIR / "identity.json"
+
+class IdentityStore:
+    """
+    Persistent identity layer.  Wraps an IdentityDocument with disk-backed
+    save / load and convenient mutation methods.  All writes are atomic
+    (tmp file + rename) so a crash during save never corrupts state.
+    """
+    def __init__(self, path: Path = IDENTITY_PATH, user_id: str = "local") -> None:
+        self.path = path
+        self.doc  = IdentityDocument(user_id=user_id)
+
+    # ----- lifecycle -----
+    def load(self) -> "IdentityStore":
+        if self.path.exists():
+            try:
+                self.doc = IdentityDocument.from_json(self.path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"identity load failed at {self.path}: {e}")
+        return self
+
+    def save(self) -> None:
+        self.doc.updated = time.time()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(self.doc.to_json(), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    # ----- facts -----
+    def add_fact(
+        self,
+        text: str,
+        domain: Optional[str] = None,
+        sensitivity: Optional[str] = None,
+        confidence: float = 0.7,
+        source: str = "user_stated",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> IdentityFact:
+        dom = domain or classify_domain(text)
+        sens = sensitivity or SensitivityRouter.classify_text(text)
+        # Dedupe by normalized text.
+        norm = " ".join(text.lower().split())
+        for f in self.doc.facts:
+            if " ".join(f.text.lower().split()) == norm:
+                f.seen_count += 1
+                f.last_seen = time.time()
+                f.confidence = min(1.0, f.confidence + 0.05)
+                return f
+        fact = IdentityFact(
+            text=text, domain=dom, sensitivity=sens,
+            confidence=confidence, source=source,
+            metadata=metadata or {},
+        )
+        self.doc.facts.append(fact)
+        return fact
+
+    def facts_for_domain(self, domain: str) -> List[IdentityFact]:
+        return [f for f in self.doc.facts if f.domain == domain]
+
+    def facts_above_sensitivity(self, level: str) -> List[IdentityFact]:
+        order = {s.value: i for i, s in enumerate([
+            Sensitivity.LOW, Sensitivity.MEDIUM, Sensitivity.HIGH, Sensitivity.SECRET
+        ])}
+        threshold = order.get(level, 1)
+        return [f for f in self.doc.facts if order.get(f.sensitivity, 1) >= threshold]
+
+    # ----- north stars -----
+    def add_north_star(
+        self, text: str, domain: Optional[str] = None, weight: float = 1.0,
+    ) -> NorthStar:
+        ns = NorthStar(text=text, domain=domain or classify_domain(text), weight=weight)
+        self.doc.north_stars.append(ns)
+        return ns
+
+    def active_north_stars(self) -> List[NorthStar]:
+        return sorted(self.doc.north_stars, key=lambda n: -n.weight)
+
+    # ----- constitutional rules -----
+    def add_rule(self, text: str, priority: int = 100) -> ConstitutionalRule:
+        rule = ConstitutionalRule(text=text, priority=priority)
+        self.doc.constitutional_rules.append(rule)
+        return rule
+
+    def active_rules(self) -> List[ConstitutionalRule]:
+        return sorted(self.doc.constitutional_rules, key=lambda r: -r.priority)
+
+# ─── Sensitivity Router (Privacy Seeds) ────────────────────────────────
+class SensitivityRouter:
+    """
+    Decides what may leave the local machine.
+
+    classify_text(text) -> Sensitivity   (heuristic seed)
+    allow_egress(tag, destination)       (gate before any outbound call)
+
+    Destination semantics:
+      'local'         — always allowed.
+      'remote_api'    — generic third-party endpoint (cloud LLM, web).
+      'public_search' — search engine queries; never carry HIGH/SECRET.
+      'user_export'   — exports created at explicit user request; SECRET
+                        is still blocked, HIGH triggers a confirmation.
+    """
+
+    @staticmethod
+    def classify_text(text: str) -> str:
+        if not text:
+            return Sensitivity.LOW.value
+        lo = text.lower()
+        for pat in _SENSITIVITY_PATTERNS_HIGH:
+            if re.search(pat, lo):
+                return Sensitivity.HIGH.value
+        for pat in _SENSITIVITY_PATTERNS_MEDIUM:
+            if re.search(pat, lo):
+                return Sensitivity.MEDIUM.value
+        return Sensitivity.LOW.value
+
+    @staticmethod
+    def allow_egress(tag: str, destination: str) -> Tuple[bool, str]:
+        """
+        Returns (allowed, reason).  reason is a short string for logging
+        and for surfacing to the user when blocked.
+        """
+        dest = (destination or "").strip().lower()
+        if dest == "local":
+            return True, "local destination always allowed"
+        if tag == Sensitivity.SECRET.value:
+            return False, "SECRET content is never permitted to leave the local machine"
+        if tag == Sensitivity.HIGH.value:
+            if dest == "user_export":
+                return True, "HIGH allowed to user_export with confirmation"
+            return False, f"HIGH content is not permitted to egress to '{dest}'"
+        if tag == Sensitivity.MEDIUM.value:
+            if dest in ("remote_api", "user_export"):
+                return True, "MEDIUM allowed to user-consented routes"
+            if dest == "public_search":
+                return False, "MEDIUM content is not allowed in public search queries"
+        return True, "LOW content cleared for egress"
+
+# ─── Biographer Agent (declared, not yet wired) ────────────────────────
+# Registered on AgentFactoryRegistry construction below.  Sprint 3 will
+# wire this into a passive background extraction step that runs after
+# user turns.  Until then it sits in the registry as available metadata
+# and is harmless.
+BIOGRAPHER_AGENT_SPEC: Optional["AgentSpec"] = None  # populated lazily below
+
+def _build_biographer_spec() -> "AgentSpec":
+    return AgentSpec(
+        agent_id="biographer",
+        display_name="Biographer",
+        purpose="Extracts durable identity facts, domain assignments, and sensitivity tags from user turns for the Identity Document.",
+        model_name=MODEL_SYNTHESIS,
+        temperature=0.0,
+        max_tokens=200,
+        system_prompt=(
+            "You are LatticeD's Biographer. Given a user message, extract zero or more "
+            "DURABLE facts about the user (their situation, preferences, relationships, "
+            "values, or goals). For each fact emit: text, domain (career, business, "
+            "financial, health, relationships, growth, lifestyle, spiritual, "
+            "uncategorized), sensitivity (low, medium, high, secret), confidence (0-1). "
+            "Do NOT extract transient facts (today's weather, what they ate for lunch). "
+            "Do NOT invent facts the user did not state. If nothing durable was said, "
+            "return an empty list."
+        ),
+        output_schema={
+            "type": "object",
+            "properties": {
+                "facts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text":        {"type": "string"},
+                            "domain":      {"type": "string"},
+                            "sensitivity": {"type": "string"},
+                            "confidence":  {"type": "number"},
+                        },
+                        "required": ["text"],
+                    },
+                    "maxItems": 5,
+                }
+            },
+            "required": ["facts"],
+        },
+        capabilities_required={
+            Capability.STRUCTURED_OUTPUT.value:     CapabilityLevel.STRONG.value,
+            Capability.INSTRUCTION_FOLLOWING.value: CapabilityLevel.STRONG.value,
+            Capability.NUANCED_CRITIQUE.value:      CapabilityLevel.MODERATE.value,
+        },
+        capabilities_avoid=[Capability.CREATIVE_GENERATION.value],
+        consensus_requirement=ConsensusRequirement.SINGLE_MODEL.value,
+        model_pool_per_tier={
+            ModelTier.MINIMAL_GPU.value: [MODEL_SYNTHESIS],
+            ModelTier.STANDARD.value:    ["qwen2.5-coder:7b"],
+            ModelTier.HIGH.value:        ["qwen2.5-coder:14b"],
+            ModelTier.ENTERPRISE.value:  ["qwen2.5-coder:32b"],
+        },
+        scales_with=ModelTier.STANDARD.value,
+        preferred_tier=ModelTier.STANDARD.value,
+    )
+
+# Register the biographer on the AgentFactoryRegistry — done by patching
+# the registry dict on instantiation rather than touching the class body.
+_OriginalAgentFactoryRegistryInit = AgentFactoryRegistry.__init__
+
+def _patched_agent_factory_init(self):
+    _OriginalAgentFactoryRegistryInit(self)
+    if "biographer" not in self.registry:
+        self.registry["biographer"] = _build_biographer_spec()
+
+AgentFactoryRegistry.__init__ = _patched_agent_factory_init  # type: ignore[method-assign]
+
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
 # ---------------------------------------------------------------------
