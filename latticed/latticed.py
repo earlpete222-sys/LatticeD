@@ -4837,6 +4837,9 @@ class LatticeContext:
         self.mood = MoodTracker(MOODS_PATH)
         install_mood_hooks(self)
         register_mood_surface(self.mcp, self)
+        # Sprint 24 — milestones / goal tracking.
+        self.milestones = MilestoneStore(MILESTONES_PATH).load()
+        register_milestone_surface(self.mcp, self)
         # Emit a boot event so we have a heartbeat in the timeline.
         try:
             self.activity.append(ActivityEvent(
@@ -4958,6 +4961,8 @@ class LatticeContext:
         except Exception as e: logger.warning(f"prompt evolution save failed: {e}")
         try: self.snapshots.save()
         except Exception as e: logger.warning(f"snapshots save failed: {e}")
+        try: self.milestones.save()
+        except Exception as e: logger.warning(f"milestones save failed: {e}")
 
     # ----- diagnostics -----
     def boot_report(self) -> Dict[str, Any]:
@@ -7416,6 +7421,302 @@ def install_mood_hooks(ctx: "LatticeContext") -> None:
                      open_threads=open_threads, domains_touched=domains_touched,
                      mood_signal=mood_signal, summary=summary)
     ctx.capture_continuity = _patched   # type: ignore[assignment]
+
+# =====================================================================
+# SPRINT 24 — GOAL TRACKING + MILESTONES
+# =====================================================================
+# Milestones turn aspirational north stars into measurable progress.
+# A milestone is a concrete attestable step toward a goal.  Each lives
+# under a north star (referenced by text) or stands alone in a domain.
+#
+# State machine:
+#   PROPOSED -> OPEN -> IN_PROGRESS -> DONE
+#                        \-> DROPPED
+#
+# Public API:
+#   Milestone                      one tracked goal increment
+#   MilestoneStore                 disk-backed, atomic save, dedup-by-id
+#     .add(text, north_star_ref?, status?, due_at?, domain?)
+#     .update_status(id, new_status)
+#     .list(north_star_ref?, status?, domain?)
+#     .progress_for(north_star_ref) -> {total, done, in_progress, percent}
+#     .stale(window_seconds)
+#
+# MCP tools (auto-registered):
+#   tools/call add_milestone {text, north_star?, due_at?}
+#   tools/call update_milestone_status {id, status}
+#   tools/call list_milestones {north_star?, status?, domain?}
+#   tools/call get_north_star_progress {north_star}
+#   tools/call get_stale_milestones {window_seconds?}
+#
+# MCP resources:
+#   goals://milestones                  full list
+#   goals://progress/<north_star_text>  progress per north star
+# =====================================================================
+
+MILESTONES_PATH = STORAGE_DIR / "milestones.json"
+
+class MilestoneStatus(str, Enum):
+    PROPOSED    = "proposed"
+    OPEN        = "open"
+    IN_PROGRESS = "in_progress"
+    DONE        = "done"
+    DROPPED     = "dropped"
+
+_VALID_TRANSITIONS: Dict[str, set] = {
+    MilestoneStatus.PROPOSED.value:    {MilestoneStatus.OPEN.value,
+                                          MilestoneStatus.DROPPED.value},
+    MilestoneStatus.OPEN.value:        {MilestoneStatus.IN_PROGRESS.value,
+                                          MilestoneStatus.DONE.value,
+                                          MilestoneStatus.DROPPED.value},
+    MilestoneStatus.IN_PROGRESS.value: {MilestoneStatus.DONE.value,
+                                          MilestoneStatus.OPEN.value,
+                                          MilestoneStatus.DROPPED.value},
+    MilestoneStatus.DONE.value:        {MilestoneStatus.OPEN.value},  # reopen
+    MilestoneStatus.DROPPED.value:     {MilestoneStatus.OPEN.value},  # revive
+}
+
+@dataclass
+class Milestone:
+    id:                 str                              = ""
+    text:               str                              = ""
+    north_star_ref:     Optional[str]                    = None    # north star text or None
+    domain:             str                              = LifeDomain.UNCATEGORIZED.value
+    status:             str                              = MilestoneStatus.OPEN.value
+    created:            float                            = field(default_factory=lambda: time.time())
+    updated:            float                            = field(default_factory=lambda: time.time())
+    due_at:             Optional[float]                  = None
+    completed_at:       Optional[float]                  = None
+    evidence_count:     int                              = 0
+    metadata:           Dict[str, Any]                   = field(default_factory=dict)
+
+def _mk_milestone_id() -> str:
+    import uuid as _uuid
+    return f"ms_{_uuid.uuid4().hex[:12]}"
+
+def _norm_ns(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    return " ".join(text.lower().split())
+
+
+class MilestoneStore:
+    """Disk-backed milestone registry.  Atomic save (tmp + os.replace)."""
+    def __init__(self, path: Path = MILESTONES_PATH) -> None:
+        self.path: Path = path
+        self.milestones: Dict[str, Milestone] = {}
+
+    # ----- lifecycle -----
+    def load(self) -> "MilestoneStore":
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                for mid, raw in (data.get("milestones") or {}).items():
+                    self.milestones[mid] = Milestone(**raw)
+            except Exception as e:
+                logger.warning(f"milestones load failed: {e}")
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"milestones": {mid: asdict(m)
+                                    for mid, m in self.milestones.items()}}
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    # ----- CRUD -----
+    def add(
+        self,
+        text: str,
+        north_star_ref: Optional[str] = None,
+        status: str = MilestoneStatus.OPEN.value,
+        due_at: Optional[float] = None,
+        domain: Optional[str] = None,
+    ) -> Milestone:
+        if not text or not text.strip():
+            raise ValueError("milestone text required")
+        if status not in {s.value for s in MilestoneStatus}:
+            status = MilestoneStatus.OPEN.value
+        m = Milestone(
+            id=_mk_milestone_id(),
+            text=text.strip(),
+            north_star_ref=(north_star_ref or "").strip() or None,
+            domain=domain or classify_domain(text),
+            status=status,
+            due_at=due_at,
+        )
+        self.milestones[m.id] = m
+        return m
+
+    def update_status(
+        self,
+        milestone_id: str,
+        new_status: str,
+    ) -> Tuple[Optional[Milestone], Optional[str]]:
+        """Returns (milestone, error_msg).  Validates against the
+        transition table."""
+        m = self.milestones.get(milestone_id)
+        if not m:
+            return None, "unknown_milestone_id"
+        if new_status not in {s.value for s in MilestoneStatus}:
+            return None, f"invalid_status:{new_status}"
+        if new_status == m.status:
+            return m, None
+        allowed = _VALID_TRANSITIONS.get(m.status, set())
+        if new_status not in allowed:
+            return None, f"invalid_transition:{m.status}->{new_status}"
+        m.status = new_status
+        m.updated = time.time()
+        if new_status == MilestoneStatus.DONE.value:
+            m.completed_at = time.time()
+        return m, None
+
+    def get(self, milestone_id: str) -> Optional[Milestone]:
+        return self.milestones.get(milestone_id)
+
+    # ----- queries -----
+    def list(
+        self,
+        north_star_ref: Optional[str] = None,
+        status: Optional[str] = None,
+        domain: Optional[str] = None,
+    ) -> List[Milestone]:
+        target_ns = _norm_ns(north_star_ref)
+        out: List[Milestone] = []
+        for m in self.milestones.values():
+            if target_ns is not None and _norm_ns(m.north_star_ref) != target_ns:
+                continue
+            if status and m.status != status:
+                continue
+            if domain and m.domain != domain:
+                continue
+            out.append(m)
+        out.sort(key=lambda m: (m.status != MilestoneStatus.DONE.value,
+                                  -m.updated))
+        return out
+
+    def progress_for(self, north_star_ref: str) -> Dict[str, Any]:
+        children = self.list(north_star_ref=north_star_ref)
+        total = len(children)
+        done  = sum(1 for m in children if m.status == MilestoneStatus.DONE.value)
+        in_p  = sum(1 for m in children if m.status == MilestoneStatus.IN_PROGRESS.value)
+        open_ = sum(1 for m in children if m.status == MilestoneStatus.OPEN.value)
+        dropped = sum(1 for m in children
+                       if m.status == MilestoneStatus.DROPPED.value)
+        active_total = total - dropped
+        percent = (done / active_total * 100.0) if active_total else 0.0
+        return {
+            "north_star":      north_star_ref,
+            "total":           total,
+            "active":          active_total,
+            "done":            done,
+            "in_progress":     in_p,
+            "open":            open_,
+            "dropped":         dropped,
+            "percent":         round(percent, 1),
+        }
+
+    def stale(self, window_seconds: float = 30 * 86400.0) -> List[Milestone]:
+        cutoff = time.time() - window_seconds
+        return [m for m in self.milestones.values()
+                  if m.status in (MilestoneStatus.OPEN.value,
+                                    MilestoneStatus.IN_PROGRESS.value)
+                  and m.updated < cutoff]
+
+
+# ---------- MCP wiring + activity coupling --------------------------
+def register_milestone_surface(server: "MCPServer", ctx: "LatticeContext") -> None:
+    store = ctx.milestones
+
+    def _emit_activity(kind: str, summary: str, m: Optional[Milestone]) -> None:
+        try:
+            payload = asdict(m) if m else {}
+            ctx.activity.append(ActivityEvent(
+                kind=kind, summary=summary, payload=payload,
+                domain=(m.domain if m else LifeDomain.UNCATEGORIZED.value),
+            ))
+        except Exception as e:
+            logger.warning(f"milestone activity emit failed: {e}")
+
+    def _tool_add(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        text = str(params.get("text", "")).strip()
+        if not text:
+            return {"ok": False, "error": "empty_text"}
+        try:
+            m = store.add(
+                text=text,
+                north_star_ref=params.get("north_star"),
+                status=params.get("status", MilestoneStatus.OPEN.value),
+                due_at=(float(params["due_at"]) if params.get("due_at") else None),
+                domain=params.get("domain"),
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"add_failed:{e}"}
+        try: store.save()
+        except Exception as e: logger.warning(f"milestones save failed: {e}")
+        _emit_activity("milestone_added", f"milestone added: {m.text[:80]}", m)
+        return {"ok": True, "milestone": asdict(m)}
+
+    def _tool_update(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        mid = params.get("id")
+        new_status = params.get("status")
+        if not mid or not new_status:
+            return {"ok": False, "error": "missing_id_or_status"}
+        m, err = store.update_status(mid, new_status)
+        if err:
+            return {"ok": False, "error": err}
+        try: store.save()
+        except Exception as e: logger.warning(f"milestones save failed: {e}")
+        kind = ("milestone_completed" if new_status == MilestoneStatus.DONE.value
+                else "milestone_status_changed")
+        _emit_activity(kind,
+                          f"{kind}: {m.text[:60]} -> {new_status}", m)
+        return {"ok": True, "milestone": asdict(m)}
+
+    def _tool_list(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        items = store.list(
+            north_star_ref=params.get("north_star"),
+            status=params.get("status"),
+            domain=params.get("domain"),
+        )
+        return {"ok": True, "count": len(items),
+                "milestones": [asdict(m) for m in items]}
+
+    def _tool_progress(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        ns = params.get("north_star")
+        if not ns:
+            return {"ok": False, "error": "missing_north_star"}
+        return {"ok": True, "progress": store.progress_for(ns)}
+
+    def _tool_stale(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        window = float(params.get("window_seconds", 30 * 86400.0))
+        items = store.stale(window_seconds=window)
+        return {"ok": True, "count": len(items),
+                "window_seconds": window,
+                "milestones": [asdict(m) for m in items]}
+
+    server.register_tool("add_milestone",            _tool_add)
+    server.register_tool("update_milestone_status",  _tool_update)
+    server.register_tool("list_milestones",          _tool_list)
+    server.register_tool("get_north_star_progress",  _tool_progress)
+    server.register_tool("get_stale_milestones",     _tool_stale)
+
+    def _res_milestones(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        items = store.list()
+        return {"ok": True, "count": len(items),
+                "milestones": [asdict(m) for m in items]}
+
+    def _res_progress(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        suffix = params.get("_suffix") or params.get("north_star") or ""
+        if not suffix:
+            return {"ok": False, "error": "missing_north_star"}
+        # Underscores in URI may stand in for spaces; the caller can pass
+        # the literal text or a `_suffix`.  We don't transform aggressively.
+        return {"ok": True, "progress": store.progress_for(suffix.strip())}
+
+    server.register_resource("goals://milestones", _res_milestones)
+    server.register_resource("goals://progress",   _res_progress)   # +/<text>
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
