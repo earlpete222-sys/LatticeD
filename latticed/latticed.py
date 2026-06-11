@@ -4833,6 +4833,10 @@ class LatticeContext:
         self.activity = ActivityLog(ACTIVITY_PATH)
         install_activity_hooks(self)
         register_activity_surface(self.mcp, self)
+        # Sprint 23 — mood tracking + pattern detection.
+        self.mood = MoodTracker(MOODS_PATH)
+        install_mood_hooks(self)
+        register_mood_surface(self.mcp, self)
         # Emit a boot event so we have a heartbeat in the timeline.
         try:
             self.activity.append(ActivityEvent(
@@ -7115,6 +7119,303 @@ def register_activity_surface(server: "MCPServer", ctx: "LatticeContext") -> Non
 
     server.register_resource("activity://recent",  _res_recent)
     server.register_resource("activity://summary", _res_summary)
+
+# =====================================================================
+# SPRINT 23 — MOOD TRACKING + PATTERN DETECTION
+# =====================================================================
+# Detect emotional state from user input via keyword + heuristic
+# signals.  Persistent mood observations let us:
+#   1. Auto-populate ContinuityToken.mood_signal (Sprint 3)
+#   2. Inform voice evolution (heavy mood -> softer response)
+#   3. Surface weekday + domain correlations the user can use
+#
+# Deterministic baseline (no model required); LLM-driven refinement
+# can layer on later via a hook.
+#
+# Public API:
+#   MoodSignal               taxonomy of detected states
+#   MoodObservation          one signal with confidence + source
+#   MoodTracker
+#     .observe(text, domain?, source?) -> MoodObservation
+#     .recent(window_seconds) -> List[MoodObservation]
+#     .dominant_signal(window) -> (signal, ratio)
+#     .mood_curve(buckets, window) -> per-bucket counts
+#     .weekday_pattern() -> {dow: {signal: count}}
+#     .domain_mood_correlation() -> {domain: {signal: count}}
+#   MoodPersistence (jsonl)
+#
+# MCP tools + resources auto-registered.
+# =====================================================================
+
+MOODS_PATH = STORAGE_DIR / "moods.jsonl"
+MAX_MOOD_LINES = 10_000
+
+class MoodSignal(str, Enum):
+    LIGHT      = "light"        # cheerful / easy
+    ENERGIZED  = "energized"    # excited / motivated
+    FOCUSED    = "focused"      # deliberate / working
+    NEUTRAL    = "neutral"      # baseline
+    DRAINED    = "drained"      # tired / depleted
+    HEAVY      = "heavy"        # sad / weighed down
+    MIXED      = "mixed"        # multiple signals present
+
+# Keyword-driven seed.  Conservative: false-neutral beats false-positive.
+_MOOD_KEYWORDS: Dict[str, List[str]] = {
+    MoodSignal.LIGHT.value:     ["great", "good", "happy", "fun", "easy", "nice", "smooth",
+                                  "love it", "loved", "enjoyed", "smile", "laughed"],
+    MoodSignal.ENERGIZED.value: ["excited", "stoked", "pumped", "energized", "fired up",
+                                  "can't wait", "shipping", "launched", "winning"],
+    MoodSignal.FOCUSED.value:   ["focus", "focused", "deep work", "deliberate", "head down",
+                                  "shipping", "working through", "grinding", "deliberate"],
+    MoodSignal.HEAVY.value:     ["sad", "down", "rough", "tough day", "hard week", "lost",
+                                  "grief", "broken", "heavy", "struggle", "struggling"],
+    MoodSignal.DRAINED.value:   ["tired", "exhausted", "worn out", "drained", "burned out",
+                                  "burnt out", "wiped", "long week", "long day", "fatigued"],
+}
+
+@dataclass
+class MoodObservation:
+    signal:      str                                = MoodSignal.NEUTRAL.value
+    confidence:  float                              = 0.5
+    timestamp:   float                              = field(default_factory=lambda: time.time())
+    source_text: str                                = ""
+    domain:      str                                = LifeDomain.UNCATEGORIZED.value
+    metadata:    Dict[str, Any]                     = field(default_factory=dict)
+
+
+def classify_mood(text: str) -> Tuple[str, float, Dict[str, int]]:
+    """
+    Deterministic classifier.  Returns (signal, confidence, raw_counts).
+    Two or more equally-weighted hits across distinct families -> MIXED.
+    Zero hits -> NEUTRAL with low confidence.
+    """
+    if not text:
+        return MoodSignal.NEUTRAL.value, 0.0, {}
+    lo = text.lower()
+    counts: Dict[str, int] = {}
+    for sig, words in _MOOD_KEYWORDS.items():
+        c = sum(1 for w in words if w in lo)
+        if c > 0:
+            counts[sig] = c
+    if not counts:
+        return MoodSignal.NEUTRAL.value, 0.4, {}
+    # Pick the strongest; if there's a strong tie across two distinct
+    # signals, report MIXED.
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    if len(ranked) >= 2 and ranked[0][1] == ranked[1][1] and ranked[0][1] >= 1:
+        return MoodSignal.MIXED.value, 0.5 + 0.05 * sum(counts.values()), counts
+    top_sig, top_count = ranked[0]
+    # Confidence rises with the dominance ratio.
+    conf = min(0.95, 0.5 + 0.15 * top_count)
+    return top_sig, conf, counts
+
+
+class MoodTracker:
+    """Persistent mood observations + simple pattern detection."""
+
+    def __init__(self, path: Path = MOODS_PATH) -> None:
+        self.path: Path = path
+
+    # ----- I/O -----
+    def observe(
+        self,
+        text: str,
+        domain: Optional[str] = None,
+        source: str = "user_turn",
+    ) -> MoodObservation:
+        signal, conf, counts = classify_mood(text or "")
+        dom = domain or classify_domain(text or "")
+        obs = MoodObservation(
+            signal=signal, confidence=conf,
+            source_text=(text or "")[:240],
+            domain=dom,
+            metadata={"counts": counts, "source": source},
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(obs), default=str) + "\n")
+        return obs
+
+    def read_all(self) -> List[MoodObservation]:
+        if not self.path.exists():
+            return []
+        out: List[MoodObservation] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(MoodObservation(**json.loads(line)))
+            except Exception as e:
+                logger.warning(f"mood log parse skip: {e}")
+        return out
+
+    # ----- queries -----
+    def recent(self, window_seconds: float = 7 * 86400.0) -> List[MoodObservation]:
+        cutoff = time.time() - window_seconds
+        return [o for o in self.read_all() if o.timestamp >= cutoff]
+
+    def dominant_signal(self, window_seconds: float = 86400.0) -> Tuple[str, float]:
+        """Most-common signal in the window + its share (0..1)."""
+        pool = self.recent(window_seconds)
+        if not pool:
+            return MoodSignal.NEUTRAL.value, 0.0
+        counts: Dict[str, int] = {}
+        for o in pool:
+            counts[o.signal] = counts.get(o.signal, 0) + 1
+        sig, c = max(counts.items(), key=lambda kv: kv[1])
+        return sig, c / len(pool)
+
+    def mood_curve(
+        self,
+        buckets: int = 7,
+        window_seconds: float = 7 * 86400.0,
+    ) -> List[Dict[str, Any]]:
+        """Bucket recent moods into `buckets` chronological slots; useful
+        for drawing a sparkline."""
+        now    = time.time()
+        cutoff = now - window_seconds
+        width  = window_seconds / max(buckets, 1)
+        out: List[Dict[str, Any]] = []
+        pool = [o for o in self.read_all() if o.timestamp >= cutoff]
+        for i in range(buckets):
+            slot_start = cutoff + i * width
+            slot_end   = slot_start + width
+            in_slot = [o for o in pool if slot_start <= o.timestamp < slot_end]
+            counts: Dict[str, int] = {}
+            for o in in_slot:
+                counts[o.signal] = counts.get(o.signal, 0) + 1
+            dominant = max(counts, key=counts.get) if counts else MoodSignal.NEUTRAL.value
+            out.append({
+                "bucket":          i,
+                "start":           slot_start,
+                "end":             slot_end,
+                "count":           len(in_slot),
+                "counts":          counts,
+                "dominant":        dominant,
+            })
+        return out
+
+    def weekday_pattern(self) -> Dict[int, Dict[str, int]]:
+        """Returns {dow_index: {signal: count}} where dow_index is
+        Python's Monday=0..Sunday=6 from local time.  Sparse -- only
+        signals seen are recorded."""
+        import datetime as _dt
+        out: Dict[int, Dict[str, int]] = {}
+        for o in self.read_all():
+            dow = _dt.datetime.fromtimestamp(o.timestamp).weekday()
+            out.setdefault(dow, {})
+            out[dow][o.signal] = out[dow].get(o.signal, 0) + 1
+        return out
+
+    def domain_mood_correlation(self) -> Dict[str, Dict[str, int]]:
+        out: Dict[str, Dict[str, int]] = {}
+        for o in self.read_all():
+            if o.domain == LifeDomain.UNCATEGORIZED.value:
+                continue
+            out.setdefault(o.domain, {})
+            out[o.domain][o.signal] = out[o.domain].get(o.signal, 0) + 1
+        return out
+
+    def rotate_if_needed(self) -> int:
+        if not self.path.exists():
+            return 0
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        if len(lines) <= MAX_MOOD_LINES:
+            return 0
+        kept = lines[-MAX_MOOD_LINES:]
+        archive = self.path.with_suffix(self.path.suffix + f".rot.{int(time.time())}")
+        self.path.rename(archive)
+        self.path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        return len(lines) - len(kept)
+
+
+# ---------- voice-evolution coupling --------------------------------
+# When the dominant signal is HEAVY or DRAINED, downstream renderers
+# can soften their tone.  This helper returns a normalized adjustment.
+def mood_to_warmth_adjustment(signal: str) -> float:
+    """Returns a value in [-0.3, +0.3] that callers can apply to warmth."""
+    return {
+        MoodSignal.HEAVY.value:     +0.30,
+        MoodSignal.DRAINED.value:   +0.20,
+        MoodSignal.LIGHT.value:     -0.05,
+        MoodSignal.ENERGIZED.value: -0.05,
+        MoodSignal.FOCUSED.value:    0.00,
+        MoodSignal.NEUTRAL.value:    0.00,
+        MoodSignal.MIXED.value:     +0.10,
+    }.get(signal, 0.0)
+
+
+# ---------- MCP wiring -----------------------------------------------
+def register_mood_surface(server: "MCPServer", ctx: "LatticeContext") -> None:
+    tracker = ctx.mood
+
+    def _tool_observe(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        text = str(params.get("text", "")).strip()
+        if not text:
+            return {"ok": False, "error": "empty_text"}
+        obs = tracker.observe(text=text, domain=params.get("domain"),
+                                source=params.get("source", "mcp"))
+        return {"ok": True,
+                "signal": obs.signal,
+                "confidence": obs.confidence,
+                "domain": obs.domain}
+
+    def _tool_dominant(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        window = float(params.get("window_seconds", 86400.0))
+        sig, share = tracker.dominant_signal(window_seconds=window)
+        return {"ok": True, "window_seconds": window,
+                "signal": sig, "share": round(share, 3)}
+
+    def _tool_curve(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        buckets = int(params.get("buckets", 7))
+        window  = float(params.get("window_seconds", 7 * 86400.0))
+        return {"ok": True,
+                "buckets": tracker.mood_curve(buckets=buckets,
+                                                window_seconds=window)}
+
+    def _tool_patterns(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        return {"ok": True,
+                "weekday":             tracker.weekday_pattern(),
+                "domain_correlation":  tracker.domain_mood_correlation()}
+
+    server.register_tool("observe_mood",         _tool_observe)
+    server.register_tool("get_dominant_mood",    _tool_dominant)
+    server.register_tool("get_mood_curve",       _tool_curve)
+    server.register_tool("get_mood_patterns",    _tool_patterns)
+
+    def _res_recent(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True,
+                "observations": [asdict(o) for o in
+                                  tracker.recent(window_seconds=7 * 86400.0)]}
+
+    def _res_dominant(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        sig, share = tracker.dominant_signal()
+        return {"ok": True, "signal": sig, "share": round(share, 3)}
+
+    server.register_resource("mood://recent",   _res_recent)
+    server.register_resource("mood://dominant", _res_dominant)
+
+
+# ---------- continuity coupling --------------------------------------
+def install_mood_hooks(ctx: "LatticeContext") -> None:
+    """When ctx.capture_continuity is called without an explicit
+    mood_signal, populate it from the dominant signal in the last 24h."""
+    orig = ctx.capture_continuity
+
+    def _patched(session_id: str, last_intent: Optional[str] = None,
+                  open_threads: Optional[List[str]] = None,
+                  domains_touched: Optional[List[str]] = None,
+                  mood_signal: Optional[str] = None,
+                  summary: Optional[str] = None) -> ContinuityToken:
+        if mood_signal is None:
+            sig, share = ctx.mood.dominant_signal()
+            if share > 0.0:
+                mood_signal = sig
+        return orig(session_id=session_id, last_intent=last_intent,
+                     open_threads=open_threads, domains_touched=domains_touched,
+                     mood_signal=mood_signal, summary=summary)
+    ctx.capture_continuity = _patched   # type: ignore[assignment]
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
