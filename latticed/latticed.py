@@ -4827,6 +4827,8 @@ class LatticeContext:
         # Sprint 20 — diagnostics surface + introspection.
         self.diagnostics = Diagnostics(self)
         register_diagnostics_surface(self.mcp, self)
+        # Sprint 21 — MCP prompts namespace.
+        self.prompts = register_prompts_surface(self.mcp, self)
 
     @classmethod
     def boot(cls, **cfg_kwargs: Any) -> "LatticeContext":
@@ -6427,6 +6429,380 @@ def register_diagnostics_surface(server: "MCPServer", ctx: "LatticeContext") -> 
     server.register_resource("diagnostics://tension",    _res(diag.tension_summary))
     server.register_resource("diagnostics://business",   _res(diag.business_summary))
     server.register_resource("diagnostics://encryption", _res(diag.encryption_status))
+
+# =====================================================================
+# SPRINT 21 — MCP PROMPTS SURFACE
+# =====================================================================
+# Implements the MCP `prompts/list` and `prompts/get` protocol methods
+# with a registry of LatticeD-aware prompt templates.  Each template
+# pulls LIVE context from the identity store + diagnostics when fetched,
+# so Claude Desktop / mcp-cli can use them as one-click actions.
+#
+# Template registry:
+#   daily_checkin            short morning prompt with curiosity question
+#   reflect_on_tension       coach-style reflection on highest-tension domain
+#   summarize_week           weekly digest from continuity + drift
+#   propose_next_north_star  draft a north star from identity gaps
+#   audit_my_engagement      what engagement signals say about voice fit
+#   review_my_north_stars    walk through active north stars + progress
+#
+# Each entry in the registry is a PromptTemplate that exposes:
+#   .name, .description, .arguments
+#   .render(ctx, args)  -> {"messages": [PromptMessage]}
+#
+# Wiring:
+#   register_prompts_surface(server, ctx) hooks
+#     server.prompts dict + builds 'prompts/list' and 'prompts/get'
+#     methods directly in MCPServer.handle dispatch.  We patch handle to
+#     route those methods through the new namespace.
+#
+# JSON-RPC dispatch:
+#   The Sprint 15 stdio bridge already maps unknown methods to errors;
+#   we add 'prompts/list' and 'prompts/get' to its translation table.
+# =====================================================================
+
+@dataclass
+class PromptArgumentSpec:
+    name:        str
+    description: str           = ""
+    required:    bool          = False
+    default:     Optional[Any] = None
+
+@dataclass
+class PromptMessage:
+    role:    str               = "user"           # "user" | "assistant" | "system"
+    content: str               = ""
+
+@dataclass
+class PromptTemplate:
+    name:        str
+    description: str
+    arguments:   List[PromptArgumentSpec] = field(default_factory=list)
+    # render(ctx, args) -> List[PromptMessage]
+    renderer:    Optional[Callable[["LatticeContext", Dict[str, Any]], List[PromptMessage]]] = None
+
+    def render(self, ctx: "LatticeContext", args: Dict[str, Any]) -> Dict[str, Any]:
+        # Apply defaults for missing optional args.
+        effective: Dict[str, Any] = {}
+        for spec in self.arguments:
+            if spec.name in args:
+                effective[spec.name] = args[spec.name]
+            elif not spec.required:
+                effective[spec.name] = spec.default
+        # Check required.
+        missing = [s.name for s in self.arguments if s.required and s.name not in args]
+        if missing:
+            return {"error": "missing_required_arguments", "missing": missing}
+        if self.renderer is None:
+            return {"messages": [asdict(PromptMessage(content=f"[{self.name}] template has no renderer."))]}
+        try:
+            msgs = self.renderer(ctx, effective)
+        except Exception as e:
+            return {"error": f"renderer_exception:{type(e).__name__}:{e}"}
+        return {"messages": [asdict(m) for m in msgs]}
+
+
+# ---------- built-in renderers ---------------------------------------
+def _render_daily_checkin(ctx: "LatticeContext", args: Dict[str, Any]) -> List[PromptMessage]:
+    parts: List[str] = []
+    parts.append("This is a daily check-in.  Speak warmly and briefly.")
+    # Pull a curiosity question if one's available.
+    sel = ctx.curiosity.select_next_question()
+    if sel:
+        q, gap, _ = sel
+        parts.append(f"Open question on your mind: \"{q}\"  (domain: {gap.domain})")
+    rules = ctx.identity.active_rules()[:2]
+    if rules:
+        parts.append("Honor these standing rules:")
+        for r in rules:
+            parts.append(f"  - {r.text}")
+    stars = ctx.identity.active_north_stars()[:2]
+    if stars:
+        parts.append("Active north stars to keep in view:")
+        for n in stars:
+            parts.append(f"  - [{n.domain}] {n.text}")
+    parts.append("Greet the user, acknowledge one fact you know about them, and either ask the open question above or invite them to share what's on their mind in 1-2 sentences.")
+    return [PromptMessage(role="system", content="\n".join(parts))]
+
+
+def _render_reflect_on_tension(ctx: "LatticeContext", args: Dict[str, Any]) -> List[PromptMessage]:
+    domain = args.get("domain")
+    model  = TwoMesModel.from_store(ctx.identity)
+    tens   = high_tension_domains(model, threshold=0.0)
+    if not domain:
+        domain = tens[0][0] if tens else LifeDomain.CAREER.value
+    score = next((s for d, s in tens if d == domain), 0.0)
+
+    facts = ctx.identity.facts_for_domain(domain)[:5]
+    stars = [n for n in ctx.identity.active_north_stars() if n.domain == domain][:3]
+
+    system = [
+        "You are a thoughtful coach.  Walk the user through a brief reflection on the "
+        f"domain of {domain}.  The current tension score is {score:.2f} (1.0 = strong "
+        "aspiration but weak present footprint).",
+        "Hold these facts loosely as background:",
+    ]
+    for f in facts:
+        system.append(f"  - {f.text}")
+    if stars:
+        system.append("Their stated aspirations in this domain:")
+        for n in stars:
+            system.append(f"  - {n.text}")
+    system.append(
+        "Ask ONE good question that helps them notice the gap between where they are and "
+        "where they want to be -- without prescribing a fix.  Keep it under 3 sentences."
+    )
+    return [PromptMessage(role="system", content="\n".join(system))]
+
+
+def _render_summarize_week(ctx: "LatticeContext", args: Dict[str, Any]) -> List[PromptMessage]:
+    n = int(args.get("n", 5))
+    tokens = ctx.continuity.latest(n)
+    parts: List[str] = []
+    parts.append("Compose a brief weekly digest for the user, drawing on these recent session tokens.")
+    if not tokens:
+        parts.append("(no recent sessions logged)")
+    else:
+        for t in tokens:
+            line = "  - "
+            if t.summary:
+                line += t.summary
+            if t.open_threads:
+                line += "  [open: " + "; ".join(t.open_threads[:3]) + "]"
+            if t.mood_signal:
+                line += f"  [mood: {t.mood_signal}]"
+            parts.append(line)
+    parts.append("Highlight one thing that moved forward and one thread still open.  Be specific.  Under 6 sentences.")
+    return [PromptMessage(role="system", content="\n".join(parts))]
+
+
+def _render_propose_next_north_star(ctx: "LatticeContext", args: Dict[str, Any]) -> List[PromptMessage]:
+    gaps = ctx.curiosity.detect_gaps()
+    # Prefer domains with facts but no north star.
+    no_star_gaps = [g for g in gaps if g.gap_type == GapType.NO_NORTH_STAR.value]
+    target_domain = (args.get("domain")
+                     or (no_star_gaps[0].domain if no_star_gaps else
+                          (gaps[0].domain if gaps else LifeDomain.GROWTH.value)))
+    facts = ctx.identity.facts_for_domain(target_domain)[:5]
+    parts = [
+        f"Propose ONE candidate north star for the user's {target_domain} domain.",
+        "Their current attested facts in this domain:",
+    ]
+    if facts:
+        for f in facts:
+            parts.append(f"  - {f.text}")
+    else:
+        parts.append("  (no attested facts in this domain yet)")
+    parts.append(
+        "Draft 2-3 alternative north star phrasings of increasing ambition.  Keep each "
+        "under 12 words.  After listing them, ask the user which one resonates."
+    )
+    return [PromptMessage(role="system", content="\n".join(parts))]
+
+
+def _render_audit_my_engagement(ctx: "LatticeContext", args: Dict[str, Any]) -> List[PromptMessage]:
+    snap = ctx.diagnostics.engagement_summary()
+    voice = ctx.diagnostics.voice_summary()
+    parts = [
+        "Walk the user through what their engagement signals reveal about how the system is fitting them.",
+        f"Global response rate to curiosity questions: {snap['global_rate']:.2f}",
+        f"Questions asked in last 24h: {snap['asked_24h']}",
+    ]
+    # Filter out domains with NO observations -- zero-data isn't the same
+    # as low engagement; reporting it as such is misleading.
+    observed = {d: sum(1 for e in ctx.curiosity_ledger.entries if e.domain == d)
+                  for d in snap["per_domain_rate"]}
+    real_rates = {d: snap["per_domain_rate"][d]
+                   for d, n in observed.items() if n > 0}
+    if real_rates:
+        worst = sorted(real_rates.items(), key=lambda kv: kv[1])[:3]
+        parts.append("Lowest-engaging domains (with observations):")
+        for d, r in worst:
+            parts.append(f"  - {d:14s} : {r:.2f}  ({observed[d]} question(s))")
+    if voice["profiles"]:
+        parts.append("Voice-profile drift (1.0 = neutral):")
+        for aid, prof in list(voice["profiles"].items())[:4]:
+            parts.append(f"  - {aid:18s} brevity={prof['brevity_pref']:.2f} "
+                          f"warmth={prof['warmth_pref']:.2f}")
+    parts.append("Offer ONE specific adjustment the user might try this week.  Be concrete; not advice-shaped.")
+    return [PromptMessage(role="system", content="\n".join(parts))]
+
+
+def _render_review_my_north_stars(ctx: "LatticeContext", args: Dict[str, Any]) -> List[PromptMessage]:
+    stars = ctx.identity.active_north_stars()
+    parts = ["Walk the user through their active north stars and how their footprint compares."]
+    if not stars:
+        parts.append("(no north stars set yet -- invite them to draft one)")
+    else:
+        for n in stars[:6]:
+            facts = ctx.identity.facts_for_domain(n.domain or LifeDomain.UNCATEGORIZED.value)
+            parts.append(f"  - [{n.domain}] {n.text} (weight {n.weight:.2f}, "
+                          f"{len(facts)} attested fact(s) in this domain)")
+    parts.append("For each, surface what's actually moving and what isn't.  No advice; just attention.")
+    return [PromptMessage(role="system", content="\n".join(parts))]
+
+
+# ---------- registry --------------------------------------------------
+def _build_default_prompt_registry() -> Dict[str, PromptTemplate]:
+    return {
+        "daily_checkin": PromptTemplate(
+            name="daily_checkin",
+            description="A short morning prompt drawing on rules, north stars, and one open curiosity question.",
+            renderer=_render_daily_checkin,
+        ),
+        "reflect_on_tension": PromptTemplate(
+            name="reflect_on_tension",
+            description="Coach-style reflection on a tension domain.  If no domain provided, the highest-tension one is chosen.",
+            arguments=[
+                PromptArgumentSpec(name="domain",
+                                    description="LifeDomain value to reflect on",
+                                    required=False),
+            ],
+            renderer=_render_reflect_on_tension,
+        ),
+        "summarize_week": PromptTemplate(
+            name="summarize_week",
+            description="Weekly digest built from recent continuity tokens.",
+            arguments=[
+                PromptArgumentSpec(name="n",
+                                    description="number of recent session tokens to include",
+                                    required=False, default=5),
+            ],
+            renderer=_render_summarize_week,
+        ),
+        "propose_next_north_star": PromptTemplate(
+            name="propose_next_north_star",
+            description="Draft 2-3 candidate north stars for a chosen domain (or the most-gap-heavy one).",
+            arguments=[
+                PromptArgumentSpec(name="domain",
+                                    description="LifeDomain to draft for",
+                                    required=False),
+            ],
+            renderer=_render_propose_next_north_star,
+        ),
+        "audit_my_engagement": PromptTemplate(
+            name="audit_my_engagement",
+            description="What engagement signals say about how the system is fitting the user.",
+            renderer=_render_audit_my_engagement,
+        ),
+        "review_my_north_stars": PromptTemplate(
+            name="review_my_north_stars",
+            description="Walk through active north stars and per-domain footprint.",
+            renderer=_render_review_my_north_stars,
+        ),
+    }
+
+
+def register_prompts_surface(server: "MCPServer", ctx: "LatticeContext") -> Dict[str, PromptTemplate]:
+    """
+    Install the MCP prompts namespace onto an MCPServer.  Patches
+    server.handle to dispatch 'prompts/list' and 'prompts/get' through
+    the prompt registry; everything else flows through the original
+    dispatcher unchanged.
+    """
+    prompts: Dict[str, PromptTemplate] = _build_default_prompt_registry()
+    server.prompts = prompts                                                       # type: ignore[attr-defined]
+
+    if getattr(server, "_lat_orig_handle", None) is None:
+        server._lat_orig_handle = server.handle                                    # type: ignore[attr-defined]
+
+    orig_handle = server._lat_orig_handle                                          # type: ignore[attr-defined]
+
+    def _new_handle(req: "MCPRequest") -> "MCPResponse":
+        if req.method not in ("prompts/list", "prompts/get"):
+            return orig_handle(req)
+
+        # Both prompt methods still require a registered consumer.
+        consumer = server.consumers.get(req.consumer_id)
+        grant    = server.grants.get(req.consumer_id)
+        if not consumer or not grant:
+            entry = AccessAuditEntry(
+                consumer_id=req.consumer_id, decision="deny",
+                reason="unknown_consumer", destination="mcp",
+            )
+            server.audit.append(entry)
+            return MCPResponse(request_id=req.request_id, ok=False,
+                                error="unknown_consumer", audit_entry=entry)
+
+        if req.method == "prompts/list":
+            return MCPResponse(req.request_id, True, result=[
+                {"name": p.name,
+                 "description": p.description,
+                 "arguments": [asdict(a) for a in p.arguments]}
+                for p in prompts.values()
+            ])
+
+        # prompts/get
+        params = req.params or {}
+        name   = params.get("name")
+        if not name:
+            return MCPResponse(req.request_id, False, error="missing_name")
+        tmpl = prompts.get(name)
+        if not tmpl:
+            return MCPResponse(req.request_id, False, error=f"unknown_prompt:{name}")
+
+        # Audit the fetch BEFORE rendering so the gate still applies.
+        preview = f"prompts/get:{name}"
+        ok, reason, entry = audited_egress(
+            preview, consumer, grant, "mcp", server.audit,
+            explicit_sensitivity=Sensitivity.LOW.value,
+            explicit_domain=LifeDomain.UNCATEGORIZED.value,
+        )
+        if not ok:
+            return MCPResponse(req.request_id, False, error=reason, audit_entry=entry)
+
+        rendered = tmpl.render(ctx, params.get("arguments") or {})
+        return MCPResponse(req.request_id, True,
+                            result={"name": name,
+                                    "description": tmpl.description,
+                                    **rendered},
+                            audit_entry=entry)
+
+    server.handle = _new_handle                                                    # type: ignore[assignment]
+    return prompts
+
+
+# ---------- JSON-RPC bridge extension --------------------------------
+def _patch_stdio_bridge_for_prompts() -> None:
+    """Extend MCPStdioBridge.handle_line to translate prompts/list and
+    prompts/get JSON-RPC methods through the in-process server."""
+    if getattr(MCPStdioBridge, "_lat_orig_handle_line", None) is not None:
+        return  # already patched
+
+    MCPStdioBridge._lat_orig_handle_line = MCPStdioBridge.handle_line              # type: ignore[attr-defined]
+    orig = MCPStdioBridge._lat_orig_handle_line                                    # type: ignore[attr-defined]
+
+    def _patched_handle_line(self, raw: str) -> str:
+        if not raw or not raw.strip():
+            return ""
+        method, req_id, params, err = decode_jsonrpc_request(raw.strip())
+        if err is None and method in ("prompts/list", "prompts/get"):
+            is_notification = (req_id is None)
+            try:
+                mcp_req = MCPRequest(method=method,
+                                       consumer_id=self.consumer_id,
+                                       params=params or {})
+                resp = self.server.handle(mcp_req)
+            except Exception as e:
+                if is_notification:
+                    return ""
+                return encode_jsonrpc_error(req_id, JSONRPC_INTERNAL_ERROR,
+                                              f"dispatch_exception:{type(e).__name__}:{e}")
+            if is_notification:
+                return ""
+            if not resp.ok:
+                return encode_jsonrpc_error(req_id, JSONRPC_APP_ERROR,
+                                              resp.error or "server_error",
+                                              data={
+                                                  "audit_entry": asdict(resp.audit_entry)
+                                                       if resp.audit_entry else None,
+                                              })
+            return encode_jsonrpc_response(req_id, resp.result)
+        return orig(self, raw)
+
+    MCPStdioBridge.handle_line = _patched_handle_line                              # type: ignore[assignment]
+
+_patch_stdio_bridge_for_prompts()
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
