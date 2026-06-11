@@ -7818,6 +7818,13 @@ class EarlRuntime:
         self.reasoning_sem: Optional[asyncio.Semaphore] = None   # deepseek-r1
         self.synthesis_sem: Optional[asyncio.Semaphore] = None   # qwen2.5-coder
         self.factory = AgentFactoryRegistry()
+        # Sprint 26 — LatticeContext hookup.  Off by default.  Set
+        # LATTICED_ACTIVATE=1 (or call activate_lattice() explicitly) to
+        # turn on identity-aware preambles, voice evolution, activity
+        # timeline, mood block, milestone block, and audit log on every
+        # registry inference.  When None, behavior is bit-for-bit
+        # identical to the pre-Sprint-26 runtime.
+        self.lattice_ctx: Optional["LatticeContext"] = None
 
     def validate_dependencies(self) -> None:
         missing = []
@@ -7833,6 +7840,54 @@ class EarlRuntime:
     def init_storage(self) -> None:
         for folder in (ROOT_DIR, STORAGE_DIR, OUTPUT_DIR, DOCS_DIR):
             folder.mkdir(parents=True, exist_ok=True)
+        # Sprint 26 — gated LatticeContext activation.
+        if os.environ.get("LATTICED_ACTIVATE", "").strip() in ("1", "true", "yes", "on"):
+            self.activate_lattice()
+
+    def activate_lattice(
+        self,
+        user_id: Optional[str] = None,
+        tier_override: Optional[str] = None,
+        passphrase: Optional[str] = None,
+    ) -> Optional["LatticeContext"]:
+        """
+        Boot a LatticeContext and bind it to this runtime so every
+        registry inference receives an identity-aware preamble and emits
+        engagement/voice/perf signals.
+
+        Safe to call once.  On failure, logs and falls through to the
+        legacy (non-personalized) path -- never crashes startup.
+        """
+        if self.lattice_ctx is not None:
+            return self.lattice_ctx
+        try:
+            uid = (user_id
+                    or os.environ.get("LATTICED_USER_ID")
+                    or "local").strip() or "local"
+            tier = (tier_override
+                     or os.environ.get("LATTICED_TIER") or "").strip() or None
+            ctx = LatticeContext.boot(
+                user_id=uid,
+                tier_override=tier,
+                passphrase=passphrase or os.environ.get("LATTICED_PASSPHRASE") or None,
+            )
+            # CRITICAL: replace the runtime's factory with the context's
+            # so the consensus overrides applied by apply_profile_overrides
+            # land on the same AgentSpec instances the runtime invokes.
+            self.factory = ctx.factory
+            self.lattice_ctx = ctx
+            logger.info(
+                "[lattice] activated: tier=%s user=%s agents=%d valid=%s",
+                ctx.profile.tier, uid, len(ctx.factory.registry),
+                ctx.validation.valid,
+            )
+            return ctx
+        except Exception as e:
+            logger.warning(
+                "[lattice] activation failed (%s: %s) -- runtime continuing on legacy path",
+                type(e).__name__, e,
+            )
+            return None
 
     def open_db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(APP_DB_PATH, check_same_thread=False)
@@ -8047,7 +8102,22 @@ class EarlRuntime:
             self.synthesis_sem = asyncio.Semaphore(2)   # two qwen2.5-coder in parallel
 
         spec = self.factory.get_agent(agent_id)
-        prompt_payload = f"<system>{spec.system_prompt}</system>\n\n[Context Blueprint]:\n{context_package}"
+
+        # Sprint 26 — identity-aware preamble (no-op when lattice_ctx is None
+        # OR when the agent's salience policy is empty, e.g., intent_router).
+        preamble = ""
+        if self.lattice_ctx is not None:
+            try:
+                preamble = self.lattice_ctx.compose_preamble(agent_id) or ""
+            except Exception as e:
+                logger.warning("[%s] preamble compose failed: %s", agent_id, e)
+                preamble = ""
+
+        system_block = (
+            f"{preamble}\n\n{spec.system_prompt}".strip()
+            if preamble else spec.system_prompt
+        )
+        prompt_payload = f"<system>{system_block}</system>\n\n[Context Blueprint]:\n{context_package}"
 
         options = {
             "temperature": spec.temperature,
@@ -8060,6 +8130,7 @@ class EarlRuntime:
         # Route to the semaphore that matches this agent's model
         sem = self.reasoning_sem if spec.model_name == MODEL_REASONING else self.synthesis_sem
 
+        _t0 = time.time()
         async with sem:
             try:
                 if spec.output_schema and OLLAMA_DIRECT_AVAILABLE:
@@ -8087,7 +8158,18 @@ class EarlRuntime:
                         asyncio.to_thread(llm.invoke, prompt_payload),
                         timeout=240.0
                     )
-                return raw_response.strip()
+                out = raw_response.strip()
+                # Sprint 26 — record turn signals (voice evolution, perf log, episodic memory).
+                if self.lattice_ctx is not None:
+                    try:
+                        self.lattice_ctx.record_turn(
+                            agent_id=agent_id,
+                            output=out,
+                            latency_ms=(time.time() - _t0) * 1000.0,
+                        )
+                    except Exception as e:
+                        logger.warning("[%s] record_turn failed: %s", agent_id, e)
+                return out
             except asyncio.TimeoutError:
                 logger.error("[%s] Inference timed out after 240s — releasing semaphore.", agent_id)
                 raise RuntimeError(f"Agent '{agent_id}' timed out.")
