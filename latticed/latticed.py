@@ -4829,6 +4829,21 @@ class LatticeContext:
         register_diagnostics_surface(self.mcp, self)
         # Sprint 21 — MCP prompts namespace.
         self.prompts = register_prompts_surface(self.mcp, self)
+        # Sprint 22 — activity log + auto-hooks + MCP surface.
+        self.activity = ActivityLog(ACTIVITY_PATH)
+        install_activity_hooks(self)
+        register_activity_surface(self.mcp, self)
+        # Emit a boot event so we have a heartbeat in the timeline.
+        try:
+            self.activity.append(ActivityEvent(
+                kind=ActivityKind.BOOT.value,
+                summary=f"latticed booted (tier={self.profile.tier})",
+                payload={"tier": self.profile.tier,
+                         "user_id": self.config.user_id,
+                         "agents": len(self.factory.registry)},
+            ))
+        except Exception as e:
+            logger.warning(f"activity boot event failed: {e}")
 
     @classmethod
     def boot(cls, **cfg_kwargs: Any) -> "LatticeContext":
@@ -6803,6 +6818,303 @@ def _patch_stdio_bridge_for_prompts() -> None:
     MCPStdioBridge.handle_line = _patched_handle_line                              # type: ignore[assignment]
 
 _patch_stdio_bridge_for_prompts()
+
+# =====================================================================
+# SPRINT 22 — ACTIVITY TIMELINE + CHANGE FEED
+# =====================================================================
+# Append-only JSONL log of meaningful identity/business/curiosity
+# changes.  Feeds the weekly digest template, supports "what changed
+# this week?" queries, and gives the system a record of its own work.
+#
+# Persisted at runtime/storage/activity.jsonl.  Rotates above
+# MAX_ACTIVITY_LINES (10,000).  Records are tagged with sensitivity so
+# HIGH-sensitivity events can be filtered out of exports.
+#
+# Public API:
+#   ActivityEvent                kind + summary + payload + timestamp
+#   ActivityLog                  append-only JSONL with filter helpers
+#   ctx.record_event(kind, summary, payload?, sensitivity?, domain?)
+#     -- standard hook for any module that wants to emit a change
+#   install_activity_hooks(ctx)  -- auto-wires IdentityStore.add_fact /
+#     .add_north_star / .add_rule, BusinessStore.register,
+#     SnapshotStore.put to emit events automatically
+#
+# MCP tools (auto-registered):
+#   tools/call get_recent_activity {limit?, since_seconds?, kinds?}
+#   tools/call activity_summary {since_seconds?}
+#
+# MCP resources:
+#   activity://recent             default last 50 events
+#   activity://summary            counts by kind in last 7 days
+# =====================================================================
+
+ACTIVITY_PATH = STORAGE_DIR / "activity.jsonl"
+MAX_ACTIVITY_LINES = 10_000
+
+class ActivityKind(str, Enum):
+    FACT_ADDED          = "fact_added"
+    FACT_UPDATED        = "fact_updated"
+    NORTH_STAR_ADDED    = "north_star_added"
+    RULE_ADDED          = "rule_added"
+    BUSINESS_REGISTERED = "business_registered"
+    BUSINESS_ACTIVE     = "business_active"
+    SNAPSHOT_CAPTURED   = "snapshot_captured"
+    DRIFT_DETECTED      = "drift_detected"
+    GAP_CLOSED          = "gap_closed"
+    QUESTION_ASKED      = "question_asked"
+    QUESTION_ANSWERED   = "question_answered"
+    EXPORT_EMITTED      = "export_emitted"
+    IMPORT_APPLIED      = "import_applied"
+    BOOT                = "boot"
+    CUSTOM              = "custom"
+
+@dataclass
+class ActivityEvent:
+    kind:        str
+    summary:     str
+    timestamp:   float                          = field(default_factory=lambda: time.time())
+    payload:     Dict[str, Any]                 = field(default_factory=dict)
+    sensitivity: str                            = Sensitivity.LOW.value
+    domain:      str                            = LifeDomain.UNCATEGORIZED.value
+
+class ActivityLog:
+    """Append-only JSONL.  One write per event so partial files are
+    well-formed; cheap to tail."""
+    def __init__(self, path: Path = ACTIVITY_PATH) -> None:
+        self.path: Path = path
+
+    def append(self, event: ActivityEvent) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(event), default=str) + "\n")
+
+    def read_all(self) -> List[ActivityEvent]:
+        if not self.path.exists():
+            return []
+        out: List[ActivityEvent] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(ActivityEvent(**json.loads(line)))
+            except Exception as e:
+                logger.warning(f"activity log parse skip: {e}")
+        return out
+
+    def filter(
+        self,
+        limit: Optional[int] = None,
+        since_seconds: Optional[float] = None,
+        kinds: Optional[Iterable[str]] = None,
+        max_sensitivity: Optional[str] = None,
+    ) -> List[ActivityEvent]:
+        order = {s.value: i for i, s in enumerate(
+            [Sensitivity.LOW, Sensitivity.MEDIUM, Sensitivity.HIGH, Sensitivity.SECRET])}
+        ceiling = order.get(max_sensitivity, 3) if max_sensitivity else 3
+        kind_set = set(kinds) if kinds else None
+        cutoff = (time.time() - since_seconds) if since_seconds else 0.0
+        out: List[ActivityEvent] = []
+        for e in self.read_all():
+            if e.timestamp < cutoff:                continue
+            if kind_set and e.kind not in kind_set: continue
+            if order.get(e.sensitivity, 1) > ceiling: continue
+            out.append(e)
+        out.sort(key=lambda e: -e.timestamp)
+        return (out[:limit] if limit else out)
+
+    def counts_by_kind(self, since_seconds: float = 7 * 86400.0) -> Dict[str, int]:
+        cutoff = time.time() - since_seconds
+        out: Dict[str, int] = {}
+        for e in self.read_all():
+            if e.timestamp < cutoff:
+                continue
+            out[e.kind] = out.get(e.kind, 0) + 1
+        return out
+
+    def rotate_if_needed(self) -> int:
+        if not self.path.exists():
+            return 0
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        if len(lines) <= MAX_ACTIVITY_LINES:
+            return 0
+        kept = lines[-MAX_ACTIVITY_LINES:]
+        archive = self.path.with_suffix(self.path.suffix + f".rot.{int(time.time())}")
+        self.path.rename(archive)
+        self.path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        return len(lines) - len(kept)
+
+
+# ---------- auto-wiring (patches stores in place) ---------------------
+def install_activity_hooks(ctx: "LatticeContext") -> None:
+    """
+    Wrap IdentityStore.add_fact / add_north_star / add_rule,
+    BusinessStore.register / set_active, SnapshotStore.put,
+    and CuriosityEngine.record_question_asked / record_response on
+    THIS specific ctx so the activity log gets a row for each.  We
+    patch the bound methods (not the class) so other ctx instances
+    aren't affected.
+    """
+    log = ctx.activity
+
+    # IdentityStore.add_fact
+    orig_add_fact = ctx.identity.add_fact
+    def _add_fact(text, domain=None, sensitivity=None, confidence=0.7,
+                   source="user_stated", metadata=None):
+        before_count = len(ctx.identity.doc.facts)
+        f = orig_add_fact(text=text, domain=domain, sensitivity=sensitivity,
+                            confidence=confidence, source=source, metadata=metadata)
+        kind = (ActivityKind.FACT_ADDED.value
+                if len(ctx.identity.doc.facts) > before_count
+                else ActivityKind.FACT_UPDATED.value)
+        log.append(ActivityEvent(
+            kind=kind,
+            summary=f"{kind}: '{(f.text or '')[:80]}'",
+            payload={"fact_text": f.text,
+                     "confidence": f.confidence,
+                     "seen_count": f.seen_count,
+                     "source": f.source},
+            sensitivity=f.sensitivity,
+            domain=f.domain,
+        ))
+        return f
+    ctx.identity.add_fact = _add_fact                                   # type: ignore[assignment]
+
+    orig_add_ns = ctx.identity.add_north_star
+    def _add_ns(text, domain=None, weight=1.0):
+        n = orig_add_ns(text=text, domain=domain, weight=weight)
+        log.append(ActivityEvent(
+            kind=ActivityKind.NORTH_STAR_ADDED.value,
+            summary=f"north star added: '{(n.text or '')[:80]}'",
+            payload={"north_star_text": n.text, "weight": n.weight},
+            domain=n.domain,
+        ))
+        return n
+    ctx.identity.add_north_star = _add_ns                                # type: ignore[assignment]
+
+    orig_add_rule = ctx.identity.add_rule
+    def _add_rule(text, priority=100):
+        r = orig_add_rule(text=text, priority=priority)
+        log.append(ActivityEvent(
+            kind=ActivityKind.RULE_ADDED.value,
+            summary=f"rule added: '{(r.text or '')[:80]}'",
+            payload={"rule_text": r.text, "priority": r.priority},
+        ))
+        return r
+    ctx.identity.add_rule = _add_rule                                    # type: ignore[assignment]
+
+    # BusinessStore
+    orig_biz_register = ctx.business.register
+    def _biz_register(profile, set_active=False):
+        out = orig_biz_register(profile, set_active=set_active)
+        log.append(ActivityEvent(
+            kind=ActivityKind.BUSINESS_REGISTERED.value,
+            summary=f"business registered: '{profile.display_name}'",
+            payload={"business_id": profile.business_id,
+                     "display_name": profile.display_name,
+                     "legal_entity": profile.legal_entity,
+                     "set_active": set_active},
+            domain=LifeDomain.BUSINESS.value,
+        ))
+        return out
+    ctx.business.register = _biz_register                                # type: ignore[assignment]
+
+    orig_biz_active = ctx.business.set_active
+    def _biz_active(bid):
+        out = orig_biz_active(bid)
+        log.append(ActivityEvent(
+            kind=ActivityKind.BUSINESS_ACTIVE.value,
+            summary=f"active business set: {bid}",
+            payload={"business_id": bid},
+            domain=LifeDomain.BUSINESS.value,
+        ))
+        return out
+    ctx.business.set_active = _biz_active                                # type: ignore[assignment]
+
+    # SnapshotStore
+    orig_snap_put = ctx.snapshots.put
+    def _snap_put(label, snap):
+        out = orig_snap_put(label, snap)
+        log.append(ActivityEvent(
+            kind=ActivityKind.SNAPSHOT_CAPTURED.value,
+            summary=f"snapshot captured: '{label}'",
+            payload={"label": label, "fact_count": snap.fact_count,
+                      "domains": list(snap.domain_fact_counts.keys())},
+        ))
+        return out
+    ctx.snapshots.put = _snap_put                                        # type: ignore[assignment]
+
+    # CuriosityEngine
+    orig_q_asked = ctx.curiosity.record_question_asked
+    def _q_asked(question, gap, expected_gain):
+        entry = orig_q_asked(question, gap, expected_gain)
+        log.append(ActivityEvent(
+            kind=ActivityKind.QUESTION_ASKED.value,
+            summary=f"curiosity asked: {question[:80]}",
+            payload={"question": question,
+                      "domain": gap.domain,
+                      "gap_type": gap.gap_type,
+                      "expected_gain": expected_gain},
+            domain=gap.domain,
+        ))
+        return entry
+    ctx.curiosity.record_question_asked = _q_asked                       # type: ignore[assignment]
+
+    orig_q_resp = ctx.curiosity.record_response
+    def _q_resp(question, answered, response_excerpt=None):
+        out = orig_q_resp(question, answered, response_excerpt=response_excerpt)
+        log.append(ActivityEvent(
+            kind=ActivityKind.QUESTION_ANSWERED.value,
+            summary=f"curiosity {'answered' if answered else 'skipped'}: {question[:60]}",
+            payload={"question": question,
+                      "answered": answered,
+                      "response_excerpt": (response_excerpt or "")[:120]},
+            domain=(out.domain if out else LifeDomain.UNCATEGORIZED.value),
+        ))
+        return out
+    ctx.curiosity.record_response = _q_resp                              # type: ignore[assignment]
+
+
+# ---------- MCP wiring -------------------------------------------------
+def register_activity_surface(server: "MCPServer", ctx: "LatticeContext") -> None:
+    log = ctx.activity
+
+    def _tool_recent(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        limit = int(params.get("limit", 25))
+        since = params.get("since_seconds")
+        kinds = params.get("kinds")
+        max_sens = params.get("max_sensitivity", Sensitivity.MEDIUM.value)
+        events = log.filter(
+            limit=limit,
+            since_seconds=(float(since) if since is not None else None),
+            kinds=kinds,
+            max_sensitivity=max_sens,
+        )
+        return {"ok": True,
+                "count": len(events),
+                "events": [asdict(e) for e in events]}
+
+    def _tool_summary(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        since = float(params.get("since_seconds", 7 * 86400.0))
+        return {"ok": True,
+                "since_seconds": since,
+                "counts_by_kind": log.counts_by_kind(since_seconds=since)}
+
+    server.register_tool("get_recent_activity", _tool_recent)
+    server.register_tool("activity_summary",    _tool_summary)
+
+    def _res_recent(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        events = log.filter(limit=50, max_sensitivity=Sensitivity.MEDIUM.value)
+        return {"ok": True,
+                "count": len(events),
+                "events": [asdict(e) for e in events]}
+
+    def _res_summary(srv: "MCPServer", params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True,
+                "counts_by_kind": log.counts_by_kind()}
+
+    server.register_resource("activity://recent",  _res_recent)
+    server.register_resource("activity://summary", _res_summary)
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
