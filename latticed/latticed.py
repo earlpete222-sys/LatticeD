@@ -4883,8 +4883,91 @@ class LatticeContext:
                 include_curiosity_hint=self.config.include_curiosity_hint,
             )
         continuity_block = build_continuity_preamble(self.continuity, n=1)
-        parts = [b for b in (continuity_block, voice_block) if b]
+        # Sprint 25 — close the voice loop: mood + active milestones.
+        mood_block      = self._compose_mood_block(agent_id)
+        milestone_block = self._compose_milestone_block(agent_id)
+        parts = [b for b in (continuity_block, voice_block,
+                              mood_block, milestone_block) if b]
         return "\n\n".join(parts)
+
+    # ----- mood-aware tone block (Sprint 25) -----
+    # Agents that produce user-facing prose: their tone bends to mood.
+    # Schema-discipline agents (auditor, router, guardian, extractors)
+    # are deliberately excluded -- structured output mustn't bend to mood.
+    _MOOD_AWARE_AGENTS = {
+        "fast_mentor", "life_coach", "executive_arbiter",
+        "quant_architect", "quant_architect_explore", "research_synthesizer",
+    }
+    # Agents that benefit from seeing active in-progress milestones in their
+    # preamble (coaches + final output formatter).
+    _MILESTONE_AWARE_AGENTS = {
+        "fast_mentor", "life_coach", "executive_arbiter",
+    }
+
+    def _compose_mood_block(self, agent_id: str) -> str:
+        if agent_id not in self._MOOD_AWARE_AGENTS:
+            return ""
+        mood = getattr(self, "mood", None)
+        if mood is None:
+            return ""
+        try:
+            sig, share = mood.dominant_signal(window_seconds=86400.0)
+        except Exception:
+            return ""
+        # Require a meaningful concentration before bending tone.
+        if share < 0.30 or sig == MoodSignal.NEUTRAL.value:
+            return ""
+        adj = mood_to_warmth_adjustment(sig)
+        if sig == MoodSignal.HEAVY.value:
+            guidance = ("The user has been signaling heaviness recently.  Lead with "
+                        "acknowledgment.  Slow down.  Do not jump to fixes or "
+                        "advice unless explicitly asked.")
+        elif sig == MoodSignal.DRAINED.value:
+            guidance = ("The user has been signaling exhaustion.  Be brief and gentle.  "
+                        "Lower the cognitive load of your response.")
+        elif sig == MoodSignal.ENERGIZED.value:
+            guidance = ("The user has been signaling momentum.  Match their energy; be "
+                        "specific and crisp; don't dilute it with caveats.")
+        elif sig == MoodSignal.LIGHT.value:
+            guidance = ("The user has been in a light mood.  Stay warm and direct; humor "
+                        "is welcome.")
+        elif sig == MoodSignal.FOCUSED.value:
+            guidance = ("The user has been in focused work mode.  Be direct, no "
+                        "small talk; respect the flow state.")
+        elif sig == MoodSignal.MIXED.value:
+            guidance = ("The user has been carrying mixed signals.  Ask once before "
+                        "assuming where they are; do not project.")
+        else:
+            return ""
+        return ("USER MOOD CONTEXT (last 24h dominant signal: "
+                f"{sig}, share={share:.0%}, warmth_adj={adj:+.2f}):\n  {guidance}")
+
+    def _compose_milestone_block(self, agent_id: str) -> str:
+        if agent_id not in self._MILESTONE_AWARE_AGENTS:
+            return ""
+        ms = getattr(self, "milestones", None)
+        if ms is None:
+            return ""
+        try:
+            in_prog = [m for m in ms.milestones.values()
+                        if m.status == MilestoneStatus.IN_PROGRESS.value]
+            soon    = [m for m in in_prog if m.due_at and (m.due_at - time.time()) < 14 * 86400.0]
+        except Exception:
+            return ""
+        if not in_prog and not soon:
+            return ""
+        in_prog.sort(key=lambda m: -m.updated)
+        lines = ["ACTIVE MILESTONES (in progress -- mention only if the user surfaces this domain):"]
+        for m in in_prog[:3]:
+            tag = f"[{m.domain}] " if m.domain and m.domain != LifeDomain.UNCATEGORIZED.value else ""
+            ns_tail = f"  (toward: {m.north_star_ref})" if m.north_star_ref else ""
+            lines.append(f"  - {tag}{m.text}{ns_tail}")
+        if soon:
+            lines.append("DUE SOON (next 14 days):")
+            for m in soon[:3]:
+                days_left = max(0, int((m.due_at - time.time()) / 86400.0))
+                lines.append(f"  - {m.text} (in {days_left}d)")
+        return "\n".join(lines)
 
     # ----- turn lifecycle -----
     def record_turn(
