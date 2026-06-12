@@ -968,6 +968,11 @@ class AgentFactoryRegistry:
                     "  You: 'What did you make?'\n\n"
                     "  User: 'How are you today?'\n"
                     "  You: 'I'm here and ready. What's on your mind?'\n\n"
+                    "  User: 'What do I like to do for fun?' (when WHAT I KNOW ABOUT THE USER "
+                    "says they hike on Saturdays)\n"
+                    "  You: 'You're a hiker — most Saturday mornings you're out on a trail.'\n"
+                    "  (When asked about themselves and you have the answer in WHAT I KNOW "
+                    "ABOUT THE USER, ANSWER from it. Never ask them the same question back.)\n\n"
                     "FORBIDDEN PATTERNS — do not do these:\n"
                     "- Do not start with 'I know you...' or 'You said...' — you don't know how they felt, "
                     "  and echoing their words back is not engagement.\n"
@@ -8519,7 +8524,15 @@ class EarlRuntime:
             #   b. Preference/self queries get a synonym-expanded variant;
             #      score = max(sim(query), sim(expanded)).  Control facts
             #      (rent vs fun-query: 0.06) confirm no false-positive risk.
-            encoder = _get_shared_st_model() if _SHARED_ST_MODEL is not None else None
+            # Sprint 35 fix: call _get_shared_st_model() directly — it lazy-
+            # loads.  The old guard (`if _SHARED_ST_MODEL is not None`) only
+            # used the encoder when something ELSE had already loaded it,
+            # silently disabling relevance filtering in any process where
+            # ChromaDB hadn't initialized first.
+            try:
+                encoder = _get_shared_st_model()
+            except Exception:
+                encoder = None
             if encoder is not None and query and query.strip():
                 try:
                     import numpy as np
@@ -9132,6 +9145,43 @@ async def _infer_with_echo_guard(agent_id: str, payload: str, user_input: str) -
         text = clean_model_text(raw)
     return text
 
+_RECALL_QUERY_RX = re.compile(
+    r"\b(?:do|did|am|was|what(?:'s| is| are)?|where|how)\s+(?:do\s+)?i\b"
+    r"|\bmy\s+(?:favorite|usual|routine|goals?|plans?)\b",
+    re.IGNORECASE,
+)
+
+# Belief lines that look like activities/preferences — used to compose the
+# deterministic recall fallback when the model refuses to answer from them.
+_ACTIVITY_BELIEF_RX = re.compile(
+    r"\b(?:enjoy|love|like|go(?:es)?|play|hik|run|read|watch|cook|swim|bike|"
+    r"climb|paint|garden|fish|camp|travel|favorite|hobby|weekend)",
+    re.IGNORECASE,
+)
+
+def _compose_recall_fallback(belief: str) -> str:
+    """
+    Deterministic answer composed from the belief lines themselves —
+    used when the model twice fails to answer a recall question from
+    its knowledge.  Recall questions deserve recall answers; the model's
+    job is phrasing, and when it refuses, the system answers directly.
+    """
+    lines = []
+    for raw in belief.splitlines():
+        t = raw.strip().lstrip("-• ").strip()
+        # Strip the "[0.76 | rel 0.32]" scoring prefix if present.
+        t = re.sub(r"^\[[^\]]*\]\s*", "", t)
+        if not t or t.upper().startswith("BELIEF GRAPH"):
+            continue
+        if _ACTIVITY_BELIEF_RX.search(t):
+            lines.append(t.rstrip("."))
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return f"From what you've shared with me: {lines[0]}."
+    listed = "; ".join(lines[:3])
+    return f"From what you've shared with me: {listed}."
+
 async def fast_core_node(state: SovereignState) -> dict:
     timer = PerfTimer("fast_core")
     # Empty section labels confuse the 1.5B model — a bare "Beliefs:" line makes
@@ -9139,6 +9189,7 @@ async def fast_core_node(state: SovereignState) -> dict:
     # (same pattern as life_coach_node).
     memory = (state.get("retrieved_memory") or "").strip()
     belief = (state.get("belief_context") or "").strip()
+    recall_mode = False
     sections = []
     if memory:
         sections.append(f"CONVERSATION HISTORY:\n{memory}")
@@ -9147,15 +9198,28 @@ async def fast_core_node(state: SovereignState) -> dict:
         # Self-referential queries ('what do I like...', 'what's my...') ask
         # the system to recall the user to themselves.  The 1.5B model needs
         # an explicit pointer or it answers generically / goes meta.
-        if re.search(r"\b(?:do|did|am|was|what(?:'s| is| are)?|where|how)\s+(?:do\s+)?i\b|\bmy\s+(?:favorite|usual|routine|goals?|plans?)\b",
-                      state["user_input"].lower()):
+        if _RECALL_QUERY_RX.search(state["user_input"].lower()):
+            recall_mode = True
             sections.append(
                 "IMPORTANT: The user is asking about THEMSELVES. Answer from "
                 "WHAT I KNOW ABOUT THE USER above — reference the specific "
-                "activities or facts listed there.")
+                "activities or facts listed there. Do NOT ask them a question back.")
     sections.append(f"USER'S MESSAGE (reply to this directly):\n{state['user_input']}")
     payload = "\n\n".join(sections)
     text = await _infer_with_echo_guard("fast_mentor", payload, state["user_input"])
+
+    # Recall-mode guarantee: a question-only response to a recall query is
+    # by definition wrong — the user asked the SYSTEM to remember, and the
+    # knowledge was in the payload.  The echo guard already retried once;
+    # if the result is STILL just a question, answer deterministically from
+    # the beliefs themselves.
+    if recall_mode and text.rstrip().rstrip('"”\'').endswith("?"):
+        fallback = _compose_recall_fallback(belief)
+        if fallback:
+            logger.warning(
+                "[fast_core] Recall query answered with a question twice — "
+                "using deterministic belief fallback.")
+            text = fallback
     timer.stop()
     return {"fast_generation": text, "guardian_decision": "fast"}
 
