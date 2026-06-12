@@ -9027,18 +9027,31 @@ def perception_barrier_node(state: SovereignState) -> dict:
 async def _infer_with_echo_guard(agent_id: str, payload: str, user_input: str) -> str:
     """
     Run a registry inference with an echo guard — the 1.5B models occasionally
-    parrot the user's message back verbatim. One retry with an explicit nudge
-    fixes nearly all cases.
+    parrot the user's message back verbatim, or go meta and SUGGEST a reply
+    instead of giving one ('You could ask, "..."').  One retry with an
+    explicit nudge fixes nearly all cases.
     """
     def _norm(s: str) -> str:
         return re.sub(r"[\W_]+", "", s).lower()
+
+    def _is_scaffolded_question(raw_text: str) -> bool:
+        # Meta-mode detector: the raw output opened with a suggestion
+        # scaffold AND what remains after stripping is itself a question —
+        # the model proposed something to ask rather than answering.
+        no_think = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+        if not _META_SCAFFOLD.match(no_think):
+            return False
+        return clean_model_text(raw_text).rstrip().rstrip('"”\'').endswith("?")
+
     raw = await runtime.execute_registry_inference(agent_id, payload)
     text = clean_model_text(raw)
-    if not text or _norm(text) == _norm(user_input):
-        logger.warning("[%s] Echo/empty response detected — retrying once.", agent_id)
+    if not text or _norm(text) == _norm(user_input) or _is_scaffolded_question(raw):
+        logger.warning("[%s] Echo/meta/empty response detected — retrying once.", agent_id)
         raw = await runtime.execute_registry_inference(
             agent_id,
-            payload + "\n\n(Answer the user's message — do not repeat it back.)",
+            payload + "\n\n(Answer the user's message directly in your own voice — "
+                       "do not repeat it back, and do not suggest a question to ask. "
+                       "If WHAT I KNOW ABOUT THE USER contains the answer, use it.)",
         )
         text = clean_model_text(raw)
     return text
@@ -9055,6 +9068,15 @@ async def fast_core_node(state: SovereignState) -> dict:
         sections.append(f"CONVERSATION HISTORY:\n{memory}")
     if belief:
         sections.append(f"WHAT I KNOW ABOUT THE USER:\n{belief}")
+        # Self-referential queries ('what do I like...', 'what's my...') ask
+        # the system to recall the user to themselves.  The 1.5B model needs
+        # an explicit pointer or it answers generically / goes meta.
+        if re.search(r"\b(?:do|did|am|was|what(?:'s| is| are)?|where|how)\s+(?:do\s+)?i\b|\bmy\s+(?:favorite|usual|routine|goals?|plans?)\b",
+                      state["user_input"].lower()):
+            sections.append(
+                "IMPORTANT: The user is asking about THEMSELVES. Answer from "
+                "WHAT I KNOW ABOUT THE USER above — reference the specific "
+                "activities or facts listed there.")
     sections.append(f"USER'S MESSAGE (reply to this directly):\n{state['user_input']}")
     payload = "\n\n".join(sections)
     text = await _infer_with_echo_guard("fast_mentor", payload, state["user_input"])
@@ -9723,8 +9745,9 @@ async def artifact_writer_node(state: SovereignState) -> dict:
 # block, the quotes are unwrapped so the user sees the reply itself.
 _META_SCAFFOLD = re.compile(
     r"^(?:(?:great|sure|okay|alright|certainly)[!.,]?\s*)?"
-    r"(?:how about|you could say|you might say|here(?:'s| is) (?:a|the|my|your) "
-    r"(?:response|reply|answer|message))\s*:?\s*",
+    r"(?:how about|you (?:could|might|can) (?:say|ask|reply|respond)(?:\s+with)?|"
+    r"try (?:saying|asking)|here(?:'s| is) (?:a|the|my|your) "
+    r"(?:response|reply|answer|message|question))\s*[:,]?\s*",
     re.IGNORECASE,
 )
 
