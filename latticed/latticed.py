@@ -4982,6 +4982,11 @@ class LatticeContext:
     _MILESTONE_AWARE_AGENTS = {
         "fast_mentor", "life_coach", "executive_arbiter",
     }
+    # Sprint 32 — decision agents: mood-aware (they acknowledge state) but
+    # their numbers/allocations/conclusions must never bend to mood.
+    _DECISION_AGENTS = {
+        "quant_architect", "quant_architect_explore", "research_synthesizer",
+    }
 
     def _compose_mood_block(self, agent_id: str) -> str:
         if agent_id not in self._MOOD_AWARE_AGENTS:
@@ -5018,6 +5023,14 @@ class LatticeContext:
                         "assuming where they are; do not project.")
         else:
             return ""
+        # Sprint 32 — emotion is signal, not master (Graham's Mr. Market /
+        # Aurelius).  Decision agents acknowledge the user's state but must
+        # never let it alter numbers, allocations, or factual conclusions.
+        if agent_id in self._DECISION_AGENTS:
+            guidance += ("  DECISION DISCIPLINE: acknowledge the user's state in at "
+                         "most one clause; never alter numbers, allocations, or "
+                         "factual conclusions because of mood.  The math does not "
+                         "change with feelings — only the timing of decisions can.")
         return ("USER MOOD CONTEXT (last 24h dominant signal: "
                 f"{sig}, share={share:.0%}, warmth_adj={adj:+.2f}):\n  {guidance}")
 
@@ -7879,6 +7892,137 @@ def register_milestone_surface(server: "MCPServer", ctx: "LatticeContext") -> No
 
     server.register_resource("goals://milestones", _res_milestones)
     server.register_resource("goals://progress",   _res_progress)   # +/<text>
+
+# =====================================================================
+# SPRINT 32 — UNIVERSAL-PATTERN CORE PRIMITIVES
+# =====================================================================
+# Cross-text universals distilled from the reference corpus (Covey,
+# Carnegie, Graham, Chhabra, Aurelius, Sun Tzu, Dixit/Nalebuff, et al.)
+# folded into the base framework.  Three primitives:
+#
+#   classify_control_locus(text)  — Covey Circle of Influence / Aurelius
+#       dichotomy of control.  Is this within the user's control?
+#   infer_time_horizon(text)      — long-horizon-over-impulse.  What
+#       timeframe does this statement/plan live on?
+#   consensus_confidence(candidates) — Graham margin of safety applied
+#       to cross-model consensus: quantified agreement ratio so callers
+#       can widen uncertainty bands instead of silently picking.
+# =====================================================================
+
+class ControlLocus(str, Enum):
+    WITHIN  = "within"    # user's own actions, choices, responses
+    OUTSIDE = "outside"   # other people, markets, weather, past events
+    MIXED   = "mixed"     # elements of both
+    UNCLEAR = "unclear"   # no signal
+
+_LOCUS_WITHIN_PATTERNS = [
+    # Negative lookbehind: "nothing I can do" / "all I can do" are
+    # helplessness phrasings, not agency.
+    r"(?<!nothing )(?<!all )\bi (?:can|will|could|plan to|decided?|chose|choose|am going to)\b",
+    r"\bmy (?:choice|decision|plan|response|effort|habit|routine)\b",
+    r"\bi(?:'m| am) (?:working on|building|starting|learning|practicing)\b",
+    r"\bup to me\b", r"\bin my (?:control|hands|power)\b",
+]
+_LOCUS_OUTSIDE_PATTERNS = [
+    r"\b(?:my boss|the company|the market|the economy|the weather|they|she|he)\s+(?:decided|did|made|forced|won't|will not|refuses?)\b",
+    r"\b(?:can't|cannot) (?:control|change|do anything about)\b",
+    r"\bout of my (?:control|hands)\b", r"\bnothing i can do\b",
+    r"\bif only (?:they|she|he|the)\b", r"\bthe (?:market|economy|fed|government)\b",
+    r"\blayoffs?\b", r"\bgot (?:passed over|rejected|denied|laid off)\b",
+]
+
+def classify_control_locus(text: str) -> Tuple[str, Dict[str, int]]:
+    """
+    Classify whether a statement concerns matters within the user's
+    control, outside it, or both.  Returns (locus, hit_counts).
+    Conservative: UNCLEAR when no signal — never guess.
+    """
+    if not text or not text.strip():
+        return ControlLocus.UNCLEAR.value, {}
+    lo = text.lower()
+    within  = sum(1 for p in _LOCUS_WITHIN_PATTERNS  if re.search(p, lo))
+    outside = sum(1 for p in _LOCUS_OUTSIDE_PATTERNS if re.search(p, lo))
+    counts = {"within": within, "outside": outside}
+    if within and outside:
+        return ControlLocus.MIXED.value, counts
+    if within:
+        return ControlLocus.WITHIN.value, counts
+    if outside:
+        return ControlLocus.OUTSIDE.value, counts
+    return ControlLocus.UNCLEAR.value, counts
+
+
+class TimeHorizon(str, Enum):
+    IMMEDIATE = "immediate"   # today / this week
+    SHORT     = "short"       # weeks to ~3 months
+    MEDIUM    = "medium"      # months to ~2 years
+    LONG      = "long"        # multi-year / life-stage
+    UNSTATED  = "unstated"
+
+_HORIZON_PATTERNS: List[Tuple[str, str]] = [
+    (TimeHorizon.IMMEDIATE.value, r"\b(?:today|tonight|right now|asap|this week|tomorrow|immediately)\b"),
+    (TimeHorizon.SHORT.value,     r"\b(?:next month|this month|few weeks|\d+\s*weeks?|this quarter|90 days?|by (?:the )?end of (?:the )?month)\b"),
+    (TimeHorizon.MEDIUM.value,    r"\b(?:next year|this year|\d+\s*months?|by 20\d\d|within (?:a|one|two) years?|18 months)\b"),
+    (TimeHorizon.LONG.value,      r"\b(?:retirement|retire|\d+\s*years?|long[- ]term|decade|college fund|by (?:age|the time)|someday|life goal)\b"),
+]
+
+def infer_time_horizon(text: str) -> str:
+    """
+    Infer the timeframe a statement or plan lives on.  When multiple
+    horizons appear, the LONGEST wins — plans should be framed against
+    their furthest commitment (Covey: begin with the end in mind).
+    """
+    if not text:
+        return TimeHorizon.UNSTATED.value
+    lo = text.lower()
+    found: List[str] = [h for h, p in _HORIZON_PATTERNS if re.search(p, lo)]
+    if not found:
+        return TimeHorizon.UNSTATED.value
+    order = [TimeHorizon.LONG.value, TimeHorizon.MEDIUM.value,
+              TimeHorizon.SHORT.value, TimeHorizon.IMMEDIATE.value]
+    for h in order:
+        if h in found:
+            return h
+    return TimeHorizon.UNSTATED.value
+
+
+def consensus_confidence(candidates: List[str]) -> Tuple[float, int]:
+    """
+    Graham's margin of safety applied to cross-model output: quantify
+    HOW MUCH the candidates agree rather than just whether the bar was
+    met.  Returns (confidence, n_clusters) where confidence is the
+    largest agreement-cluster's share of all candidates (1.0 = unanimous,
+    1/n = total disagreement).
+
+    Callers should WIDEN stated uncertainty as confidence drops — never
+    present a low-confidence answer with high-confidence language.
+    """
+    live = [c for c in (candidates or []) if c is not None]
+    if not live:
+        return 0.0, 0
+    buckets: Dict[str, int] = {}
+    for c in live:
+        key = " ".join((c or "").lower().split())
+        buckets[key] = buckets.get(key, 0) + 1
+    largest = max(buckets.values())
+    return largest / len(live), len(buckets)
+
+
+def margin_of_safety_preface(confidence: float) -> str:
+    """
+    Standard uncertainty language for a given consensus confidence.
+    Empty string at high confidence — don't hedge what's solid.
+    """
+    if confidence >= 0.99:
+        return ""
+    if confidence >= 0.66:
+        return "Models substantially agree on this answer; minor variations existed."
+    if confidence >= 0.5:
+        return ("Cross-checking produced partial agreement — treat specific "
+                "figures as provisional and verify anything stakes-bearing.")
+    return ("Cross-checking produced significant disagreement.  This answer is "
+            "the strongest candidate, but confidence is LOW — verify before "
+            "acting on any specific claim.")
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
