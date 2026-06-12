@@ -515,6 +515,62 @@ SEMANTIC_CACHE_THRESHOLD = 0.98
 # 0.50 = moderately related
 # 0.70 = strongly related
 BELIEF_RELEVANCE_THRESHOLD = 0.30
+
+# ---------------------------------------------------------------------
+# Belief-retrieval embedding helpers (Sprint 34).
+# Facts are stored third-person but queried first-person; the MiniLM
+# embedding space treats those as different people (measured: 'The user
+# goes hiking...' vs 'What do I like to do for fun?' = 0.055; same fact
+# first-person = 0.282; with query expansion = 0.320+).
+# ---------------------------------------------------------------------
+_FACT_PREFIX_RX = re.compile(r"^(?:the\s+)?user(?:'s)?\s+", re.IGNORECASE)
+# Third-person singular verb -> first person, for the verb immediately
+# following the stripped prefix.  Fallback: leave verb untouched (the
+# embedding still improves from the pronoun fix alone).
+_VERB_NORMALIZE = {
+    "goes": "go", "likes": "like", "loves": "love", "enjoys": "enjoy",
+    "has": "have", "does": "do", "is": "am", "wants": "want",
+    "works": "work", "lives": "live", "runs": "run", "plays": "play",
+    "prefers": "prefer", "hates": "hate", "owns": "own", "makes": "make",
+    "earns": "earn", "spends": "spend", "saves": "save", "feels": "feel",
+}
+
+def _normalize_fact_for_embedding(fact: str) -> str:
+    """First-person-normalize a stored fact FOR EMBEDDING ONLY."""
+    if not fact:
+        return fact
+    m = _FACT_PREFIX_RX.match(fact)
+    if not m:
+        return fact
+    rest = fact[m.end():]
+    words = rest.split(maxsplit=1)
+    if words:
+        verb = words[0].lower()
+        if verb in _VERB_NORMALIZE:
+            rest = _VERB_NORMALIZE[verb] + (" " + words[1] if len(words) > 1 else "")
+    return "I " + rest
+
+_SELF_QUERY_RX = re.compile(
+    r"\b(?:do|did|am|was|what(?:'s| is| are)?|where|how)\s+(?:do\s+)?i\b"
+    r"|\bmy\s+(?:favorite|usual|routine|hobb|interest|goals?|plans?)",
+    re.IGNORECASE,
+)
+_PREFERENCE_TERMS_RX = re.compile(
+    r"\b(?:fun|enjoy|like|love|hobb(?:y|ies)|free time|leisure|interest)",
+    re.IGNORECASE,
+)
+
+def _expand_self_query(query: str) -> str:
+    """
+    For self-referential preference questions, append synonym terms so
+    the embedding reaches activity-shaped facts.  Returns the query
+    unchanged when not applicable.
+    """
+    if not query:
+        return query
+    if _SELF_QUERY_RX.search(query) and _PREFERENCE_TERMS_RX.search(query):
+        return query + " hobbies activities enjoy leisure free time interests"
+    return query
 # TTL for cached responses in seconds.  Task/financial answers are deterministic
 # and can be cached long-term.  Research answers depend on live web data and must
 # not be served stale — they are excluded from the cache entirely at store time.
@@ -8451,18 +8507,38 @@ class EarlRuntime:
             if not decayed:
                 return ""
 
-            # Stage 2: relevance filtering by cosine similarity
+            # Stage 2: relevance filtering by cosine similarity.
+            #
+            # Two measured fixes (eval test 14 failed without them):
+            #   a. Facts are stored third-person ('The user goes hiking...')
+            #      but queried first-person ('What do I like...').  The
+            #      embedding space treats those as different people —
+            #      measured sim 0.055 raw vs 0.407 normalized.  Facts are
+            #      normalized to first person FOR EMBEDDING ONLY; display
+            #      text stays original.
+            #   b. Preference/self queries get a synonym-expanded variant;
+            #      score = max(sim(query), sim(expanded)).  Control facts
+            #      (rent vs fun-query: 0.06) confirm no false-positive risk.
             encoder = _get_shared_st_model() if _SHARED_ST_MODEL is not None else None
             if encoder is not None and query and query.strip():
                 try:
                     import numpy as np
                     q_emb = encoder.encode(query, convert_to_numpy=True)
                     q_norm = float(np.linalg.norm(q_emb)) or 1.0
+                    expanded = _expand_self_query(query)
+                    if expanded != query:
+                        qx_emb = encoder.encode(expanded, convert_to_numpy=True)
+                        qx_norm = float(np.linalg.norm(qx_emb)) or 1.0
+                    else:
+                        qx_emb, qx_norm = None, 1.0
                     scored: list[tuple[float, float, str]] = []
                     for conf, fact in decayed:
-                        f_emb = encoder.encode(fact, convert_to_numpy=True)
+                        embed_text = _normalize_fact_for_embedding(fact)
+                        f_emb = encoder.encode(embed_text, convert_to_numpy=True)
                         f_norm = float(np.linalg.norm(f_emb)) or 1.0
                         sim = float(np.dot(q_emb, f_emb) / (q_norm * f_norm))
+                        if qx_emb is not None:
+                            sim = max(sim, float(np.dot(qx_emb, f_emb) / (qx_norm * f_norm)))
                         if sim >= BELIEF_RELEVANCE_THRESHOLD:
                             scored.append((sim, conf, fact))
                     # Rank by combined score (similarity weighted by confidence)
