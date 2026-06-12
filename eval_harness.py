@@ -32,6 +32,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# Windows consoles default to cp1252, which cannot encode the ✓/✗ glyphs used
+# in test output — the resulting UnicodeEncodeError was previously swallowed by
+# the health-check except block and misreported as "Cannot reach LatticeD".
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 try:
     import requests as _requests_lib
     _USE_REQUESTS = True
@@ -606,12 +613,12 @@ def tc_contamination_isolation(url: str, key: str) -> TestResult:
         "Help me build a savings plan for a house down payment."
     )
     print("    Seeding financial context...", end=" ", flush=True)
-    _nodes1, _content1, _cached1, elapsed1 = run_prompt(url, key, seed)
+    _nodes1, _content1, _cached1, elapsed1 = run_prompt(url, key, seed, bypass_cache=True)
     print(f"{elapsed1:.1f}s")
 
     # Round 2 — casual greeting on a brand-new thread to isolate
     print("    Casual greeting (must be clean)...", end=" ", flush=True)
-    nodes2, content2, cached2, elapsed2 = run_prompt(url, key, "How are you today?")
+    nodes2, content2, cached2, elapsed2 = run_prompt(url, key, "How are you today?", bypass_cache=True)
     print(f"{elapsed2:.1f}s")
 
     # Round 2 content must not contain ANY financial-domain leakage
@@ -650,11 +657,11 @@ def tc_relevant_belief_retrieval(url: str, key: str) -> TestResult:
         "I go hiking almost every Saturday morning."
     )
     print("    Seeding activity belief...", end=" ", flush=True)
-    _nodes1, _content1, _cached1, elapsed1 = run_prompt(url, key, activity_seed)
+    _nodes1, _content1, _cached1, elapsed1 = run_prompt(url, key, activity_seed, bypass_cache=True)
     print(f"{elapsed1:.1f}s")
 
     print("    Asking about fun (must reference hiking)...", end=" ", flush=True)
-    nodes2, content2, cached2, elapsed2 = run_prompt(url, key, "What do I like to do for fun?")
+    nodes2, content2, cached2, elapsed2 = run_prompt(url, key, "What do I like to do for fun?", bypass_cache=True)
     print(f"{elapsed2:.1f}s")
 
     content_lower = content2.lower()

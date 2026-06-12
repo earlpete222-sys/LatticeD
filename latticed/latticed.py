@@ -918,6 +918,8 @@ class AgentFactoryRegistry:
                     "- Do not say 'I noticed you...' about anything from earlier in the conversation. "
                     "  The current message is what matters.\n"
                     "- Do not begin with 'As an AI...' or 'I don't have information...' disclaimers.\n"
+                    "- Never propose or describe a reply (no 'How about', 'You could say', "
+                    "'Here is a response'). Speak in your own voice — give the reply itself.\n"
                     "- Do not give unsolicited advice, tips, or suggestions. Wait for the user to ask.\n"
                     "- Do not invent facts, statistics, rates, rules, or regulations. If asked something "
                     "factual you're not confident about, say so plainly and offer to look it up.\n\n"
@@ -980,7 +982,9 @@ class AgentFactoryRegistry:
                     "than dollar amounts. The table will be appended automatically right after your paragraph.\n\n"
                     "STAY ON TOPIC: Reference only the goal the user actually stated (or none, if they did not "
                     "state one). Topics like college savings, retirement accounts, IRAs, 401(k)s, 529 plans, or "
-                    "insurance products should not appear unless the user specifically asked about them.\n\n"
+                    "insurance products should not appear unless the user specifically asked about them. "
+                    "Never mention financial products, goals, or life circumstances the user did not "
+                    "state themselves.\n\n"
                     "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
                 capabilities_required={
@@ -1172,7 +1176,9 @@ class AgentFactoryRegistry:
                     "than dollar amounts. The table will be appended automatically right after your paragraph.\n\n"
                     "STAY ON TOPIC: Reference only the goal the user actually stated (or none, if they did not "
                     "state one). Topics like college savings, retirement accounts, IRAs, 401(k)s, 529 plans, or "
-                    "insurance products should not appear unless the user specifically asked about them.\n\n"
+                    "insurance products should not appear unless the user specifically asked about them. "
+                    "Never mention financial products, goals, or life circumstances the user did not "
+                    "state themselves.\n\n"
                     "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
                 capabilities_required={
@@ -8121,6 +8127,12 @@ class EarlRuntime:
         """
         if self.semantic_cache_collection is None or not response.strip():
             return
+        # Never cache an echo — if the model parroted the prompt back and it
+        # slipped past the retry guard, caching it would serve the echo for
+        # every future near-identical query.
+        if re.sub(r"[\W_]+", "", response).lower() == re.sub(r"[\W_]+", "", prompt).lower():
+            logger.warning("[semantic_cache] Refusing to cache echo response.")
+            return
         # Research answers are grounded in live web data — never cache them
         if intent == "research":
             logger.info("[semantic_cache] Skipping cache for research intent (live web data).")
@@ -8850,12 +8862,42 @@ async def document_ingestion_node(state: SovereignState) -> dict:
 def perception_barrier_node(state: SovereignState) -> dict:
     return {"perception_status": "synchronized"}
 
+async def _infer_with_echo_guard(agent_id: str, payload: str, user_input: str) -> str:
+    """
+    Run a registry inference with an echo guard — the 1.5B models occasionally
+    parrot the user's message back verbatim. One retry with an explicit nudge
+    fixes nearly all cases.
+    """
+    def _norm(s: str) -> str:
+        return re.sub(r"[\W_]+", "", s).lower()
+    raw = await runtime.execute_registry_inference(agent_id, payload)
+    text = clean_model_text(raw)
+    if not text or _norm(text) == _norm(user_input):
+        logger.warning("[%s] Echo/empty response detected — retrying once.", agent_id)
+        raw = await runtime.execute_registry_inference(
+            agent_id,
+            payload + "\n\n(Answer the user's message — do not repeat it back.)",
+        )
+        text = clean_model_text(raw)
+    return text
+
 async def fast_core_node(state: SovereignState) -> dict:
     timer = PerfTimer("fast_core")
-    payload = f"History: {state.get('retrieved_memory')}\nBeliefs: {state.get('belief_context')}\nRequest: {state['user_input']}"
-    raw = await runtime.execute_registry_inference("fast_mentor", payload)
+    # Empty section labels confuse the 1.5B model — a bare "Beliefs:" line makes
+    # it respond about beliefs as a topic. Only include sections with content
+    # (same pattern as life_coach_node).
+    memory = (state.get("retrieved_memory") or "").strip()
+    belief = (state.get("belief_context") or "").strip()
+    sections = []
+    if memory:
+        sections.append(f"CONVERSATION HISTORY:\n{memory}")
+    if belief:
+        sections.append(f"WHAT I KNOW ABOUT THE USER:\n{belief}")
+    sections.append(f"USER'S MESSAGE (reply to this directly):\n{state['user_input']}")
+    payload = "\n\n".join(sections)
+    text = await _infer_with_echo_guard("fast_mentor", payload, state["user_input"])
     timer.stop()
-    return {"fast_generation": clean_model_text(raw), "guardian_decision": "fast"}
+    return {"fast_generation": text, "guardian_decision": "fast"}
 
 async def life_coach_node(state: SovereignState) -> dict:
     timer = PerfTimer("life_coach")
@@ -8868,9 +8910,9 @@ async def life_coach_node(state: SovereignState) -> dict:
         f"{belief_section}"
         f"REQUEST: {state['user_input']}"
     )
-    raw = await runtime.execute_registry_inference("life_coach", payload)
+    text = await _infer_with_echo_guard("life_coach", payload, state["user_input"])
     timer.stop()
-    return {"fast_generation": clean_model_text(raw), "guardian_decision": "coach"}
+    return {"fast_generation": text, "guardian_decision": "coach"}
 
 def _extract_financial_entities(text: str):
     """
@@ -9513,8 +9555,26 @@ async def artifact_writer_node(state: SovereignState) -> dict:
     # Re-stating final_output is a benign no-op (same value, same key).
     return {"final_output": output}
 
+# deepseek-r1:1.5b sometimes narrates a reply instead of giving it directly:
+#   Great! How about: "I'm glad to hear from you today. ..."
+# The scaffold prefix is stripped and, when the remainder is a single quoted
+# block, the quotes are unwrapped so the user sees the reply itself.
+_META_SCAFFOLD = re.compile(
+    r"^(?:(?:great|sure|okay|alright|certainly)[!.,]?\s*)?"
+    r"(?:how about|you could say|you might say|here(?:'s| is) (?:a|the|my|your) "
+    r"(?:response|reply|answer|message))\s*:?\s*",
+    re.IGNORECASE,
+)
+
 def clean_model_text(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    stripped = _META_SCAFFOLD.sub("", text).strip()
+    if stripped and stripped != text:
+        quoted = re.fullmatch(r'["“\'](.+)["”\']', stripped, flags=re.DOTALL)
+        if quoted:
+            stripped = quoted.group(1).strip()
+        return stripped
+    return text
 
 # ---------------------------------------------------------------------
 # Graph Conditional Routing Functions (V3.1 Logic)
@@ -9737,8 +9797,16 @@ async def evolve(
 
         # ── Store verified response in semantic cache ──────────────────────────
         # Guards: (1) never cache graph errors; (2) skip when bypass_cache=True
-        # so eval-harness runs don't pollute the cache with test results.
-        if output and not output.startswith("[GRAPH_ERROR]") and not bypass_cache:
+        # so eval-harness runs don't pollute the cache with test results;
+        # (3) never cache responses built on live web grounding, regardless of
+        # how the intent was classified — a misrouted research query (intent
+        # "task") would otherwise serve stale web data for up to 30 days.
+        # Deterministic-math answers (math_blueprint present) stay cacheable.
+        web_dependent = (
+            "VERIFIED WEB SOURCES" in (final_state.get("grounding_context") or "")
+            and not (final_state.get("math_blueprint") or "").strip()
+        )
+        if output and not output.startswith("[GRAPH_ERROR]") and not bypass_cache and not web_dependent:
             intent = final_state.get("intent_category", "")
             await asyncio.to_thread(runtime.store_semantic_cache, req.prompt, output, intent)
 
@@ -9801,7 +9869,13 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({"phase": "Final", "content": output, "is_final": True})
 
             # ── Store verified response in semantic cache ──────────────────────
-            if output:
+            # Same guards as the SSE path: no graph errors, nothing grounded in
+            # live web data (even when misrouted as a non-research intent).
+            web_dependent = (
+                "VERIFIED WEB SOURCES" in (final_state.get("grounding_context") or "")
+                and not (final_state.get("math_blueprint") or "").strip()
+            )
+            if output and not output.startswith("[GRAPH_ERROR]") and not web_dependent:
                 intent = final_state.get("intent_category", "")
                 await asyncio.to_thread(runtime.store_semantic_cache, req.prompt, output, intent)
     finally: logger.info("Session disconnected safely.")

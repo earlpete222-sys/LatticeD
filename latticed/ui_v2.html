@@ -118,6 +118,37 @@ function useApi(apiKey) {
   }, [apiKey]);
 }
 
+// ─── Lightweight markdown renderer ───────────────────────────────────────────
+// Agent output uses a small markdown subset (### headings, **bold**, - bullets).
+// Rendered as React elements — no innerHTML, so no sanitization concerns.
+function mdInline(text, keyBase) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((p, i) =>
+    p.startsWith('**') && p.endsWith('**')
+      ? <strong key={`${keyBase}-${i}`} className="font-bold text-paper">{p.slice(2, -2)}</strong>
+      : p
+  );
+}
+
+function Md({ content }) {
+  const lines = String(content ?? '').split('\n');
+  return (
+    <>
+      {lines.map((line, i) => {
+        const h = line.match(/^(#{1,6})\s+(.*)$/);
+        if (h) {
+          return (
+            <div key={i} className="text-[11px] uppercase tracking-widest text-accent font-bold mt-3 mb-1">
+              {mdInline(h[2], i)}
+            </div>
+          );
+        }
+        return <div key={i} className="min-h-[1em]">{mdInline(line, i)}</div>;
+      })}
+    </>
+  );
+}
+
 // ─── Pipeline node graph (matches build_graph() in latticed.py) ─────────────
 const PIPELINE_NODES = [
   { id: 'intent_classifier', label: 'Intent Router',         layer: 0, agent: 'intent_router' },
@@ -601,10 +632,10 @@ function ChatView({ apiKey, currentThread, setCurrentThread, onReconnect }) {
                 {m.role === 'user' ? 'You' : m.role === 'error' ? 'Error' : 'Lattice'}
                 {m.cached && <span className="ml-2 text-ok">⚡ cached</span>}
               </div>
-              <div className={`whitespace-pre-wrap text-sm leading-relaxed ${
+              <div className={`text-sm leading-relaxed ${
                 m.role === 'error' ? 'text-err' : 'text-paper'
               }`}>
-                {m.content}
+                {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : <Md content={m.content} />}
               </div>
             </div>
           ))}
@@ -1004,7 +1035,7 @@ function ThreadsView({ apiKey, setCurrentThread, setView }) {
                   </div>
                   <div className="text-sm text-paper mb-3">{m.user_input}</div>
                   <div className="text-[10px] uppercase tracking-widest text-mute mb-1">Lattice</div>
-                  <div className="text-sm text-paper whitespace-pre-wrap">{m.response}</div>
+                  <div className="text-sm text-paper"><Md content={m.response} /></div>
                 </div>
               ))}
             </div>

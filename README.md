@@ -17,7 +17,7 @@ inference cost. No data leaves the device.
 
 ## Status
 
-- **7 / 7** automated regression tests passing
+- **11 / 11** automated regression tests passing
 - All financial calculations verified to the cent
 - Cache hits under 100ms; full pipeline runs in 60–120 seconds on consumer hardware
 - 11 specialized agents, 13-node pipeline, 4GB VRAM budget
@@ -84,10 +84,20 @@ Run the full eval harness against the live system:
 python eval_harness.py
 ```
 
-Expected output: **7 / 7 passed** with cent-level financial figures verified.
+Expected output: **11 / 11 passed** with cent-level financial figures verified.
 The harness exercises label-aware financial parsing, multi-expense
-aggregation, research routing, cache round-trip behavior, and goal-aware
-allocation shifting.
+aggregation, research routing, cache round-trip behavior, goal-aware
+allocation shifting, annual-income normalization, and memory-contamination
+guards.
+
+For a guided walkthrough of the system (fast path, deep path with visible
+Auditor/Guardian review, semantic cache, and live web grounding), run the
+scripted demo:
+
+```bash
+python demo.py          # paced for live presentation (Enter between acts)
+python demo.py --auto   # unattended, for screen recording
+```
 
 ---
 
