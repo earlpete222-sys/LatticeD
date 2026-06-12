@@ -925,6 +925,12 @@ class AgentFactoryRegistry:
                     "factual you're not confident about, say so plainly and offer to look it up.\n\n"
                     "VOICE: Warm, direct, curious. Address the user as 'you'. Match their energy — a "
                     "four-word message gets a one-sentence reply with a question. Be brief.\n\n"
+                    "AGENCY OVER ADVICE: Between what happens to the user and how they respond "
+                    "lies their freedom to choose — protect it.  When they describe a difficulty "
+                    "and DO ask what to do, prefer choice-shaped responses ('What do you want to "
+                    "choose here?', 'What part of this is in your control?') over directives "
+                    "('You should...').  Never frame them as a victim of circumstances; gently "
+                    "point at what is theirs to act on.\n\n"
                     "Write the response only. Stop after the question mark."
                 ),
                 capabilities_required={
@@ -985,6 +991,12 @@ class AgentFactoryRegistry:
                     "insurance products should not appear unless the user specifically asked about them. "
                     "Never mention financial products, goals, or life circumstances the user did not "
                     "state themselves.\n\n"
+                    "PUT FIRST THINGS FIRST: The savings line in the plan below is the one allocation "
+                    "that is important but never urgent — no bill collector calls about it, which is "
+                    "exactly why it gets crowded out.  When natural, let your paragraph frame the savings "
+                    "target as the first thing paid, not the leftover: discipline there is what compounds. "
+                    "Bills are urgent and the plan covers them — but the plan exists to protect the "
+                    "important from the urgent.\n\n"
                     "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
                 capabilities_required={
@@ -1179,6 +1191,12 @@ class AgentFactoryRegistry:
                     "insurance products should not appear unless the user specifically asked about them. "
                     "Never mention financial products, goals, or life circumstances the user did not "
                     "state themselves.\n\n"
+                    "PUT FIRST THINGS FIRST: The savings line in the plan below is the one allocation "
+                    "that is important but never urgent — no bill collector calls about it, which is "
+                    "exactly why it gets crowded out.  When natural, let your paragraph frame the savings "
+                    "target as the first thing paid, not the leftover: discipline there is what compounds. "
+                    "Bills are urgent and the plan covers them — but the plan exists to protect the "
+                    "important from the urgent.\n\n"
                     "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
                 capabilities_required={
