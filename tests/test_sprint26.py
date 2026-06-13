@@ -168,7 +168,7 @@ def test_activated_runtime_injects_preamble_into_prompt():
         check("activated runtime: fact surfaces in prompt",
               "teacher" in prompt.lower())
         check("preamble appears BEFORE the original system prompt",
-              prompt.find("USER NORTH STARS") < prompt.find("LatticeD's Life Coach"))
+              prompt.find("USER NORTH STARS") < prompt.find("the user's life coach"))
     finally:
         _restore(orig); shutil.rmtree(tmp, ignore_errors=True)
 

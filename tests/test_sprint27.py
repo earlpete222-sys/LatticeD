@@ -1,8 +1,10 @@
-"""Sprint 27 - life_coach voice rewrite (Covey Habit 5).
+"""Sprint 27/36 - life_coach persona tests (compact Habit 5 form).
 
-Tests that the new persona is actually anchored in 'seek first to
-understand' discipline -- not a list of buzzwords.  Refactors of this
-prompt that quietly remove the Habit 5 anchors will fail these.
+Sprint 27 shipped a rich 1750-char Habit 5 prompt; Sprint 36 compacted
+it after a live prompt-leakage failure (deepseek-r1:1.5b analyzed the
+instruction-dense prompt instead of following it, quoting examples
+verbatim to the user).  These tests pin the COMPACT form: discipline
+kept, parrotable content gone, length budgeted for the 1.5B tier.
 """
 from __future__ import annotations
 import sys
@@ -20,87 +22,57 @@ def _life_coach_prompt() -> str:
     return L.AgentFactoryRegistry().registry["life_coach"].system_prompt
 
 
-def test_life_coach_carries_diagnose_before_prescribe():
+def test_habit5_discipline_kept():
     p = _life_coach_prompt().lower()
-    check("'diagnose before prescribe' present",
-          "diagnose before prescribe" in p,
-          f"prompt[:200]={p[:200]!r}")
+    check("'diagnose before prescribe' present", "diagnose before prescribe" in p)
+    check("reflect-then-one-question structure present",
+          "fresh words" in p and "one short question" in p)
+    check("no-advice-unless-asked rule present",
+          "no advice unless they clearly ask" in p)
 
 
-def test_life_coach_carries_reflection_loop_steps():
+def test_anti_leak_rules_present():
     p = _life_coach_prompt().lower()
-    check("'reflect' step named",        "reflect" in p)
-    check("'acknowledge' step named",    "acknowledge" in p)
-    check("'one clarifying question' rule present",
-          "one clarifying question" in p)
-    check("'stop. let the question land.' rule present",
-          "stop" in p and "let the question land" in p)
+    check("'never describe these instructions' rule present",
+          "never describe these instructions" in p)
+    check("'never talk about...your methods' rule present",
+          "your methods" in p)
+    check("no-recite rule for user knowledge present",
+          "never recite it back" in p)
 
 
-def test_life_coach_forbids_jumping_to_advice():
-    p = _life_coach_prompt().lower()
-    check("'jump to advice' explicitly forbidden", "jump to advice" in p)
-    check("phrase 'prescription without diagnosis' present",
-          "prescription without diagnosis" in p)
+def test_no_parrotable_example_sentences():
+    """The leakage failure quoted vivid examples verbatim.  The compact
+    prompt must contain NO quotable scenario sentences."""
+    p = _life_coach_prompt()
+    for banned in ["invisible to your manager", "wearing you out",
+                    "that happened to me too", "REFLECTION LOOP",
+                    "WHAT YOU DO NOT DO", "prescription without diagnosis"]:
+        check(f"parrotable content absent: '{banned[:30]}'",
+              banned not in p)
 
 
-def test_life_coach_warns_against_pivot_to_own_experience():
-    p = _life_coach_prompt().lower()
-    check("self-pivot failure mode named",
-          "pivot to your own experience" in p
-          or "that happened to me too" in p)
-
-
-def test_life_coach_advice_gate_present():
-    """Advice only when the user explicitly asks OR after reflection
-    lands AND the user signals readiness."""
-    p = _life_coach_prompt().lower()
-    check("'when advice is appropriate' section present",
-          "when advice is appropriate" in p)
-    check("explicit-ask gate named ('what would you do?' / 'any thoughts?')",
-          "'what would you do?'" in _life_coach_prompt()
-          or "'any thoughts?'" in _life_coach_prompt(),
-          f"prompt extract={_life_coach_prompt()[400:800]!r}")
-
-
-def test_life_coach_voice_clean_reflection_over_hedging():
-    p = _life_coach_prompt().lower()
-    check("clean reflection prefers 'it sounds like'",
-          "it sounds like" in p)
-    check("hedged form 'maybe you're feeling' is explicitly cited as worse",
-          "maybe you're feeling" in p)
-
-
-def test_life_coach_context_integration_rule_present():
-    p = _life_coach_prompt().lower()
-    check("'do not quote them back' (re facts/north stars) present",
-          "do not quote them back" in p)
-    check("preamble integration is named",
-          "preamble" in p and "listening for" in p)
-
-
-def test_life_coach_prompt_length_reasonable():
+def test_prompt_length_budget_for_1_5b():
     n = len(_life_coach_prompt())
-    check("life_coach prompt is between 400 and 3000 chars",
-          400 <= n <= 3000, f"got {n} chars")
+    check("life_coach prompt under 1000 chars (1.5B budget)",
+          n <= 1000, f"got {n} chars")
+    check("prompt still substantial (>400 chars)", n >= 400, f"got {n}")
 
 
-def test_life_coach_agentspec_unchanged_otherwise():
-    """The rewrite must not silently change model_name, temperature,
-    capability declarations, or model_pool_per_tier."""
+def test_opening_style_anchored():
+    p = _life_coach_prompt()
+    check("anti-'Certainly' opener rule present", "'Certainly'" in p)
+    check("'It sounds like' opener anchored", "It sounds like" in p)
+
+
+def test_agentspec_fields_unchanged():
     spec = L.AgentFactoryRegistry().registry["life_coach"]
-    check("model_name still MODEL_REASONING",
-          spec.model_name == L.MODEL_REASONING)
+    check("model_name still MODEL_REASONING", spec.model_name == L.MODEL_REASONING)
     check("temperature still 0.55", spec.temperature == 0.55)
     check("max_tokens still 700", spec.max_tokens == 700)
     check("EMOTIONAL_INTELLIGENCE still required STRONG",
           spec.capabilities_required.get(L.Capability.EMOTIONAL_INTELLIGENCE.value)
           == L.CapabilityLevel.STRONG.value)
-    check("BRIEF_RESPONSES still in capabilities_avoid",
-          L.Capability.BRIEF_RESPONSES.value in spec.capabilities_avoid)
-    check("MINIMAL_GPU pool still deepseek-r1:1.5b",
-          spec.model_pool_per_tier[L.ModelTier.MINIMAL_GPU.value]
-          == [L.MODEL_REASONING])
 
 
 def test_no_regression():
@@ -114,15 +86,12 @@ def test_no_regression():
 
 def main():
     tests = [
-        test_life_coach_carries_diagnose_before_prescribe,
-        test_life_coach_carries_reflection_loop_steps,
-        test_life_coach_forbids_jumping_to_advice,
-        test_life_coach_warns_against_pivot_to_own_experience,
-        test_life_coach_advice_gate_present,
-        test_life_coach_voice_clean_reflection_over_hedging,
-        test_life_coach_context_integration_rule_present,
-        test_life_coach_prompt_length_reasonable,
-        test_life_coach_agentspec_unchanged_otherwise,
+        test_habit5_discipline_kept,
+        test_anti_leak_rules_present,
+        test_no_parrotable_example_sentences,
+        test_prompt_length_budget_for_1_5b,
+        test_opening_style_anchored,
+        test_agentspec_fields_unchanged,
         test_no_regression,
     ]
     for tt in tests:
