@@ -4979,6 +4979,15 @@ class LatticeContext:
         # Sprint 24 — milestones / goal tracking.
         self.milestones = MilestoneStore(MILESTONES_PATH).load()
         register_milestone_surface(self.mcp, self)
+        # Sprint 39 — PersonaPack registry (definitions registered by
+        # register_seed_persona_packs when present; enabled state loaded
+        # from disk).  MCP toggle tools + overlay composition in
+        # compose_preamble.
+        self.persona_packs = PersonaPackRegistry(PERSONA_PACKS_PATH)
+        if "register_seed_persona_packs" in globals():
+            register_seed_persona_packs(self.persona_packs)
+        self.persona_packs.load()
+        register_persona_pack_surface(self.mcp, self)
         # Emit a boot event so we have a heartbeat in the timeline.
         try:
             self.activity.append(ActivityEvent(
@@ -5025,8 +5034,16 @@ class LatticeContext:
         # Sprint 25 — close the voice loop: mood + active milestones.
         mood_block      = self._compose_mood_block(agent_id)
         milestone_block = self._compose_milestone_block(agent_id)
+        # Sprint 39 — enabled PersonaPack overlays (budget-capped, tier-aware).
+        persona_block = ""
+        pp = getattr(self, "persona_packs", None)
+        if pp is not None:
+            try:
+                persona_block = pp.overlay_for(agent_id, self.profile.tier)
+            except Exception as e:
+                logger.warning("[persona] overlay compose failed: %s", e)
         parts = [b for b in (continuity_block, voice_block,
-                              mood_block, milestone_block) if b]
+                              mood_block, milestone_block, persona_block) if b]
         return "\n\n".join(parts)
 
     # ----- mood-aware tone block (Sprint 25) -----
@@ -5188,6 +5205,8 @@ class LatticeContext:
         except Exception as e: logger.warning(f"ledger save failed: {e}")
         try: self.voice.save()
         except Exception as e: logger.warning(f"voice save failed: {e}")
+        try: self.persona_packs.save()
+        except Exception as e: logger.warning(f"persona packs save failed: {e}")
         try: self.continuity.save()
         except Exception as e: logger.warning(f"continuity save failed: {e}")
         try: self.business.save()
@@ -8083,6 +8102,197 @@ def margin_of_safety_preface(confidence: float) -> str:
     return ("Cross-checking produced significant disagreement.  This answer is "
             "the strongest candidate, but confidence is LOW — verify before "
             "acting on any specific claim.")
+
+# =====================================================================
+# SPRINT 39 — PERSONAPACK INFRASTRUCTURE
+# =====================================================================
+# Optional, user-toggled advisor overlays distilled from source texts
+# (the C:\Full_Text_Books corpus).  A pack appends per-agent guidance to
+# the preamble and may nudge temperature within bounds.  The base
+# framework stays lean; users opt into the advisors that fit them.
+#
+# Sprint 36 lesson is built in: prompt sophistication must scale with
+# model capability.  Each pack declares a minimum tier and supplies a
+# COMPACT overlay for low tiers; overlay composition enforces a total
+# character budget so multiple enabled packs cannot bloat a 1.5B prompt.
+#
+# Public API:
+#   PersonaPack                  one advisor overlay set
+#   PersonaPackRegistry          register/enable/disable/persist
+#     .overlay_for(agent_id, tier) -> combined overlay (budget-capped)
+#     .temperature_offset_for(agent_id) -> bounded summed delta
+#   register_persona_pack_surface(server, ctx)  -> MCP tools
+# =====================================================================
+
+PERSONA_PACKS_PATH = STORAGE_DIR / "persona_packs.json"
+# Total overlay budget appended to any single agent's preamble.  Keeps
+# multiple enabled packs from blowing the 1.5B context (Sprint 36).
+PERSONA_OVERLAY_BUDGET_CHARS = 700
+# Hard bound on how far a pack may move an agent's temperature.
+PERSONA_TEMP_OFFSET_BOUND = 0.20
+
+_TIER_RANK = {
+    ModelTier.MINIMAL_CPU.value: 0,
+    ModelTier.MINIMAL_GPU.value: 1,
+    ModelTier.STANDARD.value:    2,
+    ModelTier.HIGH.value:        3,
+    ModelTier.ENTERPRISE.value:  4,
+    ModelTier.HYBRID.value:      2,   # treat like STANDARD for gating
+}
+
+@dataclass
+class PersonaPack:
+    pack_id: str
+    display_name: str
+    source: str                                       # "Book Title — Author"
+    description: str
+    # Full overlays applied at min_tier and above.
+    agent_overlays: Dict[str, str]                    = field(default_factory=dict)
+    # Optional compact overlays for tiers BELOW min_tier (1.5B-safe).
+    agent_overlays_compact: Dict[str, str]            = field(default_factory=dict)
+    temperature_offsets: Dict[str, float]             = field(default_factory=dict)
+    min_tier: str                                     = ModelTier.STANDARD.value
+    enabled: bool                                     = False
+    metadata: Dict[str, Any]                          = field(default_factory=dict)
+
+    def overlay_text(self, agent_id: str, tier: str) -> str:
+        """Pick the right overlay for the active tier.  Compact below
+        min_tier (falls back to full if no compact provided AND the full
+        text is short); full at/above min_tier."""
+        full    = (self.agent_overlays.get(agent_id) or "").strip()
+        compact = (self.agent_overlays_compact.get(agent_id) or "").strip()
+        if _TIER_RANK.get(tier, 1) >= _TIER_RANK.get(self.min_tier, 2):
+            return full
+        # Below min_tier: prefer compact; else use full only if it's short.
+        if compact:
+            return compact
+        return full if len(full) <= 220 else ""
+
+
+class PersonaPackRegistry:
+    """Holds available packs + persists which are enabled."""
+    def __init__(self, path: Path = PERSONA_PACKS_PATH) -> None:
+        self.path: Path = path
+        self.packs: Dict[str, PersonaPack] = {}
+
+    def register(self, pack: PersonaPack) -> None:
+        # Preserve enabled state if a pack with this id was already loaded.
+        existing = self.packs.get(pack.pack_id)
+        if existing is not None:
+            pack.enabled = existing.enabled
+        self.packs[pack.pack_id] = pack
+
+    def enable(self, pack_id: str) -> bool:
+        if pack_id in self.packs:
+            self.packs[pack_id].enabled = True
+            return True
+        return False
+
+    def disable(self, pack_id: str) -> bool:
+        if pack_id in self.packs:
+            self.packs[pack_id].enabled = False
+            return True
+        return False
+
+    def enabled_packs(self) -> List[PersonaPack]:
+        return [p for p in self.packs.values() if p.enabled]
+
+    def overlay_for(self, agent_id: str, tier: str) -> str:
+        """Combine overlays from all enabled packs for this agent at this
+        tier, capped at PERSONA_OVERLAY_BUDGET_CHARS.  Stable order by
+        pack_id so output is deterministic."""
+        blocks: List[str] = []
+        for pack in sorted(self.enabled_packs(), key=lambda p: p.pack_id):
+            text = pack.overlay_text(agent_id, tier)
+            if text:
+                blocks.append(f"[{pack.display_name}] {text}")
+        if not blocks:
+            return ""
+        combined = "\n".join(blocks)
+        if len(combined) > PERSONA_OVERLAY_BUDGET_CHARS:
+            # Trim whole blocks from the end until within budget, never
+            # mid-sentence.
+            kept: List[str] = []
+            running = 0
+            for b in blocks:
+                if running + len(b) + 1 > PERSONA_OVERLAY_BUDGET_CHARS:
+                    break
+                kept.append(b)
+                running += len(b) + 1
+            combined = "\n".join(kept)
+        return ("ADVISOR LENS (enabled persona packs — let these shape "
+                "HOW you respond, not what facts you state):\n" + combined) if combined else ""
+
+    def temperature_offset_for(self, agent_id: str) -> float:
+        total = sum(p.temperature_offsets.get(agent_id, 0.0)
+                    for p in self.enabled_packs())
+        return max(-PERSONA_TEMP_OFFSET_BOUND,
+                   min(PERSONA_TEMP_OFFSET_BOUND, total))
+
+    # ----- persistence (enabled state only; definitions live in code) -----
+    def load(self) -> "PersonaPackRegistry":
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                for pid in (data.get("enabled") or []):
+                    if pid in self.packs:
+                        self.packs[pid].enabled = True
+            except Exception as e:
+                logger.warning(f"persona packs load failed: {e}")
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"enabled": sorted(p.pack_id for p in self.enabled_packs())}
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+
+def register_persona_pack_surface(server: "MCPServer", ctx: "LatticeContext") -> None:
+    reg = ctx.persona_packs
+
+    def _tool_list(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        return {"ok": True, "packs": [
+            {"pack_id": p.pack_id, "display_name": p.display_name,
+             "source": p.source, "description": p.description,
+             "min_tier": p.min_tier, "enabled": p.enabled,
+             "agents": sorted(set(p.agent_overlays) | set(p.agent_overlays_compact))}
+            for p in sorted(reg.packs.values(), key=lambda p: p.pack_id)
+        ]}
+
+    def _tool_enable(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        pid = params.get("pack_id")
+        if not pid:
+            return {"ok": False, "error": "missing_pack_id"}
+        if not reg.enable(pid):
+            return {"ok": False, "error": f"unknown_pack:{pid}"}
+        try: reg.save()
+        except Exception as e: logger.warning(f"persona save failed: {e}")
+        try:
+            ctx.activity.append(ActivityEvent(
+                kind=ActivityKind.CUSTOM.value,
+                summary=f"persona pack enabled: {pid}",
+                payload={"pack_id": pid}))
+        except Exception: pass
+        return {"ok": True, "pack_id": pid, "enabled": True}
+
+    def _tool_disable(params: Dict[str, Any], srv: "MCPServer") -> Dict[str, Any]:
+        pid = params.get("pack_id")
+        if not pid:
+            return {"ok": False, "error": "missing_pack_id"}
+        if not reg.disable(pid):
+            return {"ok": False, "error": f"unknown_pack:{pid}"}
+        try: reg.save()
+        except Exception as e: logger.warning(f"persona save failed: {e}")
+        return {"ok": True, "pack_id": pid, "enabled": False}
+
+    server.register_tool("list_persona_packs",   _tool_list)
+    server.register_tool("enable_persona_pack",   _tool_enable)
+    server.register_tool("disable_persona_pack",  _tool_disable)
+
+    server.register_resource("persona://packs",
+        lambda srv, params: _tool_list({}, srv))
 
 # ---------------------------------------------------------------------
 # Runtime Persistence and Infrastructure Environment
