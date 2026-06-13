@@ -1,7 +1,8 @@
 param(
     [switch]$Watch,
     [switch]$Dev,
-    [switch]$LAN     # When set, binds to 0.0.0.0 so other devices on the local network can reach the UI.
+    [switch]$LAN,        # When set, binds to 0.0.0.0 so other devices on the local network can reach the UI.
+    [switch]$NoLattice   # When set, runs the legacy pipeline WITHOUT the LatticeContext personalization layer.
 )
 
 # When -LAN is passed, expose the server on all interfaces so phones / tablets
@@ -39,6 +40,24 @@ Log-Ok "OLLAMA_NUM_PARALLEL=2 (persisted to User scope)"
 [System.Environment]::SetEnvironmentVariable("HF_HUB_OFFLINE", "1", "User")
 $env:HF_HUB_OFFLINE = "1"
 Log-Ok "HF_HUB_OFFLINE=1  (suppresses HuggingFace network calls at startup)"
+
+# LatticeContext personalization is ON by default (verified 14/14 live, Sprint 37).
+# Pass -NoLattice to run the legacy pipeline without identity preambles.
+if ($NoLattice) {
+    $env:LATTICED_ACTIVATE = "0"
+    Log-Warn "LATTICED_ACTIVATE=0  (legacy pipeline - personalization layer OFF)"
+} else {
+    $env:LATTICED_ACTIVATE = "1"
+    Log-Ok "LATTICED_ACTIVATE=1  (identity-aware personalization layer ON)"
+}
+
+# Pin the hardware tier so the server doesn't misdetect minimal_cpu when
+# nvidia-smi isn't on PATH for the server process.  Override by exporting
+# LATTICED_TIER before launch.
+if (-not $env:LATTICED_TIER) {
+    $env:LATTICED_TIER = "minimal_gpu"
+    Log-Ok "LATTICED_TIER=minimal_gpu  (pinned; export LATTICED_TIER to override)"
+}
 
 # Step 2 - Kill Ollama
 Log-Step "Stopping existing Ollama processes..."

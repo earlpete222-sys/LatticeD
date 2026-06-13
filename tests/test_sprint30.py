@@ -31,6 +31,17 @@ def test_both_architects_carry_first_things_first():
               "protect the important from the urgent" in lo)
 
 
+def test_anti_role_parrot_rule_present():
+    """Sprint 38: both architects must forbid role-description openers
+    (live probe parroted 'As a confident financial strategist...')."""
+    pc, pe = _prompts()
+    for label, p in [("conservative", pc), ("explore", pe)]:
+        check(f"{label}: forbids role-describing openers",
+              "NEVER open by describing your role" in p, f"{label} missing rule")
+        check(f"{label}: names the parroted opener as forbidden",
+              "As a confident" in p and "Forbidden openers" in p)
+
+
 def test_contamination_guards_still_present():
     pc, pe = _prompts()
     for label, p in [("conservative", pc), ("explore", pe)]:
@@ -81,6 +92,7 @@ def test_no_regression():
 def main():
     tests = [
         test_both_architects_carry_first_things_first,
+        test_anti_role_parrot_rule_present,
         test_contamination_guards_still_present,
         test_templates_and_voice_intact,
         test_agentspec_fields_unchanged,

@@ -1058,6 +1058,9 @@ class AgentFactoryRegistry:
                     "target as the first thing paid, not the leftover: discipline there is what compounds. "
                     "Bills are urgent and the plan covers them — but the plan exists to protect the "
                     "important from the urgent.\n\n"
+                    "NEVER open by describing your role. Forbidden openers: 'As a confident "
+                    "financial strategist', 'As your', 'I'd be happy to help', 'Here is'. Start "
+                    "directly with the user's financial picture in second person ('Your income...').\n\n"
                     "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
                 capabilities_required={
@@ -1251,6 +1254,9 @@ class AgentFactoryRegistry:
                     "target as the first thing paid, not the leftover: discipline there is what compounds. "
                     "Bills are urgent and the plan covers them — but the plan exists to protect the "
                     "important from the urgent.\n\n"
+                    "NEVER open by describing your role. Forbidden openers: 'As a confident "
+                    "financial strategist', 'As your', 'I'd be happy to help', 'Here is'. Start "
+                    "directly with the user's financial picture in second person ('Your income...').\n\n"
                     "Write the paragraph (2-3 complete sentences). Stop after the last sentence."
                 ),
                 capabilities_required={
