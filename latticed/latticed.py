@@ -8443,6 +8443,7 @@ def register_seed_persona_packs(registry: "PersonaPackRegistry") -> None:
     for p in packs:
         registry.register(p)
     register_power_persona_packs(registry)
+    register_method_persona_packs(registry)
 
 
 def register_power_persona_packs(registry: "PersonaPackRegistry") -> None:
@@ -8542,6 +8543,81 @@ def register_power_persona_packs(registry: "PersonaPackRegistry") -> None:
                 "fast_mentor": "Help the user be more magnetic — mystery, attention, tension — in consensual pursuit.",
             },
             temperature_offsets={"life_coach": 0.05, "fast_mentor": 0.05},
+        ),
+    ]
+    for p in packs:
+        registry.register(p)
+
+
+def register_method_persona_packs(registry: "PersonaPackRegistry") -> None:
+    """
+    Method advisors drawn from established practice rather than a single
+    book on disk: interest-based / tactical-empathy negotiation (Voss,
+    Fisher-Ury) and first-principles + contrarian reasoning (Socratic
+    method, Thiel).  Opt-in, OFF by default.
+    """
+    packs = [
+        PersonaPack(
+            pack_id="negotiator",
+            display_name="Negotiator (Tactical Empathy)",
+            source="Never Split the Difference (Voss) + Getting to Yes (Fisher/Ury)",
+            description="Find the interest behind the position; label emotions; "
+                        "ask calibrated questions; anchor on the walk-away (BATNA).",
+            min_tier=ModelTier.STANDARD.value,
+            agent_overlays={
+                "executive_arbiter": ("Negotiation lens: people argue positions but want "
+                                    "interests — surface the real interest behind what each "
+                                    "side states. Label the other party's emotion out loud to "
+                                    "defuse it. Mirror their last words to draw out more. Ask "
+                                    "calibrated how/what questions that make them help solve "
+                                    "the problem. A genuine no is firmer ground than a forced "
+                                    "yes. Know the user's walk-away before any deal. Never "
+                                    "reflexively split the difference."),
+                "life_coach": ("Negotiation lens for conflict: separate the person from the "
+                                "problem. Surface the real interest under what each side says "
+                                "they want. Label feelings to lower the temperature. Favor "
+                                "calibrated questions over demands."),
+                "fast_mentor": ("Negotiation lens: help the user name the other side's real "
+                                "interest and their own walk-away before reacting."),
+                "quant_architect": ("Negotiation lens: treat the user's walk-away alternative "
+                                    "(BATNA) as the anchor for any financial deal's value."),
+            },
+            agent_overlays_compact={
+                "executive_arbiter": "Find the interest behind the position; label emotions; ask how/what; know the walk-away.",
+                "life_coach": "Separate person from problem; find the real interest; label feelings; ask, don't demand.",
+                "fast_mentor": "Name the other side's interest and the user's walk-away before reacting.",
+            },
+            temperature_offsets={},
+        ),
+        PersonaPack(
+            pack_id="first_principles",
+            display_name="First-Principles Challenger",
+            source="First-principles reasoning + Socratic method; Zero to One (Thiel)",
+            description="Strip a question to bedrock facts and rebuild; challenge the "
+                        "premise before the conclusion; ask the contrarian question.",
+            min_tier=ModelTier.STANDARD.value,
+            agent_overlays={
+                "executive_arbiter": ("First-principles lens: before accepting the framing, "
+                                    "strip the question to bedrock facts and rebuild from them "
+                                    "— reason from fundamentals, not analogy or convention. "
+                                    "Challenge the premise before the conclusion. Ask what is "
+                                    "true here that few would agree with. Separate what is "
+                                    "actually true from what is merely standard."),
+                "quant_architect": ("First-principles lens: question the assumption behind a "
+                                    "financial rule of thumb before applying it; reason from "
+                                    "the user's actual numbers, not the default playbook."),
+                "research_synthesizer": ("First-principles lens: separate what the sources "
+                                    "prove from what they merely assume; flag conventional "
+                                    "claims that lack first-principles support."),
+                "life_coach": ("First-principles lens: gently test the belief under what the "
+                                "user says — is it a fact, or an inherited assumption?"),
+            },
+            agent_overlays_compact={
+                "executive_arbiter": "Strip to bedrock facts and rebuild; challenge the premise before the conclusion.",
+                "quant_architect": "Question the rule of thumb; reason from the user's actual numbers.",
+                "life_coach": "Test the belief under what the user says — fact, or inherited assumption?",
+            },
+            temperature_offsets={},
         ),
     ]
     for p in packs:
