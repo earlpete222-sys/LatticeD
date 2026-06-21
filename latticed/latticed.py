@@ -620,6 +620,68 @@ MODEL_REASONING = "deepseek-r1:1.5b"  # Local reasoning engine with explicit int
 MODEL_SYNTHESIS = "qwen2.5-coder:1.5b" # Fast structural translation, synthesis, and execution engine
 OLLAMA_KEEP_ALIVE = "2m"                # Keep model resident in VRAM across the full pipeline; evicts after 2 min idle
 OLLAMA_NUM_CTX = 4096                   # ~293MB KV cache per 1.5b model; safe within 4GB VRAM with both models loaded
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+WARM_MODELS_ENABLED = os.getenv("LATTICED_WARM_MODELS", "1").strip() not in ("0", "false", "no", "off")
+
+# ---------------------------------------------------------------------
+# Sprint 43 — Reliability layer: typed exceptions + user-facing translation
+# ---------------------------------------------------------------------
+class OllamaUnavailable(RuntimeError):
+    """Raised when an inference call cannot reach the Ollama runtime."""
+
+class OllamaModelMissing(RuntimeError):
+    """Raised when Ollama is reachable but the requested model is not pulled."""
+
+# Patterns are matched against str(exc) — covers httpx/requests/urllib3 wording
+# without importing them just for isinstance checks.
+_OLLAMA_DOWN_HINTS = (
+    "connection refused", "connection aborted", "failed to establish",
+    "name or service not known", "max retries exceeded", "connecterror",
+    "remote end closed", "11434", "winerror 10061",
+)
+_OLLAMA_MODEL_MISSING_HINTS = (
+    "model not found", "no such model", "pull model first", "try pulling",
+)
+
+def classify_inference_exception(exc: BaseException) -> str:
+    """Bucket an inference exception so the UI can show a useful message.
+
+    Returns one of: 'ollama_down', 'model_missing', 'timeout', 'other'.
+    The runtime catches RuntimeError boundaries from the registry, so this
+    helper accepts both the wrapped RuntimeError and the original cause.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    msg = (str(exc) or "").lower()
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if cause is not None and cause is not exc:
+        msg = f"{msg} || {str(cause).lower()}"
+    if any(h in msg for h in _OLLAMA_MODEL_MISSING_HINTS):
+        return "model_missing"
+    if any(h in msg for h in _OLLAMA_DOWN_HINTS):
+        return "ollama_down"
+    return "other"
+
+def user_facing_inference_error(bucket: str, detail: str = "") -> str:
+    """Translate a classify_inference_exception bucket into a user-readable note."""
+    if bucket == "ollama_down":
+        return (
+            "I can't reach my reasoning engine right now (Ollama isn't "
+            "responding on " + OLLAMA_HOST + "). Start Ollama and try again."
+        )
+    if bucket == "model_missing":
+        extra = f" ({detail})" if detail else ""
+        return (
+            "One of my local models hasn't been downloaded yet" + extra + ". "
+            "Run `ollama pull deepseek-r1:1.5b` and "
+            "`ollama pull qwen2.5-coder:1.5b`, then try again."
+        )
+    if bucket == "timeout":
+        return (
+            "That request took longer than I'm allowed to wait. Try a shorter "
+            "prompt, or check whether Ollama is overloaded."
+        )
+    return ""  # other — caller falls back to partial state / generic message
 
 # ---------------------------------------------------------------------
 # State Definitions and Schemas
@@ -8632,6 +8694,11 @@ class EarlRuntime:
         self.chroma_collection: Any = None
         self.semantic_cache_collection: Any = None   # dedicated collection for response caching
         self.tavily_client: Any = None
+        # Sprint 43 — track last grounding outcome so /api/health can report it.
+        # Values: "ok" | "error:<short>" | "" (never attempted in this session).
+        self.tavily_last_status: str = ""
+        # Sprint 43 — warm-up bookkeeping for /api/health and tests.
+        self.warmup_status: Dict[str, str] = {}     # model_name -> "ok" | "error:<short>" | "pending"
         self._chroma_embed_fn: Any = None            # shared across both chroma collections — loaded once
         # Per-model semaphores: both models live in VRAM simultaneously,
         # so a deepseek-r1 call and a qwen2.5-coder call can run in parallel.
@@ -8802,6 +8869,50 @@ class EarlRuntime:
         if TAVILY_AVAILABLE:
             from tavily import TavilyClient
             self.tavily_client = TavilyClient(api_key=TAVILY_KEY)
+
+    async def warm_models(self, models: Optional[Iterable[str]] = None) -> Dict[str, str]:
+        """Sprint 43 — prime each model with a minimal generate call so the
+        first user request doesn't pay the cold-load tax (60–120s on consumer
+        hardware). Non-fatal: any failure is logged and recorded in
+        ``self.warmup_status`` but does not block startup.
+
+        Returns the same dict that ``warmup_status`` now holds, for tests.
+        """
+        targets = list(models) if models is not None else [MODEL_REASONING, MODEL_SYNTHESIS]
+        if not WARM_MODELS_ENABLED:
+            self.warmup_status = {m: "skipped" for m in targets}
+            logger.info("[warmup] LATTICED_WARM_MODELS=0 — skipping model priming.")
+            return self.warmup_status
+        if not OLLAMA_DIRECT_AVAILABLE:
+            self.warmup_status = {m: "error:ollama_client_missing" for m in targets}
+            logger.warning("[warmup] ollama python client not installed; skipping.")
+            return self.warmup_status
+
+        self.warmup_status = {m: "pending" for m in targets}
+
+        async def _warm_one(model: str) -> None:
+            def _ping() -> None:
+                ollama_client.generate(
+                    model=model,
+                    prompt="ok",
+                    options={"num_predict": 1, "temperature": 0.0,
+                             "num_ctx": 256, "keep_alive": OLLAMA_KEEP_ALIVE},
+                )
+            try:
+                t0 = time.time()
+                await asyncio.wait_for(asyncio.to_thread(_ping), timeout=120.0)
+                self.warmup_status[model] = "ok"
+                logger.info("[warmup] %s primed in %.1fs", model, time.time() - t0)
+            except asyncio.TimeoutError:
+                self.warmup_status[model] = "error:timeout"
+                logger.warning("[warmup] %s did not respond within 120s.", model)
+            except Exception as exc:
+                bucket = classify_inference_exception(exc)
+                self.warmup_status[model] = f"error:{bucket}"
+                logger.warning("[warmup] %s failed (%s): %s", model, bucket, exc)
+
+        await asyncio.gather(*(_warm_one(m) for m in targets))
+        return self.warmup_status
 
     def init_semantic_cache(self) -> None:
         """Initialize a dedicated ChromaDB collection for semantic response caching."""
@@ -9001,6 +9112,18 @@ class EarlRuntime:
             except asyncio.TimeoutError:
                 logger.error("[%s] Inference timed out after 240s — releasing semaphore.", agent_id)
                 raise RuntimeError(f"Agent '{agent_id}' timed out.")
+            except Exception as exc:
+                # Sprint 43 — translate transport errors into typed reliability
+                # exceptions so SSE/WS handlers can show a useful note instead
+                # of a generic [GRAPH_ERROR] traceback.
+                bucket = classify_inference_exception(exc)
+                if bucket == "ollama_down":
+                    logger.error("[%s] Ollama unreachable: %s", agent_id, exc)
+                    raise OllamaUnavailable(str(exc)) from exc
+                if bucket == "model_missing":
+                    logger.error("[%s] Ollama model missing: %s", agent_id, exc)
+                    raise OllamaModelMissing(str(exc)) from exc
+                raise
 
     def get_loyalty_weights(self) -> Dict[str, float]:
         fallback = {"family": 0.35, "reliability": 0.25, "learning": 0.20, "safety": 0.15, "speed": 0.05}
@@ -9611,7 +9734,17 @@ async def grounding_node(state: SovereignState) -> dict:
     query = state["user_input"]
     parts = [f"CURRENT TIME: {datetime.now(timezone.utc).isoformat()}"]
 
-    if runtime.tavily_client is not None and state.get("intent_category", "") in ("web", "research", "task"):
+    wants_grounding = state.get("intent_category", "") in ("web", "research", "task")
+    if wants_grounding and runtime.tavily_client is None:
+        # Sprint 43 — explicit signal to downstream agents that the user asked
+        # for a researched answer but no provider is configured / reachable.
+        parts.append(
+            "GROUNDING_UNAVAILABLE: web research provider not configured. "
+            "Answer from internal knowledge only and tell the user the response "
+            "may not reflect recent events."
+        )
+        runtime.tavily_last_status = "error:not_configured"
+    elif runtime.tavily_client is not None and wants_grounding:
         try:
             res = await asyncio.to_thread(runtime.tavily_client.search, query, max_results=5)
             results = res.get("results", [])
@@ -9633,8 +9766,33 @@ async def grounding_node(state: SovereignState) -> dict:
                         "\n\n".join(formatted_sources)
                     )
                     logger.info("[grounding] Tavily returned %d sources.", len(formatted_sources))
+                    runtime.tavily_last_status = "ok"
+                else:
+                    parts.append(
+                        "GROUNDING_UNAVAILABLE: web research returned no usable "
+                        "sources. Answer from internal knowledge and tell the "
+                        "user no fresh sources were found."
+                    )
+                    runtime.tavily_last_status = "error:empty"
+            else:
+                parts.append(
+                    "GROUNDING_UNAVAILABLE: web research returned zero results. "
+                    "Answer from internal knowledge and tell the user no fresh "
+                    "sources were found."
+                )
+                runtime.tavily_last_status = "error:zero_results"
         except Exception as e:
-            parts.append(f"GROUNDING PATH ERROR: {e}")
+            # Sprint 43 — translate the failure into a directive the agents
+            # can act on, instead of opaque "GROUNDING PATH ERROR" text the
+            # model would dutifully repeat to the user.
+            short = type(e).__name__
+            parts.append(
+                "GROUNDING_UNAVAILABLE: web research provider failed "
+                f"({short}). Answer from internal knowledge and tell the user "
+                "the answer may not reflect recent events."
+            )
+            runtime.tavily_last_status = f"error:{short}"
+            logger.warning("[grounding] Tavily failed: %s: %s", short, e)
 
     timer.stop()
     return {"grounding_context": "\n\n".join(parts)}
@@ -10603,8 +10761,17 @@ async def lifespan(app: FastAPI):
     try:
         app.state.graph = build_graph(checkpointer)
         logger.info("LatticeD V3.1 Cognitive System Online.")
+        # Sprint 43 — kick model warm-up off the event loop so the server
+        # accepts requests immediately while models load into VRAM in the
+        # background. First user message still waits if it lands before warm
+        # finishes, but subsequent ones get the warmed model.
+        app.state.warmup_task = asyncio.create_task(runtime.warm_models())
         yield
     finally:
+        # Cancel warm-up if still running at shutdown so we don't leak the task.
+        wt = getattr(app.state, "warmup_task", None)
+        if wt is not None and not wt.done():
+            wt.cancel()
         await checkpoint_cm.__aexit__(None, None, None)
 
 app = FastAPI(title="LatticeD", lifespan=lifespan)
@@ -10612,7 +10779,17 @@ app = FastAPI(title="LatticeD", lifespan=lifespan)
 @app.get("/api/health")
 async def health(user_id: str = Depends(get_authenticated_user)):
     del user_id
-    return {"status": "ok", "chroma": runtime.chroma_collection is not None, "tavily": runtime.tavily_client is not None}
+    # Sprint 43 — expose Tavily last-call status and per-model warm-up state so
+    # the UI (and a human operator) can see reliability degradation at a glance
+    # without having to grep the log.
+    return {
+        "status": "ok",
+        "chroma": runtime.chroma_collection is not None,
+        "tavily": runtime.tavily_client is not None,
+        "tavily_last_status": runtime.tavily_last_status,
+        "warmup": dict(runtime.warmup_status),
+        "ollama_host": OLLAMA_HOST,
+    }
 
 @app.get("/api/agents")
 async def get_agents(user_id: str = Depends(get_authenticated_user)):
@@ -10645,6 +10822,7 @@ async def evolve(
 
         accumulated = {}
         _graph_error: str = ""
+        _reliability_note: str = ""   # Sprint 43 — user-facing degradation message
         try:
             async for chunk in app.state.graph.astream(state, config):
                 for node, update in chunk.items():
@@ -10670,14 +10848,25 @@ async def evolve(
                             "phase":          "goal",
                             "active_goal":    update["active_goal"],
                         }) + "\n\n"
+        except (OllamaUnavailable, OllamaModelMissing) as _rel:
+            bucket = "ollama_down" if isinstance(_rel, OllamaUnavailable) else "model_missing"
+            _reliability_note = user_facing_inference_error(bucket, str(_rel)[:120])
+            logger.warning("SSE reliability fallback — %s: %s", bucket, _rel)
         except Exception as _exc:
             import traceback as _tb
             _graph_error = f"[GRAPH_ERROR] {type(_exc).__name__}: {_exc}\n{_tb.format_exc()}"
             logger.exception("SSE graph stream error — returning partial accumulated state.")
         final_state = {**state, **accumulated}
         runtime.log_interaction(final_state, int((time.time() - started) * 1000))
-        output = final_state.get("final_output") or final_state.get("strategy_plan", "") or _graph_error
-        yield "data: " + json.dumps({"phase": "Final", "content": output, "is_final": True}) + "\n\n"
+        # Reliability note takes precedence over partial state so the user sees
+        # actionable guidance instead of a half-assembled answer.
+        output = (
+            _reliability_note
+            or final_state.get("final_output")
+            or final_state.get("strategy_plan", "")
+            or _graph_error
+        )
+        yield "data: " + json.dumps({"phase": "Final", "content": output, "is_final": True, "degraded": bool(_reliability_note)}) + "\n\n"
 
         # ── Store verified response in semantic cache ──────────────────────────
         # Guards: (1) never cache graph errors; (2) skip when bypass_cache=True
@@ -10726,31 +10915,60 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             accumulated = {}
+            _reliability_note: str = ""
+            _client_gone: bool = False
             try:
                 async for chunk in app.state.graph.astream(state, config):
                     for node, update in chunk.items():
                         if not update: continue
                         accumulated.update(update)
-                        await websocket.send_json({"node": node, "agent": NODE_AGENT_MAP.get(node, node), "status": "complete"})
-                        if node == "intent_classifier" and "execution_path" in update:
-                            await websocket.send_json({
-                                "phase":            "routing",
-                                "execution_path":   update.get("execution_path", ""),
-                                "intent_category":  update.get("intent_category", ""),
-                                "route_reason":     update.get("route_reason", ""),
-                            })
-                        if node == "math_engine" and update.get("active_goal") and update.get("active_goal") != "default":
-                            await websocket.send_json({
-                                "phase":       "goal",
-                                "active_goal": update["active_goal"],
-                            })
+                        try:
+                            await websocket.send_json({"node": node, "agent": NODE_AGENT_MAP.get(node, node), "status": "complete"})
+                            if node == "intent_classifier" and "execution_path" in update:
+                                await websocket.send_json({
+                                    "phase":            "routing",
+                                    "execution_path":   update.get("execution_path", ""),
+                                    "intent_category":  update.get("intent_category", ""),
+                                    "route_reason":     update.get("route_reason", ""),
+                                })
+                            if node == "math_engine" and update.get("active_goal") and update.get("active_goal") != "default":
+                                await websocket.send_json({
+                                    "phase":       "goal",
+                                    "active_goal": update["active_goal"],
+                                })
+                        except WebSocketDisconnect:
+                            # Sprint 43 — client vanished mid-stream. Stop the
+                            # pipeline cleanly; don't keep streaming events to
+                            # a dead socket.
+                            logger.info("[ws] client disconnected mid-stream — cancelling stream.")
+                            _client_gone = True
+                            break
+                    if _client_gone:
+                        break
+            except (OllamaUnavailable, OllamaModelMissing) as _rel:
+                bucket = "ollama_down" if isinstance(_rel, OllamaUnavailable) else "model_missing"
+                _reliability_note = user_facing_inference_error(bucket, str(_rel)[:120])
+                logger.warning("WS reliability fallback — %s: %s", bucket, _rel)
             except Exception:
                 logger.exception("WebSocket graph stream error — sending partial final state.")
 
+            if _client_gone:
+                # Drop back to the outer receive loop; client will reconnect or
+                # the WebSocketDisconnect on next receive_text() will close.
+                continue
+
             final_state = {**state, **accumulated}
             runtime.log_interaction(final_state, int((time.time() - started) * 1000))
-            output = final_state.get("final_output") or final_state.get("strategy_plan", "")
-            await websocket.send_json({"phase": "Final", "content": output, "is_final": True})
+            output = (
+                _reliability_note
+                or final_state.get("final_output")
+                or final_state.get("strategy_plan", "")
+            )
+            try:
+                await websocket.send_json({"phase": "Final", "content": output, "is_final": True, "degraded": bool(_reliability_note)})
+            except WebSocketDisconnect:
+                logger.info("[ws] client disconnected before Final send.")
+                continue
 
             # ── Store verified response in semantic cache ──────────────────────
             # Same guards as the SSE path: no graph errors, nothing grounded in

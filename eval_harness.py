@@ -107,6 +107,18 @@ def _parse_sse_event(event_text: str, nodes: list, content_ref: list, cached_ref
                 cached_ref[0] = True
 
 
+# ── Sprint 43 — teardown bookkeeping ──────────────────────────────────────────
+# Every thread_id allocated by run_prompt() is recorded here so the harness can
+# call DELETE /api/threads/{tid} after the run finishes. Without teardown the
+# eval harness slowly poisons the live interaction_ledger and Chroma memory
+# vectors with synthetic test threads.
+USED_THREAD_IDS: list[str] = []
+# Two test cases seed the belief graph (contamination_isolation and
+# relevant_belief_retrieval). When either runs we also wipe beliefs at the end.
+BELIEF_SEEDING_TESTS = {"contamination_isolation", "relevant_belief_retrieval"}
+_BELIEFS_TOUCHED: bool = False
+
+
 def run_prompt(
     url: str,
     key: str,
@@ -128,6 +140,7 @@ def run_prompt(
     is spec-correct regardless of chunk size.
     """
     thread_id = f"eval_{uuid.uuid4().hex[:8]}"
+    USED_THREAD_IDS.append(thread_id)
     headers   = {"x-api-key": key, "Accept": "text/event-stream"}
     params    = {"prompt": prompt, "thread_id": thread_id, "path": "auto"}
     if bypass_cache:
@@ -711,6 +724,7 @@ def run_all(url: str, key: str) -> list[TestResult]:
     print(f"Tests  : {len(TESTS)}")
     print()
 
+    global _BELIEFS_TOUCHED
     results: list[TestResult] = []
     for i, fn in enumerate(TESTS, 1):
         desc = fn.__doc__.strip().split("\n")[0] if fn.__doc__ else fn.__name__
@@ -724,6 +738,8 @@ def run_all(url: str, key: str) -> list[TestResult]:
                 [], False, 0.0, str(exc),
             )
 
+        if result.test_id in BELIEF_SEEDING_TESTS:
+            _BELIEFS_TOUCHED = True
         results.append(result)
         status = "PASS" if result.passed else "FAIL"
         badge  = "✅" if result.passed else "❌"
@@ -734,6 +750,51 @@ def run_all(url: str, key: str) -> list[TestResult]:
         print()
 
     return results
+
+
+def teardown(url: str, key: str) -> dict:
+    """Sprint 43 — clean up state the harness seeded into the live store.
+
+    Deletes every thread_id created during this run (interaction_ledger rows +
+    Chroma memory vectors) and, if any belief-seeding test ran, wipes the
+    belief graph. Without this the harness silently grows the production store
+    on every run, which the operator then has to wipe by hand.
+
+    Best-effort: failures are logged but never raise — teardown must not flip
+    a passing run into a failure.
+    """
+    headers = {"x-api-key": key}
+    summary = {"threads_deleted": 0, "thread_failures": 0, "beliefs_purged": False}
+
+    # Dedupe thread IDs so a retried test doesn't double-DELETE.
+    unique_threads = list(dict.fromkeys(USED_THREAD_IDS))
+    for tid in unique_threads:
+        try:
+            r = _requests_lib.delete(
+                f"{url}/api/threads/{tid}",
+                headers=headers,
+                timeout=10,
+            )
+            if r.status_code == 200:
+                summary["threads_deleted"] += 1
+            else:
+                summary["thread_failures"] += 1
+        except Exception:
+            summary["thread_failures"] += 1
+
+    if _BELIEFS_TOUCHED:
+        try:
+            r = _requests_lib.delete(
+                f"{url}/api/beliefs",
+                headers=headers,
+                params={"confirm": "true"},
+                timeout=15,
+            )
+            summary["beliefs_purged"] = (r.status_code == 200)
+        except Exception:
+            summary["beliefs_purged"] = False
+
+    return summary
 
 
 def save_results(results: list[TestResult], path: Path) -> None:
@@ -795,6 +856,17 @@ def main() -> None:
         print("  — all green ✅")
 
     save_results(results, OUTPUT_PATH)
+
+    # Sprint 43 — teardown after every run so the harness no longer pollutes
+    # the live store. Best-effort; never flips a passing run to a failure.
+    td = teardown(args.url, args.key)
+    print(
+        f"Teardown: {td['threads_deleted']} threads deleted"
+        + (f" ({td['thread_failures']} failed)" if td["thread_failures"] else "")
+        + (" + beliefs purged" if td["beliefs_purged"]
+           else (" + belief purge FAILED" if _BELIEFS_TOUCHED else ""))
+    )
+
     sys.exit(0 if passed == total else 1)
 
 
