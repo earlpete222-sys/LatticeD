@@ -35,6 +35,21 @@ Log-Step "Setting environment variables..."
 $env:OLLAMA_NUM_PARALLEL = "2"
 Log-Ok "OLLAMA_NUM_PARALLEL=2 (persisted to User scope)"
 
+# Sprint 45 — self-heal: if LATTICED_SECRET is unset or still the public
+# default, generate a strong one on first run and persist to User scope.
+# Stops accidental LAN exposure with the dev secret in place.
+$currentSecret = if ($env:LATTICED_SECRET) { $env:LATTICED_SECRET } else { [System.Environment]::GetEnvironmentVariable("LATTICED_SECRET", "User") }
+if (-not $currentSecret -or $currentSecret -eq "local_dev_secret_123") {
+    $bytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $newSecret = [Convert]::ToBase64String($bytes).TrimEnd("=")
+    [System.Environment]::SetEnvironmentVariable("LATTICED_SECRET", $newSecret, "User")
+    $env:LATTICED_SECRET = $newSecret
+    Log-Ok "Generated a strong LATTICED_SECRET on first run (persisted to User scope)."
+} else {
+    Log-Ok "LATTICED_SECRET already set (length $($currentSecret.Length))."
+}
+
 # Prevents HuggingFace Hub from firing 40+ HEAD requests at startup to check
 # for model updates - models are local-only, updates are irrelevant.
 [System.Environment]::SetEnvironmentVariable("HF_HUB_OFFLINE", "1", "User")

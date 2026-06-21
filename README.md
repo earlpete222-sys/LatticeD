@@ -29,49 +29,74 @@ For the complete architectural rationale, build history, and roadmap, see the
 
 ## Quick Start
 
-### Prerequisites
+LatticeD runs on your own machine. Two paths:
 
-- Python 3.12 or later
-- [Ollama](https://ollama.com) installed and running locally
-- 4GB VRAM (GPU) or sufficient system RAM for CPU inference
-- Windows, macOS, or Linux
+- **One-click install** — for non-developers, walks you through Python, Ollama, models, and a secure secret automatically.
+- **Manual install** — if you already have Python and Ollama set up.
 
-### Install
+### Requirements
+
+- Windows 10/11, macOS, or Linux
+- ~6 GB free disk (Python deps + two 1.5B models)
+- 4 GB VRAM (GPU) or ~6 GB free RAM (CPU inference)
+
+### One-click install
+
+**Windows:**
+
+```powershell
+# 1. Download or `git clone` this repo, then in PowerShell:
+.\Install-LatticeD.ps1
+
+# 2. Launch (or use the LatticeD desktop shortcut the installer creates):
+.\Start-LatticeD.ps1
+```
+
+**macOS / Linux:**
 
 ```bash
-# 1. Clone the repository
+git clone https://github.com/earlpete222-sys/LatticeD.git
+cd LatticeD
+./install.sh
+./start.sh
+```
+
+Either installer will:
+- Detect or install Python 3.12+ (via winget / Homebrew / apt)
+- Install Python dependencies
+- Detect or install Ollama and pull the two required 1.5B models
+- Generate a strong `LATTICED_SECRET` and persist it
+- Write a launcher (Windows: desktop shortcut; *nix: `start.sh`)
+
+When the server is up, open <http://127.0.0.1:8000> in your browser.
+
+To access from your phone, see [MOBILE.md](./MOBILE.md) — Tailscale + device pairing, no public-internet exposure.
+
+### Manual install
+
+```bash
 git clone https://github.com/earlpete222-sys/LatticeD.git
 cd LatticeD
 
-# 2. Install Python dependencies
 python -m pip install -r requirements.txt
-
-# 3. Pull the two required models via Ollama
 ollama pull deepseek-r1:1.5b
 ollama pull qwen2.5-coder:1.5b
 
-# 4. (Optional) Set a Tavily API key for the research path
-# Get one free at https://tavily.com
+# Optional — research path uses Tavily (free tier at https://tavily.com)
 export TAVILY_API_KEY="your_tavily_key_here"          # macOS / Linux
 $env:TAVILY_API_KEY = "your_tavily_key_here"          # Windows PowerShell
 
-# 5. Launch the framework
 python latticed/latticed.py
 ```
 
-The HTTP API will be available at `http://127.0.0.1:8000`.
-Open `latticed/ui_v2.html` in a browser for the full React interface (or visit `http://127.0.0.1:8000/` once the server is running).
-
-### Windows Quick Launch
-
-Two PowerShell helpers are included for Windows users:
+### Windows extras
 
 ```powershell
-# One-shot launch (also stops/restarts Ollama with OLLAMA_NUM_PARALLEL=2)
-.\Start-LatticeD.ps1
-
-# Register as an auto-start scheduled task
+# Auto-start on login as a scheduled task:
 .\Register-LatticeDTask.ps1
+
+# Expose to your private network (combine with Tailscale for phone access):
+.\Start-LatticeD.ps1 -LAN
 ```
 
 ---
