@@ -8808,6 +8808,15 @@ class EarlRuntime:
                         status TEXT DEFAULT 'pending'
                     );
                     CREATE INDEX IF NOT EXISTS idx_pending_questions_status ON pending_questions(status, created_at DESC);
+                    -- Sprint 44 — per-device pairing tokens. Issued via the
+                    -- pairing flow so a phone can authenticate without ever
+                    -- typing the shared API key, and can be revoked per device.
+                    CREATE TABLE IF NOT EXISTS device_tokens (
+                        token        TEXT PRIMARY KEY,
+                        label        TEXT NOT NULL,
+                        created_at   REAL NOT NULL,
+                        last_seen_at REAL
+                    );
                     """
                 )
                 # Idempotent migration: add categories column to belief_graph if not present.
@@ -10725,10 +10734,71 @@ def build_graph(checkpointer: Any):
 # ---------------------------------------------------------------------
 # Auth and API Handlers
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Sprint 44 — Device pairing: phone-friendly auth without typing the
+# shared secret. Flow:
+#   1. Home machine (authenticated with shared secret) POST /api/pair/code
+#      -> returns a 6-digit code valid for PAIRING_CODE_TTL seconds.
+#   2. Phone (not yet authenticated) POST /api/pair {code, label}
+#      -> if the code is valid + unconsumed, returns a per-device token
+#         (stored client-side in localStorage).
+#   3. Phone uses that token as x-api-key on every subsequent request;
+#      get_authenticated_user accepts it as well as the shared secret.
+#   4. Revoke per-device via DELETE /api/devices/{token_prefix}.
+# Codes live only in memory (no need to persist a 10-minute artifact);
+# tokens live in the device_tokens SQLite table.
+# ---------------------------------------------------------------------
+PAIRING_CODE_TTL = 600          # 10 minutes
+DEVICE_TOKEN_PREFIX = "ltd_"    # makes leaked tokens identifiable in logs
+_pairing_codes: Dict[str, Tuple[float, str]] = {}   # code -> (expires_at, label_hint)
+_pairing_lock = asyncio.Lock()
+
+def _generate_pairing_code() -> str:
+    """6-digit numeric code formatted XXX-XXX for human readability."""
+    n = int.from_bytes(os.urandom(3), "big") % 1_000_000
+    s = f"{n:06d}"
+    return f"{s[:3]}-{s[3:]}"
+
+def _generate_device_token() -> str:
+    return DEVICE_TOKEN_PREFIX + uuid.uuid4().hex + uuid.uuid4().hex[:8]
+
+def _is_device_token_valid(token: str) -> bool:
+    """Look up the token in device_tokens and bump last_seen_at on hit.
+
+    Synchronous SQLite read is fine here — auth happens per-request, the table
+    is single-digit rows in practice, and FastAPI dependencies allow sync
+    callables. Returns False on any error (including the table not existing
+    yet during the very early startup window).
+    """
+    if not token or not token.startswith(DEVICE_TOKEN_PREFIX):
+        return False
+    try:
+        with runtime.open_db() as conn:
+            row = conn.execute(
+                "SELECT token FROM device_tokens WHERE token = ?", (token,)
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "UPDATE device_tokens SET last_seen_at = ? WHERE token = ?",
+                (time.time(), token),
+            )
+            conn.commit()
+            return True
+    except Exception:
+        return False
+
 def get_authenticated_user(x_api_key: str = Header(...)) -> str:
-    if not hmac.compare_digest(x_api_key, ACTIVE_SECRET):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key credentials.")
-    return INTERNAL_USER_ID
+    # Shared-secret path (existing behavior — used by the home machine, eval
+    # harness, and any client that already pasted the LATTICED_SECRET).
+    if hmac.compare_digest(x_api_key, ACTIVE_SECRET):
+        return INTERNAL_USER_ID
+    # Sprint 44 — per-device pairing tokens. Phones authenticate this way
+    # after a one-time pairing exchange so the long shared secret never has
+    # to leave the home machine.
+    if _is_device_token_valid(x_api_key):
+        return INTERNAL_USER_ID
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key credentials.")
 
 def make_initial_state(req: ChatRequest | WSMessage) -> SovereignState:
     return {
@@ -10795,6 +10865,128 @@ async def health(user_id: str = Depends(get_authenticated_user)):
 async def get_agents(user_id: str = Depends(get_authenticated_user)):
     del user_id
     return {"agents": runtime.factory.manifest(), "node_agent_map": NODE_AGENT_MAP}
+
+# ---------------------------------------------------------------------
+# Sprint 44 — Device pairing endpoints
+# ---------------------------------------------------------------------
+class PairingCodeRequest(BaseModel):
+    label_hint: str = Field("paired device", min_length=1, max_length=64)
+
+class PairingClaimRequest(BaseModel):
+    code: str = Field(..., min_length=6, max_length=16)
+    label: str = Field("paired device", min_length=1, max_length=64)
+
+@app.post("/api/pair/code")
+async def create_pairing_code(
+    body: PairingCodeRequest,
+    user_id: str = Depends(get_authenticated_user),
+):
+    """Generate a short-lived 6-digit pairing code. Caller must already be
+    authenticated (typically the home machine browser, using the shared
+    secret). The code is printed to the server log so an operator can read
+    it off the screen onto a phone, and is also returned in the response."""
+    del user_id
+    async with _pairing_lock:
+        # Reap expired codes before issuing a new one so the in-memory dict
+        # doesn't grow unbounded on a long-lived server.
+        now = time.time()
+        for k in [c for c, (exp, _) in _pairing_codes.items() if exp <= now]:
+            _pairing_codes.pop(k, None)
+        code = _generate_pairing_code()
+        # Extremely unlikely collision, but loop to be safe.
+        while code in _pairing_codes:
+            code = _generate_pairing_code()
+        _pairing_codes[code] = (now + PAIRING_CODE_TTL, body.label_hint)
+    logger.info("[pair] issued pairing code %s (label hint: %s, ttl %ds)",
+                code, body.label_hint, PAIRING_CODE_TTL)
+    return {"code": code, "expires_in": PAIRING_CODE_TTL}
+
+@app.post("/api/pair")
+async def claim_pairing_code(body: PairingClaimRequest):
+    """Exchange a pairing code for a per-device token. Intentionally
+    UNAUTHENTICATED — the code itself is the bearer credential. After this
+    call the code is consumed (single-use) and the returned token should be
+    stored client-side (localStorage on a PWA, Keychain in a native app)."""
+    code = body.code.strip()
+    async with _pairing_lock:
+        entry = _pairing_codes.pop(code, None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Pairing code not found or already used.")
+    expires_at, _hint = entry
+    if expires_at <= time.time():
+        raise HTTPException(status_code=410, detail="Pairing code expired.")
+    token = _generate_device_token()
+    label = body.label[:64]
+    try:
+        with runtime.db_lock:
+            with runtime.open_db() as conn:
+                conn.execute(
+                    "INSERT INTO device_tokens (token, label, created_at, last_seen_at) VALUES (?, ?, ?, ?)",
+                    (token, label, time.time(), None),
+                )
+                conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to persist device token: {e}")
+    logger.info("[pair] code %s claimed -> issued device token %s*** (label %r)",
+                code, token[:8], label)
+    return {"token": token, "label": label}
+
+@app.get("/api/devices")
+async def list_devices(user_id: str = Depends(get_authenticated_user)):
+    """List paired devices so the user can see what's connected and revoke
+    individual ones. Token values are truncated in the response — the full
+    token is only returned once, at pairing time."""
+    del user_id
+    try:
+        with runtime.open_db() as conn:
+            rows = conn.execute(
+                "SELECT token, label, created_at, last_seen_at "
+                "FROM device_tokens ORDER BY created_at DESC"
+            ).fetchall()
+        return {
+            "devices": [
+                {
+                    "token_prefix": (t[:12] + "..."),
+                    "label": label,
+                    "created_at": created_at,
+                    "last_seen_at": last_seen_at,
+                }
+                for (t, label, created_at, last_seen_at) in rows
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Device list failed: {e}")
+
+@app.delete("/api/devices/{token_prefix}")
+async def revoke_device(
+    token_prefix: str,
+    user_id: str = Depends(get_authenticated_user),
+):
+    """Revoke a paired device by its token prefix (the 12-character prefix
+    shown in /api/devices). After revocation the device's saved token is
+    rejected by auth and the phone is forced back through pairing."""
+    del user_id
+    if not token_prefix.startswith(DEVICE_TOKEN_PREFIX) or len(token_prefix) < 8:
+        raise HTTPException(status_code=400, detail="Invalid token prefix.")
+    try:
+        with runtime.db_lock:
+            with runtime.open_db() as conn:
+                # Use LIKE on the prefix so the UI doesn't need to round-trip
+                # the full token (which it never sees after pairing).
+                cur = conn.execute(
+                    "DELETE FROM device_tokens WHERE token LIKE ? || '%'",
+                    (token_prefix,),
+                )
+                deleted = cur.rowcount
+                conn.commit()
+        if deleted == 0:
+            raise HTTPException(status_code=404, detail="No device matched that prefix.")
+        logger.info("[pair] revoked %d device token(s) matching prefix %s", deleted, token_prefix)
+        return {"ok": True, "deleted": deleted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Device revoke failed: {e}")
 
 @app.get("/api/evolve")
 async def evolve(
@@ -10890,7 +11082,11 @@ async def websocket_endpoint(websocket: WebSocket):
     api_key = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key") or ""
     logger.info("[ws-auth] received key — first 4: %s*** len: %d | expected len: %d",
                 str(api_key)[:4], len(str(api_key)), len(ACTIVE_SECRET))
-    if not hmac.compare_digest(str(api_key), ACTIVE_SECRET):
+    # Sprint 44 — accept either the shared secret OR a paired device token.
+    if not (
+        hmac.compare_digest(str(api_key), ACTIVE_SECRET)
+        or _is_device_token_valid(str(api_key))
+    ):
         logger.warning("[ws-auth] Key mismatch — rejecting connection.")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
@@ -10996,6 +11192,117 @@ async def serve_ui():
         "<h1>LatticeD - System Online</h1>"
         "<p>Error: neither <b>ui_v2.html</b> nor <b>ui.html</b> was found.</p>"
     )
+
+# ---------------------------------------------------------------------
+# Sprint 44 — PWA: manifest + minimal service worker so a phone can
+# "Add to Home Screen" and launch LatticeD fullscreen without a browser
+# chrome. Both are inline so we don't take on a static-files dependency.
+# ---------------------------------------------------------------------
+_PWA_MANIFEST = {
+    "name":              "LatticeD",
+    "short_name":        "LatticeD",
+    "description":       "Sovereign multi-agent personal assistant.",
+    "start_url":         "/",
+    "scope":             "/",
+    "display":           "standalone",
+    "orientation":       "portrait",
+    "background_color":  "#0b1220",
+    "theme_color":       "#0b1220",
+    # SVG icons render crisp at every size and avoid us shipping a binary.
+    # iOS still appreciates apple-touch-icon — added via <link> in ui_v2.html.
+    "icons": [
+        {
+            "src":     "/static/icon.svg",
+            "sizes":   "any",
+            "type":    "image/svg+xml",
+            "purpose": "any",
+        },
+        {
+            "src":     "/static/icon-maskable.svg",
+            "sizes":   "any",
+            "type":    "image/svg+xml",
+            "purpose": "maskable",
+        },
+    ],
+}
+
+@app.get("/manifest.webmanifest")
+async def pwa_manifest():
+    # No auth — manifest must be fetchable before pairing, same as the HTML
+    # shell. It exposes nothing sensitive.
+    from fastapi.responses import JSONResponse
+    return JSONResponse(_PWA_MANIFEST, media_type="application/manifest+json")
+
+# Minimal app-shell service worker. Caches the UI shell and the manifest so
+# the first paint is instant on subsequent loads even if the home machine is
+# briefly unreachable. Does NOT attempt to cache /api/* responses — those
+# are live and must always hit the server.
+_SERVICE_WORKER_JS = """\
+const CACHE = 'latticed-shell-v1';
+const SHELL = ['/', '/manifest.webmanifest'];
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
+  self.skipWaiting();
+});
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys => Promise.all(
+      keys.filter(k => k !== CACHE).map(k => caches.delete(k))
+    ))
+  );
+  self.clients.claim();
+});
+self.addEventListener('fetch', e => {
+  const url = new URL(e.request.url);
+  // Never cache API or websocket traffic — always live.
+  if (url.pathname.startsWith('/api/') || url.pathname === '/ws') return;
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    fetch(e.request).then(resp => {
+      const copy = resp.clone();
+      caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {});
+      return resp;
+    }).catch(() => caches.match(e.request))
+  );
+});
+"""
+
+@app.get("/sw.js")
+async def service_worker():
+    from fastapi.responses import Response
+    return Response(content=_SERVICE_WORKER_JS, media_type="application/javascript")
+
+# Tiny inline SVG icons so the manifest has something to point at without us
+# shipping PNG assets. Two variants: "any" (full-bleed) and "maskable" (the
+# safe zone is the inner ~80% per the maskable-icon spec).
+_ICON_SVG_BASE = """\
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#0b1220"/>
+  <g stroke="#7dd3fc" stroke-width="14" fill="none" stroke-linecap="round">
+    <path d="M 96 160 L 256 96 L 416 160 L 256 224 Z"/>
+    <path d="M 96 256 L 256 192 L 416 256 L 256 320 Z"/>
+    <path d="M 96 352 L 256 288 L 416 352 L 256 416 Z"/>
+  </g>
+</svg>
+"""
+
+@app.get("/static/icon.svg")
+async def pwa_icon_any():
+    from fastapi.responses import Response
+    return Response(content=_ICON_SVG_BASE, media_type="image/svg+xml")
+
+@app.get("/static/icon-maskable.svg")
+async def pwa_icon_maskable():
+    # Same artwork at 80% scale so the maskable safe zone is honored on
+    # Android adaptive-icon rendering.
+    maskable = _ICON_SVG_BASE.replace(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+        '<rect width="512" height="512" fill="#0b1220"/>'
+        '<g transform="translate(51 51) scale(0.8)">'
+    ).replace("</svg>", "</g></svg>")
+    from fastapi.responses import Response
+    return Response(content=maskable, media_type="image/svg+xml")
 
 @app.get("/legacy", response_class=HTMLResponse)
 async def serve_legacy_ui():

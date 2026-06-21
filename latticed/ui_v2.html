@@ -2,7 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#0a0a0a" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="LatticeD" />
+<link rel="manifest" href="/manifest.webmanifest" />
+<link rel="apple-touch-icon" href="/static/icon.svg" />
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg" />
 <title>LatticeD — Sovereign Multi-Agent Framework</title>
 
 <!-- Hanken Grotesk — matches tecklifeinnovation.com -->
@@ -51,6 +58,18 @@
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+  /* Sprint 44 — hide the scrollbar on the mobile bottom-nav so the overflow
+     fallback (when 7 items don't fit) doesn't leave a visible bar. */
+  .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  /* Sprint 44 — iOS Safari zooms in when an input's font-size is < 16px.
+     Inputs in chat + auth use text-base (16px); enforce a floor here so any
+     future input we add doesn't trigger the zoom-on-focus behavior. */
+  @media (max-width: 1023px) {
+    input[type="text"], input[type="password"], input[type="email"], textarea {
+      font-size: 16px;
+    }
   }
   /* numbered section label — directly inspired by tecklifeinnovation.com */
   .section-number {
@@ -174,9 +193,32 @@ const PIPELINE_NODES = [
 // ─── Components ──────────────────────────────────────────────────────────────
 
 function LoginScreen({ onConnect }) {
+  // Sprint 44 — two modes:
+  //   "secret": paste the LATTICED_SECRET (home machine flow)
+  //   "pair":   enter a 6-digit code generated on the home machine to claim
+  //             a per-device token (phone flow). The shared secret never
+  //             leaves the home machine.
+  const [mode, setMode] = useState('secret');
   const [apiKey, setApiKey] = useState('local_dev_secret_123');
+  const [pairCode, setPairCode] = useState('');
+  const [deviceLabel, setDeviceLabel] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+
+  // Suggest a sensible default device label so phone users don't have to type
+  // one (they can edit if they want a more specific name).
+  useEffect(() => {
+    if (!deviceLabel) {
+      const ua = (navigator.userAgent || '').toLowerCase();
+      const guess =
+        ua.includes('iphone')  ? 'iPhone'  :
+        ua.includes('ipad')    ? 'iPad'    :
+        ua.includes('android') ? 'Android' :
+        ua.includes('mac')     ? 'Mac'     :
+        ua.includes('windows') ? 'PC'      : 'paired device';
+      setDeviceLabel(guess);
+    }
+  }, []);
 
   const tryConnect = async () => {
     setBusy(true);
@@ -193,41 +235,124 @@ function LoginScreen({ onConnect }) {
     }
   };
 
+  const tryPair = async () => {
+    setBusy(true);
+    setErr('');
+    try {
+      const code = pairCode.replace(/\s/g, '');
+      const pr = await fetch(`${API_BASE}/api/pair`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, label: deviceLabel || 'paired device' }),
+      });
+      if (!pr.ok) {
+        const detail = await pr.json().catch(() => ({}));
+        throw new Error(detail.detail || `Pairing failed (${pr.status})`);
+      }
+      const { token } = await pr.json();
+      // Reuse the connect path so we exercise the same /api/health check.
+      const hr = await fetch(`${API_BASE}/api/health`, { headers: { 'x-api-key': token } });
+      if (!hr.ok) throw new Error(`Server rejected paired token (${hr.status})`);
+      onConnect(token, await hr.json());
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
-    <div className="min-h-screen flex items-center justify-center p-6">
+    <div className="min-h-screen flex items-center justify-center p-6 pb-safe">
       <div className="w-full max-w-md">
-        <div className="mb-12 text-center">
+        <div className="mb-10 text-center">
           <div className="section-number mb-3">00 — Connect</div>
           <h1 className="text-5xl font-bold tracking-tight mb-3">LatticeD</h1>
           <p className="text-mute text-sm">A self-correcting multi-agent framework.</p>
           <p className="text-mute text-xs mt-1">Built for <span className="accent-italic">private, personal AI.</span></p>
         </div>
-        <div className="bg-slate border border-line rounded-sm p-6">
-          <label className="block text-xs uppercase tracking-widest text-mute mb-2">
-            API Key
-          </label>
-          <input
-            type="password"
-            value={apiKey}
-            onChange={e => setApiKey(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && tryConnect()}
-            className="w-full bg-ink border border-line p-3 text-paper text-sm font-mono focus:border-accent focus:outline-none"
-            placeholder="Enter LATTICED_SECRET"
-            autoFocus
-          />
-          {err && <div className="text-err text-xs mt-3">{err}</div>}
+
+        <div className="flex mb-4 border border-line">
           <button
-            onClick={tryConnect}
-            disabled={busy || !apiKey}
-            className="w-full mt-4 bg-accent text-ink font-bold py-3 px-4 hover:bg-paper transition disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {busy ? 'Connecting…' : 'Connect to Lattice'}
-          </button>
-          <div className="text-mute text-[10px] mt-4 leading-relaxed">
-            The default <code className="text-accent">local_dev_secret_123</code> is intentionally public.
-            Change <code className="text-accent">LATTICED_SECRET</code> before exposing this service beyond localhost.
-          </div>
+            onClick={() => { setMode('secret'); setErr(''); }}
+            className={`flex-1 py-3 text-xs uppercase tracking-widest font-semibold transition ${
+              mode === 'secret' ? 'bg-accent text-ink' : 'bg-slate text-mute hover:text-paper'
+            }`}
+          >Use API Key</button>
+          <button
+            onClick={() => { setMode('pair'); setErr(''); }}
+            className={`flex-1 py-3 text-xs uppercase tracking-widest font-semibold transition ${
+              mode === 'pair' ? 'bg-accent text-ink' : 'bg-slate text-mute hover:text-paper'
+            }`}
+          >Pair This Device</button>
         </div>
+
+        {mode === 'secret' ? (
+          <div className="bg-slate border border-line rounded-sm p-6">
+            <label className="block text-xs uppercase tracking-widest text-mute mb-2">
+              API Key
+            </label>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={e => setApiKey(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && tryConnect()}
+              className="w-full bg-ink border border-line p-3 text-paper text-base font-mono focus:border-accent focus:outline-none"
+              placeholder="Enter LATTICED_SECRET"
+              autoFocus
+            />
+            {err && <div className="text-err text-xs mt-3">{err}</div>}
+            <button
+              onClick={tryConnect}
+              disabled={busy || !apiKey}
+              className="w-full mt-4 bg-accent text-ink font-bold py-3 px-4 hover:bg-paper transition disabled:opacity-40 disabled:cursor-not-allowed min-h-[44px]"
+            >
+              {busy ? 'Connecting…' : 'Connect to Lattice'}
+            </button>
+            <div className="text-mute text-[10px] mt-4 leading-relaxed">
+              The default <code className="text-accent">local_dev_secret_123</code> is intentionally public.
+              Change <code className="text-accent">LATTICED_SECRET</code> before exposing this service beyond localhost.
+            </div>
+          </div>
+        ) : (
+          <div className="bg-slate border border-line rounded-sm p-6">
+            <label className="block text-xs uppercase tracking-widest text-mute mb-2">
+              Pairing Code
+            </label>
+            <input
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              value={pairCode}
+              onChange={e => setPairCode(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && tryPair()}
+              className="w-full bg-ink border border-line p-3 text-paper text-xl font-mono tracking-[0.3em] text-center focus:border-accent focus:outline-none"
+              placeholder="000-000"
+              autoFocus
+            />
+            <label className="block text-xs uppercase tracking-widest text-mute mt-4 mb-2">
+              Device Name
+            </label>
+            <input
+              type="text"
+              value={deviceLabel}
+              onChange={e => setDeviceLabel(e.target.value)}
+              className="w-full bg-ink border border-line p-3 text-paper text-sm focus:border-accent focus:outline-none"
+              placeholder="e.g. Earl's iPhone"
+            />
+            {err && <div className="text-err text-xs mt-3">{err}</div>}
+            <button
+              onClick={tryPair}
+              disabled={busy || pairCode.replace(/\D/g, '').length < 6}
+              className="w-full mt-4 bg-accent text-ink font-bold py-3 px-4 hover:bg-paper transition disabled:opacity-40 disabled:cursor-not-allowed min-h-[44px]"
+            >
+              {busy ? 'Pairing…' : 'Pair Device'}
+            </button>
+            <div className="text-mute text-[10px] mt-4 leading-relaxed">
+              On your home machine, open LatticeD and tap <code className="text-accent">Settings → Pair new device</code> to
+              generate a 6-digit code. Enter it here within 10 minutes.
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -245,13 +370,20 @@ function Sidebar({ view, setView, onLogout, isMobile, pendingCount = 0 }) {
   ];
 
   if (isMobile) {
+    // Sprint 44 — horizontal scroll fallback so the 7 nav items don't get
+    // crushed on the narrowest phones (375px viewport). Each item gets a
+    // 44px min hit target (touch-accessibility guideline). The safe-area
+    // padding handles iPhone home-indicator overlap.
     return (
-      <nav className="fixed bottom-0 left-0 right-0 bg-slate border-t border-line z-40 flex">
+      <nav
+        className="fixed bottom-0 left-0 right-0 bg-slate border-t border-line z-40 flex overflow-x-auto no-scrollbar"
+        style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
+      >
         {items.map(item => (
           <button
             key={item.id}
             onClick={() => setView(item.id)}
-            className={`flex-1 py-3 text-[10px] uppercase tracking-widest font-semibold relative ${
+            className={`flex-shrink-0 min-w-[64px] flex-1 px-1 py-3 min-h-[56px] text-[10px] uppercase tracking-widest font-semibold relative ${
               view === item.id ? 'text-accent' : 'text-mute'
             }`}
           >
@@ -1654,13 +1786,52 @@ function SettingsView({ apiKey, onLogout, health }) {
   const api = useApi(apiKey);
   const [stats, setStats] = useState(null);
   const [err, setErr] = useState('');
+  // Sprint 44 — device pairing UI
+  const [devices, setDevices] = useState([]);
+  const [pairCode, setPairCode] = useState('');
+  const [pairExpiresAt, setPairExpiresAt] = useState(0);
+  const [pairBusy, setPairBusy] = useState(false);
 
   const load = useCallback(() => {
     setErr('');
     api('/api/stats').then(setStats).catch(e => setErr(e.message));
+    api('/api/devices').then(d => setDevices(d.devices || [])).catch(() => {});
   }, [api]);
 
   useEffect(load, [load]);
+
+  const generatePairCode = async () => {
+    setPairBusy(true); setErr('');
+    try {
+      const r = await fetch(`${API_BASE}/api/pair/code`, {
+        method: 'POST',
+        headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label_hint: 'new device' }),
+      });
+      if (!r.ok) throw new Error(`Pair code request failed (${r.status})`);
+      const { code, expires_in } = await r.json();
+      setPairCode(code);
+      setPairExpiresAt(Date.now() + expires_in * 1000);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setPairBusy(false);
+    }
+  };
+
+  const revokeDevice = async (prefix) => {
+    setErr('');
+    try {
+      const r = await fetch(`${API_BASE}/api/devices/${encodeURIComponent(prefix.replace(/\.\.\.$/, ''))}`, {
+        method: 'DELETE',
+        headers: { 'x-api-key': apiKey },
+      });
+      if (!r.ok) throw new Error(`Revoke failed (${r.status})`);
+      load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
 
   return (
     <div className="view-fade p-4 lg:p-8">
@@ -1716,6 +1887,50 @@ function SettingsView({ apiKey, onLogout, health }) {
         </div>
 
         <div className="bg-slate border border-line p-4 lg:col-span-2">
+          <div className="section-number mb-3">Paired Devices</div>
+          <p className="text-xs text-mute mb-3 leading-relaxed">
+            Generate a 6-digit code to pair a new phone or tablet. The code is
+            valid for 10 minutes and is consumed on first use. Each paired
+            device gets a token that can be revoked here.
+          </p>
+          {pairCode ? (
+            <div className="bg-ink border border-accent p-4 mb-3 text-center">
+              <div className="text-mute text-xs uppercase tracking-widest">Pairing Code</div>
+              <div className="text-accent text-3xl font-mono tracking-[0.3em] mt-2">{pairCode}</div>
+              <div className="text-mute text-[10px] mt-2">
+                Expires in {Math.max(0, Math.floor((pairExpiresAt - Date.now()) / 1000))}s
+              </div>
+            </div>
+          ) : null}
+          <button
+            onClick={generatePairCode}
+            disabled={pairBusy}
+            className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition px-3 py-2 disabled:opacity-40 min-h-[44px]"
+          >
+            {pairBusy ? 'Generating…' : (pairCode ? '↻ New code' : 'Pair new device')}
+          </button>
+
+          {devices.length > 0 && (
+            <div className="mt-4 space-y-2">
+              {devices.map(d => (
+                <div key={d.token_prefix} className="flex items-center justify-between border border-line bg-ink/40 p-3 text-sm">
+                  <div className="min-w-0">
+                    <div className="text-paper truncate">{d.label}</div>
+                    <div className="text-mute text-[10px] font-mono">
+                      {d.token_prefix} · last seen {d.last_seen_at ? new Date(d.last_seen_at * 1000).toLocaleString() : 'never'}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => revokeDevice(d.token_prefix)}
+                    className="text-xs text-err hover:text-paper transition px-3 py-2 min-h-[44px]"
+                  >Revoke</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="bg-slate border border-line p-4 lg:col-span-2">
           <div className="section-number mb-3">Repository</div>
           <a
             href="https://github.com/earlpete222-sys/LatticeD"
@@ -1738,6 +1953,21 @@ function SettingsView({ apiKey, onLogout, health }) {
 }
 
 // ─── App Root ────────────────────────────────────────────────────────────────
+// Sprint 44 — single source of truth for the saved auth credential. Stored
+// in localStorage so a phone (or refreshed browser) auto-reconnects without
+// retyping the API key or re-pairing. Cleared on Disconnect.
+const STORAGE_KEY = 'latticed_api_key';
+function loadStoredKey() {
+  try { return window.localStorage.getItem(STORAGE_KEY) || null; }
+  catch { return null; }
+}
+function persistKey(k) {
+  try {
+    if (k) window.localStorage.setItem(STORAGE_KEY, k);
+    else window.localStorage.removeItem(STORAGE_KEY);
+  } catch {}
+}
+
 function App() {
   const [apiKey, setApiKey] = useState(null);
   const [health, setHealth] = useState(null);
@@ -1745,6 +1975,36 @@ function App() {
   const [currentThread, setCurrentThread] = useState(null);
   const [isMobile, setIsMobile] = useState(window.innerWidth < 1024);
   const [pendingCount, setPendingCount] = useState(0);
+  const [bootChecked, setBootChecked] = useState(false);
+
+  // Sprint 44 — auto-reconnect on load: try the stored key against /api/health.
+  // If it's valid we skip the login screen entirely; if it's stale (e.g. token
+  // was revoked from the home machine) we clear it and fall through to login.
+  useEffect(() => {
+    const stored = loadStoredKey();
+    if (!stored) { setBootChecked(true); return; }
+    let cancelled = false;
+    fetch(`${API_BASE}/api/health`, { headers: { 'x-api-key': stored } })
+      .then(r => {
+        if (cancelled) return;
+        if (r.ok) {
+          r.json().then(h => { if (!cancelled) { setApiKey(stored); setHealth(h); } });
+        } else {
+          persistKey(null);   // stale credential — force re-login
+        }
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setBootChecked(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Sprint 44 — register the PWA service worker so "Add to Home Screen" gets
+  // a real app-shell experience. Registration is best-effort; failures don't
+  // affect normal browser usage.
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }, []);
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 1024);
@@ -1768,8 +2028,14 @@ function App() {
     return () => { cancelled = true; clearInterval(id); };
   }, [apiKey]);
 
+  // Wait for the stored-key probe so we don't flash the login screen on a
+  // refresh from a paired device.
+  if (!bootChecked) {
+    return <div className="min-h-screen flex items-center justify-center text-mute text-xs uppercase tracking-widest">Loading…</div>;
+  }
+
   if (!apiKey) {
-    return <LoginScreen onConnect={(k, h) => { setApiKey(k); setHealth(h); }} />;
+    return <LoginScreen onConnect={(k, h) => { persistKey(k); setApiKey(k); setHealth(h); }} />;
   }
 
   const renderView = () => {
@@ -1780,18 +2046,18 @@ function App() {
       case 'docs':     return <DocumentsView apiKey={apiKey} />;
       case 'cache':    return <CacheView apiKey={apiKey} />;
       case 'refine':   return <RefineView apiKey={apiKey} onPendingChange={setPendingCount} />;
-      case 'settings': return <SettingsView apiKey={apiKey} onLogout={() => setApiKey(null)} health={health} />;
+      case 'settings': return <SettingsView apiKey={apiKey} onLogout={() => { persistKey(null); setApiKey(null); }} health={health} />;
       default: return null;
     }
   };
 
   return (
-    <div className={`min-h-screen flex ${isMobile ? 'flex-col pb-20' : ''}`}>
-      {!isMobile && <Sidebar view={view} setView={setView} onLogout={() => setApiKey(null)} isMobile={false} pendingCount={pendingCount} />}
+    <div className={`min-h-screen flex ${isMobile ? 'flex-col pb-28' : ''}`}>
+      {!isMobile && <Sidebar view={view} setView={setView} onLogout={() => { persistKey(null); setApiKey(null); }} isMobile={false} pendingCount={pendingCount} />}
       <main className="flex-1 min-w-0 lg:h-screen lg:overflow-y-auto">
         {renderView()}
       </main>
-      {isMobile && <Sidebar view={view} setView={setView} onLogout={() => setApiKey(null)} isMobile={true} pendingCount={pendingCount} />}
+      {isMobile && <Sidebar view={view} setView={setView} onLogout={() => { persistKey(null); setApiKey(null); }} isMobile={true} pendingCount={pendingCount} />}
     </div>
   );
 }
