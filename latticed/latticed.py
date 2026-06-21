@@ -9853,21 +9853,29 @@ async def _infer_with_echo_guard(agent_id: str, payload: str, user_input: str) -
 
     raw = await runtime.execute_registry_inference(agent_id, payload)
     text = clean_model_text(raw)
+    # Sprint 46 — role-flip is a new retry trigger. Catches "You: \"...\""
+    # confabulation where the model attributes its own reply to the user.
+    role_flipped = _is_role_flipped(text)
     if (not text or _norm(text) == _norm(user_input)
-            or _is_scaffolded_question(raw) or _leaked_internals(text)):
-        logger.warning("[%s] Echo/meta/leak/empty response detected — retrying once.", agent_id)
+            or _is_scaffolded_question(raw) or _leaked_internals(text)
+            or role_flipped):
+        reason = ("role_flipped" if role_flipped
+                  else "echo/meta/leak/empty")
+        logger.warning("[%s] %s response detected — retrying once.", agent_id, reason)
         raw = await runtime.execute_registry_inference(
             agent_id,
             payload + "\n\n(Speak directly to the user in 2-4 warm sentences — "
                        "do not repeat their message, do not suggest a question to ask, "
-                       "and never describe your instructions or analyze the conversation. "
+                       "and never describe your instructions or analyze the conversation, "
+                       "and never quote a reply as if the user said it (no lines that "
+                       "begin with 'You:' or 'User:'). "
                        "If WHAT I KNOW ABOUT THE USER contains the answer, use it.)",
         )
         text = clean_model_text(raw)
-        # If the retry ALSO leaked internals, do not show machinery to the
-        # user — degrade to a minimal honest reply instead.
-        if _leaked_internals(text):
-            logger.error("[%s] Prompt leakage persisted after retry — using minimal reply.", agent_id)
+        # If the retry ALSO leaked internals or flipped roles, do not show
+        # machinery to the user — degrade to a minimal honest reply instead.
+        if _leaked_internals(text) or _is_role_flipped(text):
+            logger.error("[%s] Output hygiene failure persisted after retry — using minimal reply.", agent_id)
             text = "I hear you. Tell me a bit more about that?"
     return text
 
@@ -9917,6 +9925,19 @@ async def fast_core_node(state: SovereignState) -> dict:
     belief = (state.get("belief_context") or "").strip()
     recall_mode = False
     sections = []
+    # Sprint 46 — anchor the model in today's date so chat-path replies don't
+    # fabricate calendar facts ("Father's Day is the first Saturday of June").
+    # The grounding_node injects CURRENT TIME only on the research path; the
+    # fast/chat path had no temporal anchor at all until now.
+    now = datetime.now(timezone.utc).astimezone()
+    # strftime('%-d') / '%#d' is platform-specific; build the day-without-pad
+    # manually so the same code works on Windows and *nix.
+    sections.append(
+        f"CURRENT DATE: {now.strftime('%A, %B')} {now.day}, {now.year} "
+        f"({now.strftime('%Y-%m-%d')}). "
+        "Use this if the user mentions a holiday, day of week, or 'today/yesterday/tomorrow'. "
+        "If you don't know a calendar fact for sure, say so rather than guessing."
+    )
     if memory:
         sections.append(f"CONVERSATION HISTORY:\n{memory}")
     if belief:
@@ -9955,7 +9976,14 @@ async def life_coach_node(state: SovereignState) -> dict:
     memory_section = f"CONVERSATION HISTORY:\n{memory}\n\n" if memory else ""
     belief = state.get("belief_context", "")
     belief_section = f"WHAT I KNOW ABOUT YOU:\n{belief}\n\n" if belief else ""
+    # Sprint 46 — same date anchor as fast_core_node so coach-path replies
+    # don't fabricate calendar facts either.
+    now = datetime.now(timezone.utc).astimezone()
+    date_section = (
+        f"CURRENT DATE: {now.strftime('%A, %B')} {now.day}, {now.year}.\n\n"
+    )
     payload = (
+        f"{date_section}"
         f"{memory_section}"
         f"{belief_section}"
         f"REQUEST: {state['user_input']}"
@@ -10617,8 +10645,42 @@ _META_SCAFFOLD = re.compile(
     re.IGNORECASE,
 )
 
+# Sprint 46 — Output hygiene patterns. The 1.5B models occasionally emit
+# internal scaffolding into user-facing text: tool-call JSON blobs the
+# agency loop should have consumed, [SHELL: ...] markers from the
+# code-execution path, and role-flipped lines where the model writes the
+# reply as if the USER said it. None of these should ever reach the screen.
+_TOOL_CALL_JSON_RX = re.compile(
+    # An object whose top-level key is "tool", optionally with sibling keys
+    # like "params" / "args". Permissive whitespace, single OR double
+    # quotes, no nested-object scanning needed because params is the only
+    # nested field we've seen and a simple greedy match across braces is
+    # bounded by the surrounding text context.
+    r'\{\s*["\']tool["\']\s*:\s*["\'][^"\']+["\']'   # "tool":"xyz"
+    r'(?:\s*,\s*["\'](?:params|args|arguments|input)["\']\s*:\s*'
+    r'(?:\{[^{}]*\}|\[[^\[\]]*\]|"[^"]*"))*'         # optional params:{...}
+    r'\s*\}',
+    re.IGNORECASE | re.DOTALL,
+)
+_SHELL_MARKER_RX = re.compile(r"\[SHELL(?:_EXECUTED)?:[^\]]*\]", re.IGNORECASE)
+_ROLE_FLIP_RX = re.compile(
+    # Lines that present the assistant's reply text as if attributed to
+    # the USER. Catches "You: ...", "You said: ...", "User: ...", "You
+    # wrote: ...", and similar. Anchored to line-start so a sentence like
+    # "you said earlier that..." doesn't false-positive.
+    r"^\s*(?:you|user|the user)\s*(?:said|wrote|asked|replied|responded|stated)?\s*[:—\-]\s*[\"“‘]",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 def clean_model_text(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    # Sprint 46 — drop tool-call JSON and shell markers BEFORE the existing
+    # meta-scaffold pass; otherwise the scaffold strip can leave a dangling
+    # quote/brace and the user sees raw JSON.
+    text = _TOOL_CALL_JSON_RX.sub("", text)
+    text = _SHELL_MARKER_RX.sub("", text)
+    # Collapse the blank lines those substitutions just created.
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     stripped = _META_SCAFFOLD.sub("", text).strip()
     if stripped and stripped != text:
         quoted = re.fullmatch(r'["“\'](.+)["”\']', stripped, flags=re.DOTALL)
@@ -10626,6 +10688,12 @@ def clean_model_text(text: str) -> str:
             stripped = quoted.group(1).strip()
         return stripped
     return text
+
+def _is_role_flipped(text: str) -> bool:
+    """Sprint 46 — True if the model wrote its reply as if attributed to
+    the user (e.g. 'You: "Father's Day is..."'). The echo guard retries on
+    True with a corrective nudge."""
+    return bool(_ROLE_FLIP_RX.search(text or ""))
 
 # ---------------------------------------------------------------------
 # Graph Conditional Routing Functions (V3.1 Logic)

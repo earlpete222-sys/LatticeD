@@ -24,6 +24,16 @@
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- Pin the classic JSX runtime. Newer @babel/standalone defaults to the
+     automatic runtime, which emits `import { jsx } from "react/jsx-runtime"`.
+     That import statement fails in our non-module inline script and silently
+     breaks the entire UI (root stays empty). Force classic so JSX compiles
+     to React.createElement(...) calls that work in any script context. -->
+<script>
+  Babel.registerPreset('classic-react', {
+    presets: [[Babel.availablePresets.react, { runtime: 'classic' }]],
+  });
+</script>
 
 <script>
   tailwind.config = {
@@ -119,7 +129,7 @@
 <body>
 <div id="root"></div>
 
-<script type="text/babel">
+<script type="text/babel" data-presets="classic-react">
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 // ─── API helper ──────────────────────────────────────────────────────────────
@@ -274,13 +284,13 @@ function LoginScreen({ onConnect }) {
         <div className="flex mb-4 border border-line">
           <button
             onClick={() => { setMode('secret'); setErr(''); }}
-            className={`flex-1 py-3 text-xs uppercase tracking-widest font-semibold transition ${
+            className={`flex-1 py-3 min-h-[44px] text-xs uppercase tracking-widest font-semibold transition ${
               mode === 'secret' ? 'bg-accent text-ink' : 'bg-slate text-mute hover:text-paper'
             }`}
           >Use API Key</button>
           <button
             onClick={() => { setMode('pair'); setErr(''); }}
-            className={`flex-1 py-3 text-xs uppercase tracking-widest font-semibold transition ${
+            className={`flex-1 py-3 min-h-[44px] text-xs uppercase tracking-widest font-semibold transition ${
               mode === 'pair' ? 'bg-accent text-ink' : 'bg-slate text-mute hover:text-paper'
             }`}
           >Pair This Device</button>
