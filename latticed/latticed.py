@@ -1018,6 +1018,19 @@ class AgentFactoryRegistry:
                     "time. Ask about the specific people, places, feelings, or choices they just "
                     "mentioned — not generic questions. Do NOT invent details to react to; if their "
                     "message is brief, reflect only what's actually there and ask about a piece of it.\n\n"
+                    "TWO HARD RULES — failing either of these breaks the reply:\n"
+                    "  (a) NEVER use 'we', 'us', 'our' — you were NOT there. The user spoke with "
+                    "their dad; you did not. Say 'your dad', 'your conversation', 'that moment' — "
+                    "never 'we talked', 'the father we talked to', 'our conversation'.\n"
+                    "  (b) NEVER invent a detail the user did not state. If they said 'had a great "
+                    "conversation' without specifics, do NOT say 'had such an amazing personality' "
+                    "or 'about the game' or 'over coffee' — you don't know. Reflect on the type of "
+                    "moment ('a real Father's Day conversation with your dad — that's something "
+                    "that stays with you') and ASK what made it great.\n\n"
+                    "BAD reply (do NOT do this): 'The father we talked to had such an amazing "
+                    "personality. What did you say?'  — uses 'we', and invents 'amazing personality'.\n"
+                    "GOOD reply: 'A real Father's Day conversation with your dad — that's the kind "
+                    "of moment that stays with you. What did the two of you end up talking about?'\n\n"
                     "CRITICAL: Focus entirely on the CURRENT 'Request' line. Do not reference 'History', "
                     "'Beliefs', or anything else you see in the context unless the user's current message "
                     "is literally about that past topic. If History contains 'park' and the user just said "
@@ -1219,6 +1232,8 @@ class AgentFactoryRegistry:
                     "are, what matters to them, how they think. Reflect only what they actually "
                     "said; never invent details. Your question is how you build a real picture "
                     "of this person, not a conversational nicety.\n\n"
+                    "Never write 'we', 'us', or 'our' — you were NOT there. Say 'you', 'your', "
+                    "'that moment'. Never invent specifics the user did not state.\n\n"
                     "Reply in 2-4 sentences, two beats, in this order:\n"
                     "1. CREATIVE RESPONSE — name the feeling or need underneath what they said, "
                     "in fresh words that point at a SPECIFIC thing they mentioned. Not generic.\n"
@@ -9921,11 +9936,16 @@ async def _infer_with_echo_guard(
     # Sprint 47 — chat agents must produce "creative response + question to
     # learn more". Flat answers and bare questions both trigger retry.
     shape_bad = enforce_two_beat and text and not _is_two_beat_shape(text)
+    # Sprint 48 — banned plural pronouns ("we talked", "our conversation")
+    # imply the assistant was present in the user's life. Only enforced for
+    # chat agents (other agents may legitimately use "we" in technical text).
+    plural_bad = enforce_two_beat and text and _uses_banned_plural(text)
     if (not text or _norm(text) == _norm(user_input)
             or _is_scaffolded_question(raw) or _leaked_internals(text)
-            or role_flipped or shape_bad):
+            or role_flipped or shape_bad or plural_bad):
         reason = (
             "role_flipped" if role_flipped
+            else "banned_plural" if plural_bad
             else "missing_two_beat" if shape_bad
             else "echo/meta/leak/empty"
         )
@@ -9945,6 +9965,13 @@ async def _infer_with_echo_guard(
                 "sentence reflecting a specific detail of what they said, "
                 "then (2) one open question to learn more. End with the "
                 "question mark."
+            )
+        if plural_bad:
+            nudge += (
+                "\n\nNever write 'we', 'us', 'our', or 'we talked' — you "
+                "were NOT there with the user. Address them as 'you' and "
+                "refer to the people/events they mentioned as 'your dad', "
+                "'your conversation', 'that moment', etc."
             )
         raw = await runtime.execute_registry_inference(agent_id, payload + nudge)
         text = clean_model_text(raw)
@@ -10779,6 +10806,23 @@ def _is_role_flipped(text: str) -> bool:
     the user (e.g. 'You: "Father's Day is..."'). The echo guard retries on
     True with a corrective nudge."""
     return bool(_ROLE_FLIP_RX.search(text or ""))
+
+# Sprint 48 — banned-pronoun guard. Live failure: the assistant wrote
+# "The father we talked to had such an amazing personality" — first-person
+# plural implies the assistant was present in the user's life, which it
+# wasn't. Catches "we talked", "us at the park", "our conversation", etc.
+# Whitelist: "we (the user and I)" / "let's" are fine in some agent contexts
+# but never appear in chat replies, so the broad rule is safe.
+_BANNED_PLURAL_RX = re.compile(
+    r"\b(?:we|us|our|we're|we've|we'll|we'd|ourselves)\b",
+    re.IGNORECASE,
+)
+
+def _uses_banned_plural(text: str) -> bool:
+    """Sprint 48 — True if the assistant used first-person plural pronouns.
+    The chat agent is never a participant in the user's life; replies must
+    address the user as 'you', not 'we/us/our'."""
+    return bool(_BANNED_PLURAL_RX.search(text or ""))
 
 # ---------------------------------------------------------------------
 # Graph Conditional Routing Functions (V3.1 Logic)
