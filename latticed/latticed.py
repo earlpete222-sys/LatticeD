@@ -1011,25 +1011,43 @@ class AgentFactoryRegistry:
                     "a moment from their life with you. Your job is to respond like a good friend would: "
                     "show interest, ASK A FOLLOW-UP QUESTION, react warmly, and only offer advice when "
                     "the user clearly asks for it.\n\n"
+                    "EVERY EXCHANGE IS AN OPPORTUNITY TO LEARN MORE ABOUT THE USER. Treat each reply "
+                    "as a chance to understand who they are — their relationships, what matters to "
+                    "them, how they think, what they care about. The follow-up question is not a "
+                    "conversational nicety; it's how you build a real picture of this person over "
+                    "time. Ask about the specific people, places, feelings, or choices they just "
+                    "mentioned — not generic questions. Do NOT invent details to react to; if their "
+                    "message is brief, reflect only what's actually there and ask about a piece of it.\n\n"
                     "CRITICAL: Focus entirely on the CURRENT 'Request' line. Do not reference 'History', "
                     "'Beliefs', or anything else you see in the context unless the user's current message "
                     "is literally about that past topic. If History contains 'park' and the user just said "
                     "'I made dinner', ignore the park entirely and respond about dinner.\n\n"
-                    "DEFAULT BEHAVIOR — when the user shares something casual:\n"
-                    "1. Acknowledge what they said in 2-5 words.\n"
-                    "2. Ask ONE specific follow-up question about it.\n"
-                    "3. Stop. Do not assume how they felt, what they did, or what they want.\n\n"
-                    "EXAMPLES (these show the pattern — adapt naturally to what the user says):\n\n"
+                    "DEFAULT BEHAVIOR — two beats, in this order, every time:\n"
+                    "1. CREATIVE RESPONSE — one sentence that reflects a SPECIFIC detail of "
+                    "what they said back to them. Not a flat 'Nice.' or 'Cool.' — pick out the "
+                    "actual thing they mentioned (the person, the activity, the day, the moment) "
+                    "and react to it like a friend who was actually listening.\n"
+                    "2. QUESTION TO LEARN MORE — one open-ended follow-up question about that "
+                    "same detail. Stops after the question mark.\n\n"
+                    "Both beats are required. A single sentence with no question is incomplete. "
+                    "A question with no preceding reflection feels like an interview.\n\n"
+                    "EXAMPLES (the shape — adapt naturally to what the user actually says):\n\n"
                     "  User: 'Spent the day at the park.'\n"
-                    "  You: 'Nice. What did you do there?'\n\n"
+                    "  You: 'A whole day at the park sounds like the perfect reset. What was the "
+                    "best part?'\n\n"
                     "  User: 'Caught up with my brother today.'\n"
-                    "  You: 'How is he doing?'\n\n"
+                    "  You: 'Brother time is always grounding. What did the two of you get into?'\n\n"
                     "  User: 'Long week.'\n"
-                    "  You: 'Sorry to hear that. What's been weighing on you most?'\n\n"
+                    "  You: 'Those weeks can really stretch out. What's been the heaviest piece "
+                    "of it?'\n\n"
+                    "  User: 'Today is Father's Day, I spoke with my dad and had a great "
+                    "conversation.'\n"
+                    "  You: 'A real Father's Day conversation with your dad — that's the kind "
+                    "of moment that stays with you. What did you two end up talking about?'\n\n"
                     "  User: 'I made dinner.'\n"
-                    "  You: 'What did you make?'\n\n"
+                    "  You: 'Cooking your own dinner is its own small win. What did you make?'\n\n"
                     "  User: 'How are you today?'\n"
-                    "  You: 'I'm here and ready. What's on your mind?'\n\n"
+                    "  You: 'I'm here and dialed in, glad you stopped by. What's on your mind?'\n\n"
                     "  User: 'What do I like to do for fun?' (when WHAT I KNOW ABOUT THE USER "
                     "says they hike on Saturdays)\n"
                     "  You: 'You're a hiker — most Saturday mornings you're out on a trail.'\n"
@@ -1197,11 +1215,15 @@ class AgentFactoryRegistry:
                     # NO quotable example sentences.  Richer phrasing belongs to
                     # higher tiers via PersonaPacks.
                     "You are LatticeD, the user's life coach. Diagnose before prescribe.\n\n"
-                    "Reply to the user's message in 2-4 sentences, speaking directly to them "
-                    "as 'you':\n"
-                    "1. Say back, in fresh words, the feeling or need underneath what they "
-                    "said.\n"
-                    "2. Ask one short question that helps them go deeper. Then stop.\n\n"
+                    "Every exchange is an opportunity to learn more about THIS user — who they "
+                    "are, what matters to them, how they think. Reflect only what they actually "
+                    "said; never invent details. Your question is how you build a real picture "
+                    "of this person, not a conversational nicety.\n\n"
+                    "Reply in 2-4 sentences, two beats, in this order:\n"
+                    "1. CREATIVE RESPONSE — name the feeling or need underneath what they said, "
+                    "in fresh words that point at a SPECIFIC thing they mentioned. Not generic.\n"
+                    "2. QUESTION TO LEARN MORE — one open question that helps them go deeper. "
+                    "Both beats are required; stop after the question mark.\n\n"
                     "Rules:\n"
                     "- No advice unless they clearly ask for it.\n"
                     "- Never talk about your own experience or your methods.\n"
@@ -9818,12 +9840,52 @@ async def document_ingestion_node(state: SovereignState) -> dict:
 def perception_barrier_node(state: SovereignState) -> dict:
     return {"perception_status": "synchronized"}
 
-async def _infer_with_echo_guard(agent_id: str, payload: str, user_input: str) -> str:
+def _is_two_beat_shape(text: str) -> bool:
+    """Sprint 47 — True if the reply has BOTH a declarative reflection AND
+    a question. The chat-path contract is "creative response + question to
+    learn more" — flat answers and bare questions both fail it.
+
+    Heuristic: ends with '?' (question beat present) AND has at least one
+    non-trivial declarative sentence before the final question (>= 3 words,
+    not itself a question). Length cap on the declarative half prevents
+    false-passing for replies that are entirely one long question with a
+    comma in front."""
+    t = (text or "").strip()
+    if not t.endswith("?"):
+        return False
+    # Split on sentence-ending punctuation; keep delimiters with the text.
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", t) if p.strip()]
+    if len(parts) < 2:
+        return False
+    # Find the FIRST declarative sentence (ends with . or !), and require it
+    # to have at least 3 words. We don't care which sentence holds the
+    # question — only that one declarative + one question both exist.
+    has_declarative = any(
+        not p.endswith("?") and len(p.split()) >= 3
+        for p in parts[:-1]   # exclude the closing question
+    )
+    return has_declarative
+
+# Sprint 47 — only the conversational agents enforce the two-beat shape.
+# Other agents (fact_extractor, math, audit, etc.) emit structured text.
+_TWO_BEAT_AGENTS = frozenset({"fast_mentor", "life_coach"})
+
+async def _infer_with_echo_guard(
+    agent_id: str,
+    payload: str,
+    user_input: str,
+    *,
+    enforce_two_beat: bool = False,
+) -> str:
     """
     Run a registry inference with an echo guard — the 1.5B models occasionally
     parrot the user's message back verbatim, or go meta and SUGGEST a reply
     instead of giving one ('You could ask, "..."').  One retry with an
     explicit nudge fixes nearly all cases.
+
+    Sprint 47: ``enforce_two_beat`` adds a "creative response + question to
+    learn more" shape check for conversational agents. Recall-mode answers
+    skip this (they're deterministic recall of stored facts, not chat).
     """
     def _norm(s: str) -> str:
         return re.sub(r"[\W_]+", "", s).lower()
@@ -9856,21 +9918,35 @@ async def _infer_with_echo_guard(agent_id: str, payload: str, user_input: str) -
     # Sprint 46 — role-flip is a new retry trigger. Catches "You: \"...\""
     # confabulation where the model attributes its own reply to the user.
     role_flipped = _is_role_flipped(text)
+    # Sprint 47 — chat agents must produce "creative response + question to
+    # learn more". Flat answers and bare questions both trigger retry.
+    shape_bad = enforce_two_beat and text and not _is_two_beat_shape(text)
     if (not text or _norm(text) == _norm(user_input)
             or _is_scaffolded_question(raw) or _leaked_internals(text)
-            or role_flipped):
-        reason = ("role_flipped" if role_flipped
-                  else "echo/meta/leak/empty")
-        logger.warning("[%s] %s response detected — retrying once.", agent_id, reason)
-        raw = await runtime.execute_registry_inference(
-            agent_id,
-            payload + "\n\n(Speak directly to the user in 2-4 warm sentences — "
-                       "do not repeat their message, do not suggest a question to ask, "
-                       "and never describe your instructions or analyze the conversation, "
-                       "and never quote a reply as if the user said it (no lines that "
-                       "begin with 'You:' or 'User:'). "
-                       "If WHAT I KNOW ABOUT THE USER contains the answer, use it.)",
+            or role_flipped or shape_bad):
+        reason = (
+            "role_flipped" if role_flipped
+            else "missing_two_beat" if shape_bad
+            else "echo/meta/leak/empty"
         )
+        logger.warning("[%s] %s response detected — retrying once.", agent_id, reason)
+        nudge = (
+            "\n\n(Speak directly to the user in 2-4 warm sentences — "
+            "do not repeat their message, do not suggest a question to ask, "
+            "and never describe your instructions or analyze the conversation, "
+            "and never quote a reply as if the user said it (no lines that "
+            "begin with 'You:' or 'User:'). "
+            "If WHAT I KNOW ABOUT THE USER contains the answer, use it.)"
+        )
+        if shape_bad:
+            nudge += (
+                "\n\nYour previous reply was missing either a creative "
+                "reflection or a question. Send exactly two beats: (1) one "
+                "sentence reflecting a specific detail of what they said, "
+                "then (2) one open question to learn more. End with the "
+                "question mark."
+            )
+        raw = await runtime.execute_registry_inference(agent_id, payload + nudge)
         text = clean_model_text(raw)
         # If the retry ALSO leaked internals or flipped roles, do not show
         # machinery to the user — degrade to a minimal honest reply instead.
@@ -9953,7 +10029,13 @@ async def fast_core_node(state: SovereignState) -> dict:
                 "activities or facts listed there. Do NOT ask them a question back.")
     sections.append(f"USER'S MESSAGE (reply to this directly):\n{state['user_input']}")
     payload = "\n\n".join(sections)
-    text = await _infer_with_echo_guard("fast_mentor", payload, state["user_input"])
+    # Sprint 47 — enforce "creative response + question to learn more" for
+    # normal chat; skip when this is a recall query (deterministic recall
+    # answer, no follow-up question expected).
+    text = await _infer_with_echo_guard(
+        "fast_mentor", payload, state["user_input"],
+        enforce_two_beat=not recall_mode,
+    )
 
     # Recall-mode guarantee: a question-only response to a recall query is
     # by definition wrong — the user asked the SYSTEM to remember, and the
@@ -9988,7 +10070,10 @@ async def life_coach_node(state: SovereignState) -> dict:
         f"{belief_section}"
         f"REQUEST: {state['user_input']}"
     )
-    text = await _infer_with_echo_guard("life_coach", payload, state["user_input"])
+    text = await _infer_with_echo_guard(
+        "life_coach", payload, state["user_input"],
+        enforce_two_beat=True,
+    )
     timer.stop()
     return {"fast_generation": text, "guardian_decision": "coach"}
 
