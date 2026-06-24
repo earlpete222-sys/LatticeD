@@ -11274,6 +11274,151 @@ async def evolve(
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
+# ---------------------------------------------------------------------
+# Sprint 53 — /api/v2/chat: end-to-end v2 pipeline endpoint
+#
+# This is the first real exposure of the v2 architecture (kstore +
+# perceive + strategies + narrate + review) to traffic. v1 /api/evolve
+# stays the default; v2 is opt-in via the new path. The A/B harness in
+# eval_v2_vs_v1.py compares them on the same prompts.
+#
+# SSE events emitted (in order):
+#     {node: "perceive",  status: "complete", intent, mood, mentions, ...}
+#     {node: "strategy",  status: "complete", strategy_name, expected_shape}
+#     {node: "narrate",   status: "complete", slots_filled, fallbacks}
+#     {node: "review",    status: "complete", verdict, reasons?}
+#     {phase: "Final",    content, strategy, verdict, used_fallback}
+# ---------------------------------------------------------------------
+_v2_runtime: Optional["V2Runtime_T"] = None   # initialized in lifespan
+try:
+    # Local alias for type checkers; real import below at use site to avoid
+    # importing v2 at module load if someone strips the v2 package.
+    from latticed.v2.runtime import V2Runtime as V2Runtime_T
+except Exception:
+    V2Runtime_T = Any   # type: ignore
+
+def _get_v2_runtime():
+    """Lazy initializer. First call constructs a V2Runtime backed by the
+    real ollama_client (when available). Subsequent calls reuse it."""
+    global _v2_runtime
+    if _v2_runtime is not None:
+        return _v2_runtime
+    from latticed.v2.runtime import V2Runtime, OllamaNarratorBackend
+    backend = None
+    if OLLAMA_DIRECT_AVAILABLE and ollama_client is not None:
+        backend = OllamaNarratorBackend(
+            ollama_client=ollama_client,
+            model_name=MODEL_REASONING,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+    _v2_runtime = V2Runtime(backend=backend)
+    # One-shot migration from v1 belief_graph on first call. Logs + skips
+    # if store is already populated.
+    try:
+        _v2_runtime.maybe_migrate_v1()
+    except Exception:
+        logger.exception("[v2] migration failed (non-fatal)")
+    return _v2_runtime
+
+
+@app.get("/api/v2/chat")
+async def v2_chat(
+    prompt: str = Query(..., min_length=1, max_length=MAX_PROMPT_CHARS),
+    thread_id: str = Query("main", pattern=THREAD_ID_PATTERN),
+    user_id: str = Depends(get_authenticated_user),
+):
+    del user_id, thread_id   # threading reserved for a later sprint
+    v2 = _get_v2_runtime()
+
+    async def gen():
+        started = time.time()
+        # Import inside the generator so a syntax/import problem in v2
+        # never breaks v1's endpoint. Failures here yield an error event
+        # rather than 500.
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            from latticed.v2.perceive import perceive
+            from latticed.v2.strategies import choose_strategy, StubNarratorBackend
+            from latticed.v2.review import review_and_finalize
+        except Exception as e:
+            yield "data: " + json.dumps({
+                "node": "v2_init", "status": "error",
+                "detail": f"{type(e).__name__}: {e}",
+            }) + "\n\n"
+            yield "data: " + json.dumps({
+                "phase": "Final",
+                "content": "v2 stack unavailable.",
+                "is_final": True,
+                "degraded": True,
+            }) + "\n\n"
+            return
+
+        now = _dt.now(_tz.utc).astimezone()
+
+        # ── Perceive ──────────────────────────────────────────────────
+        perception = perceive(prompt, now=now, kstore=v2.kstore)
+        yield "data: " + json.dumps({
+            "node": "perceive", "status": "complete",
+            "intent": perception.intent.value,
+            "intent_confidence": round(perception.intent_confidence, 2),
+            "mood": perception.mood.value if perception.mood else None,
+            "mentions": [m.canonical for m in perception.mentions],
+            "temporal_refs": [t.text for t in perception.temporal_refs],
+        }) + "\n\n"
+
+        # ── Strategy ──────────────────────────────────────────────────
+        strategy = choose_strategy(perception, v2.kstore)
+        plan = strategy.plan(perception, v2.kstore)
+        yield "data: " + json.dumps({
+            "node": "strategy", "status": "complete",
+            "strategy_name": plan.strategy_name,
+            "expected_shape": plan.expected_shape,
+            "slot_count": len(plan.slots),
+        }) + "\n\n"
+
+        # ── Narrate + Review ──────────────────────────────────────────
+        backend = v2.backend or StubNarratorBackend()
+        final = await review_and_finalize(
+            perception=perception, plan=plan,
+            backend=backend, kstore=v2.kstore, reviewer=v2.reviewer,
+        )
+        yield "data: " + json.dumps({
+            "node": "narrate", "status": "complete",
+            "used_fallback": final.used_fallback,
+        }) + "\n\n"
+        yield "data: " + json.dumps({
+            "node": "review", "status": "complete",
+            "verdict": final.report.verdict.value,
+            "reasons": list(final.report.reasons)[:5],
+        }) + "\n\n"
+
+        # ── Final ──────────────────────────────────────────────────────
+        yield "data: " + json.dumps({
+            "phase": "Final",
+            "content": final.text,
+            "is_final": True,
+            "strategy": final.strategy_name,
+            "verdict": final.report.verdict.value,
+            "used_fallback": final.used_fallback,
+            "fallback_reason": final.fallback_reason,
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }) + "\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/api/v2/stats")
+async def v2_stats(user_id: str = Depends(get_authenticated_user)):
+    """Exposes v2 KStore counts + last migration outcome for the UI /
+    operator. Lazy-inits the runtime on first call."""
+    del user_id
+    v2 = _get_v2_runtime()
+    return {
+        "kstore": v2.kstore.stats(),
+        "backend_attached": v2.backend is not None,
+    }
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     api_key = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key") or ""
