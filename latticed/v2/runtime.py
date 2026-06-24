@@ -25,6 +25,8 @@ from typing import Any, Optional, TYPE_CHECKING
 
 from latticed.v2.kstore.store import KStore
 from latticed.v2.kstore.migrate import migrate_v1_belief_graph
+from latticed.v2.reflect.reflector import Reflector
+from latticed.v2.reflect.turn_log import TurnLog
 from latticed.v2.review.reviewer import Reviewer
 from latticed.v2.strategies.base import NarratorBackend, Slot
 
@@ -54,6 +56,15 @@ def _default_v1_db_path() -> Path:
         return Path(override)
     here = Path(__file__).resolve().parent.parent
     return here / "runtime" / "storage" / "end_game.db"
+
+
+def _default_turn_log_path() -> Path:
+    """v2_turns.db alongside v2_kstore.db; override via env."""
+    override = os.environ.get("LATTICED_V2_TURNLOG_PATH")
+    if override:
+        return Path(override)
+    here = Path(__file__).resolve().parent.parent
+    return here / "runtime" / "storage" / "v2_turns.db"
 
 
 # ── OllamaNarratorBackend ─────────────────────────────────────────────────
@@ -145,12 +156,16 @@ class V2Runtime:
         kstore_path: Optional[Path] = None,
         backend: Optional[NarratorBackend] = None,
         v1_db_path: Optional[Path] = None,
+        turn_log_path: Optional[Path] = None,
     ) -> None:
         self.kstore = KStore(kstore_path or _default_kstore_path())
         self.reviewer = Reviewer()
         self.backend: Optional[NarratorBackend] = backend
         self._v1_db_path = v1_db_path or _default_v1_db_path()
         self._migration_attempted = False
+        # Sprint 54 — turn log + reflector for off-peak self-improvement
+        self.turn_log = TurnLog(turn_log_path or _default_turn_log_path())
+        self.reflector = Reflector(kstore=self.kstore, turn_log=self.turn_log)
 
     def attach_backend(self, backend: NarratorBackend) -> None:
         """Late-bind the backend (e.g. after Ollama init completes in lifespan)."""
@@ -190,3 +205,7 @@ class V2Runtime:
 
     def close(self) -> None:
         self.kstore.close()
+        try:
+            self.turn_log.close()
+        except Exception:
+            pass

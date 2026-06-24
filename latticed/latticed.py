@@ -11392,6 +11392,22 @@ async def v2_chat(
             "reasons": list(final.report.reasons)[:5],
         }) + "\n\n"
 
+        # Sprint 54 — log the turn so the reflector can learn from it.
+        try:
+            from latticed.v2.reflect.turn_log import perception_to_json
+            v2.turn_log.append_turn(
+                user_input=perception.user_input,
+                perception_json=perception_to_json(perception),
+                strategy_name=final.strategy_name,
+                expected_shape=final.report.expected_shape,
+                final_text=final.text,
+                verdict=final.report.verdict.value,
+                used_fallback=final.used_fallback,
+                fallback_reason=final.fallback_reason,
+            )
+        except Exception:
+            logger.exception("[v2] turn log append failed (non-fatal)")
+
         # ── Final ──────────────────────────────────────────────────────
         yield "data: " + json.dumps({
             "phase": "Final",
@@ -11416,7 +11432,32 @@ async def v2_stats(user_id: str = Depends(get_authenticated_user)):
     return {
         "kstore": v2.kstore.stats(),
         "backend_attached": v2.backend is not None,
+        # Sprint 54 — reflection layer visibility
+        "turns": {
+            "total": v2.turn_log.total_count(),
+            "unprocessed": v2.turn_log.unprocessed_count(),
+        },
     }
+
+
+@app.post("/api/v2/reflect")
+async def v2_reflect(
+    batch: int = Query(100, ge=1, le=1000),
+    user_id: str = Depends(get_authenticated_user),
+):
+    """Sprint 54 — trigger the reflector to process unprocessed turns.
+
+    Reads up to ``batch`` turns from the turn log, runs the distiller,
+    auto-applies high-confidence proposals to kstore. Returns a report
+    of what changed so the operator can see what the system learned.
+
+    Idempotent: re-running with no new turns returns zeros. Safe to
+    expose to the UI as a "Catch up" button.
+    """
+    del user_id
+    v2 = _get_v2_runtime()
+    report = v2.reflector.reflect(batch=batch)
+    return report.as_dict()
 
 
 @app.websocket("/ws")
