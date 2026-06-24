@@ -99,6 +99,19 @@ python latticed/latticed.py
 .\Start-LatticeD.ps1 -LAN
 ```
 
+### v2 engine (beta)
+
+LatticeD ships with a second pipeline you can opt into from the chat header:
+
+- **v1 (default)** — the legacy 13-node pipeline. Stable. The default.
+- **v2 (beta)** — typed knowledge store + deterministic perception + slotted response templates + always-on reviewer. The 1.5B model is restricted to filling tightly-constrained slots; everything else is Python and typed data. Eliminates the failure modes v1 has to retry-and-patch (fabricated dates, banned plurals, role-flips, invented details).
+
+Toggle from the engine selector in the chat header. v1 stays available — your knowledge base and conversations are unaffected by switching. v2 knows what v1 knew (migrated on first use) plus anything v2 captures itself.
+
+`/api/v2/chat` is the v2 endpoint. The A/B harness `python eval_v2_vs_v1.py` compares both on the same prompts against the v2 migration gate.
+
+See [`V2_ARCHITECTURE.md`](./V2_ARCHITECTURE.md) for the full design and sprint sequence.
+
 ---
 
 ## Verify the Build

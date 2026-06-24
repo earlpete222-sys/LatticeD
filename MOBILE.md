@@ -59,6 +59,17 @@ If a phone is lost or you no longer want it connected: on the home machine, Sett
 - Pairing codes are valid for 10 minutes and single-use.
 - All data — beliefs, memories, cache, conversations — stays on your home machine. Nothing leaves your tailnet.
 
+## Trying the v2 engine (beta) on your phone
+
+Once paired, the chat header has an engine selector:
+
+- **engine v1** — the default. Legacy 13-node pipeline.
+- **engine v2 (beta)** — the typed pipeline (kstore + perception + strategies + reviewer). Doesn't fabricate dates, doesn't say "we talked", doesn't invent details — these are structurally prevented, not patched after the fact.
+
+Toggle is per-device and persists across sessions. Switch any time without losing thread history. v2 stores its own knowledge in `v2_kstore.db`; the first time you use v2 it imports what v1 knew about you.
+
+If a v2 reply ever looks too short or off, tap **Settings → v2 Engine → Run reflection now** to push recent turns through the distiller and grow the knowledge store.
+
 ## What does NOT work yet
 
 - Public internet exposure (intentionally — use Tailscale).

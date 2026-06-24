@@ -502,6 +502,20 @@ function ChatView({ apiKey, currentThread, setCurrentThread, onReconnect }) {
   const [copyMsg, setCopyMsg] = useState('');
   const [routingInfo, setRoutingInfo] = useState(null);    // { execution_path, intent_category, route_reason }
   const [goalInfo, setGoalInfo] = useState(null);          // string like 'house' / 'debt' / 'emergency' / 'retirement'
+  // Sprint 55 — engine selector. v1 = /api/evolve (legacy 13-node).
+  // v2 = /api/v2/chat (typed kstore + perception + strategies + reviewer).
+  // Persisted to localStorage; default v1 so existing users see no change.
+  const [engine, setEngine] = useState(() => {
+    try { return window.localStorage.getItem('latticed_engine') || 'v1'; }
+    catch { return 'v1'; }
+  });
+  const setEngineAndPersist = (e) => {
+    setEngine(e);
+    try { window.localStorage.setItem('latticed_engine', e); } catch {}
+  };
+  // v2-specific pipeline ticker: 4 ordered steps.
+  const [v2Steps, setV2Steps] = useState([]);   // [{name, done, detail}]
+  const [v2Final, setV2Final] = useState(null); // {strategy, verdict, used_fallback}
   const scrollRef = useRef(null);
   const abortRef = useRef(null);
 
@@ -614,11 +628,17 @@ function ChatView({ apiKey, currentThread, setCurrentThread, onReconnect }) {
     setDoneNodes(new Set());
     setRoutingInfo(null);
     setGoalInfo(null);
+    setV2Steps([]);
+    setV2Final(null);
 
     const threadId = currentThread || `ui_${Date.now().toString(36)}`;
     if (!currentThread) setCurrentThread(threadId);
 
-    const url = `${API_BASE}/api/evolve?prompt=${encodeURIComponent(prompt)}&thread_id=${encodeURIComponent(threadId)}&path=auto${bypassCache ? '&bypass_cache=1' : ''}`;
+    // Sprint 55 — route to v1 or v2 endpoint based on engine selector.
+    // v1 keeps the bypassCache option; v2 doesn't use the semantic cache.
+    const url = engine === 'v2'
+      ? `${API_BASE}/api/v2/chat?prompt=${encodeURIComponent(prompt)}&thread_id=${encodeURIComponent(threadId)}`
+      : `${API_BASE}/api/evolve?prompt=${encodeURIComponent(prompt)}&thread_id=${encodeURIComponent(threadId)}&path=auto${bypassCache ? '&bypass_cache=1' : ''}`;
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -669,6 +689,12 @@ function ChatView({ apiKey, currentThread, setCurrentThread, onReconnect }) {
         });
       };
 
+      // Sprint 55 — v2 event keys: "perceive", "strategy", "narrate",
+      // "review". v1 keys are the 13 PIPELINE_NODES. We branch on
+      // engine so each path uses its own ticker semantics.
+      const V2_STEPS_ORDER = ['perceive', 'strategy', 'narrate', 'review'];
+      const v2StepsLocal = [];
+
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -682,32 +708,65 @@ function ChatView({ apiKey, currentThread, setCurrentThread, onReconnect }) {
             if (!line.startsWith('data: ')) continue;
             try {
               const ev = JSON.parse(line.slice(6));
-              if (ev.node) {
-                const layer = nodeLayer[ev.node] ?? 0;
-                // Retire any active nodes from earlier pipeline layers
-                retirePrevLayers(layer);
-                // Add this node as active (same-layer siblings co-activate)
-                activeLocal.add(ev.node);
-                setActiveNodes(prev => new Set(prev).add(ev.node));
-              }
-              if (ev.phase === 'routing') {
-                setRoutingInfo({
-                  path:    ev.execution_path || '',
-                  intent:  ev.intent_category || '',
-                  reason:  ev.route_reason || '',
-                });
-              }
-              if (ev.phase === 'goal') {
-                setGoalInfo(ev.active_goal || null);
-              }
-              if (ev.phase === 'Final') {
-                retireAll();
-                setMessages(m => [...m, {
-                  role: 'assistant',
-                  content: ev.content || '(empty)',
-                  ts: Date.now(),
-                  cached: ev.cached || false,
-                }]);
+              if (engine === 'v2') {
+                // v2 events: each {node: ...} is a fully-completed step.
+                if (ev.node && V2_STEPS_ORDER.includes(ev.node)) {
+                  // Build a short human-readable detail per step.
+                  let detail = '';
+                  if (ev.node === 'perceive') {
+                    detail = `${ev.intent || ''}${ev.mood ? ' · ' + ev.mood : ''}`;
+                  } else if (ev.node === 'strategy') {
+                    detail = ev.strategy_name || '';
+                  } else if (ev.node === 'narrate') {
+                    detail = ev.used_fallback ? 'fallback' : 'ok';
+                  } else if (ev.node === 'review') {
+                    detail = ev.verdict || '';
+                  }
+                  v2StepsLocal.push({ name: ev.node, done: true, detail });
+                  setV2Steps([...v2StepsLocal]);
+                }
+                if (ev.phase === 'Final') {
+                  setV2Final({
+                    strategy: ev.strategy,
+                    verdict: ev.verdict,
+                    used_fallback: ev.used_fallback,
+                    elapsed_ms: ev.elapsed_ms,
+                  });
+                  setMessages(m => [...m, {
+                    role: 'assistant',
+                    content: ev.content || '(empty)',
+                    ts: Date.now(),
+                    v2: { strategy: ev.strategy, verdict: ev.verdict,
+                          used_fallback: ev.used_fallback },
+                  }]);
+                }
+              } else {
+                // v1 event handling (unchanged from before Sprint 55).
+                if (ev.node) {
+                  const layer = nodeLayer[ev.node] ?? 0;
+                  retirePrevLayers(layer);
+                  activeLocal.add(ev.node);
+                  setActiveNodes(prev => new Set(prev).add(ev.node));
+                }
+                if (ev.phase === 'routing') {
+                  setRoutingInfo({
+                    path:    ev.execution_path || '',
+                    intent:  ev.intent_category || '',
+                    reason:  ev.route_reason || '',
+                  });
+                }
+                if (ev.phase === 'goal') {
+                  setGoalInfo(ev.active_goal || null);
+                }
+                if (ev.phase === 'Final') {
+                  retireAll();
+                  setMessages(m => [...m, {
+                    role: 'assistant',
+                    content: ev.content || '(empty)',
+                    ts: Date.now(),
+                    cached: ev.cached || false,
+                  }]);
+                }
               }
             } catch (e) { /* malformed event — skip */ }
           }
@@ -735,29 +794,67 @@ function ChatView({ apiKey, currentThread, setCurrentThread, onReconnect }) {
           <h2 className="text-2xl font-bold mt-1">
             Ask the lattice <span className="accent-italic">anything.</span>
           </h2>
-          {(currentThread || routingInfo || goalInfo) && (
-            <div className="flex flex-wrap items-center gap-2 mt-2 text-[10px] font-mono">
-              {currentThread && (
-                <span className="text-mute">thread: <span className="text-paper">{currentThread}</span></span>
-              )}
-              {routingInfo && (
-                <>
-                  <span className="text-mute">·</span>
-                  <span className="bg-ink border border-line px-2 py-0.5 uppercase tracking-widest">
-                    path: <span className="text-accent ml-1">{routingInfo.path || '—'}</span>
-                  </span>
-                  <span className="bg-ink border border-line px-2 py-0.5 uppercase tracking-widest">
-                    intent: <span className="text-accent ml-1">{routingInfo.intent || '—'}</span>
-                  </span>
-                </>
-              )}
-              {goalInfo && (
-                <span className="bg-ink border border-accent px-2 py-0.5 uppercase tracking-widest">
-                  goal: <span className="text-accent ml-1">{goalInfo}</span>
-                </span>
-              )}
+          {/* Sprint 55 — engine selector + thread/routing chip row */}
+          <div className="flex flex-wrap items-center gap-2 mt-2 text-[10px] font-mono">
+            {/* Engine toggle: v1 (legacy) vs v2 (typed pipeline). */}
+            <div className="flex border border-line bg-ink">
+              <button
+                onClick={() => setEngineAndPersist('v1')}
+                className={`px-2 py-1 uppercase tracking-widest min-h-[28px] ${
+                  engine === 'v1' ? 'bg-accent text-ink' : 'text-mute hover:text-paper'
+                }`}
+                title="Legacy 13-node pipeline"
+              >engine v1</button>
+              <button
+                onClick={() => setEngineAndPersist('v2')}
+                className={`px-2 py-1 uppercase tracking-widest min-h-[28px] ${
+                  engine === 'v2' ? 'bg-accent text-ink' : 'text-mute hover:text-paper'
+                }`}
+                title="Typed pipeline (beta): kstore + perception + strategies + reviewer"
+              >engine v2 (beta)</button>
             </div>
-          )}
+            {currentThread && (
+              <span className="text-mute">thread: <span className="text-paper">{currentThread}</span></span>
+            )}
+            {routingInfo && engine === 'v1' && (
+              <>
+                <span className="text-mute">·</span>
+                <span className="bg-ink border border-line px-2 py-0.5 uppercase tracking-widest">
+                  path: <span className="text-accent ml-1">{routingInfo.path || '—'}</span>
+                </span>
+                <span className="bg-ink border border-line px-2 py-0.5 uppercase tracking-widest">
+                  intent: <span className="text-accent ml-1">{routingInfo.intent || '—'}</span>
+                </span>
+              </>
+            )}
+            {goalInfo && engine === 'v1' && (
+              <span className="bg-ink border border-accent px-2 py-0.5 uppercase tracking-widest">
+                goal: <span className="text-accent ml-1">{goalInfo}</span>
+              </span>
+            )}
+            {/* v2 pipeline ticker: 4 ordered steps + final verdict */}
+            {engine === 'v2' && v2Steps.length > 0 && (
+              <>
+                <span className="text-mute">·</span>
+                {v2Steps.map((s, i) => (
+                  <span key={i} className="bg-ink border border-line px-2 py-0.5 uppercase tracking-widest">
+                    <span className="text-accent">{s.name}</span>
+                    {s.detail && <span className="text-paper ml-1">{s.detail}</span>}
+                  </span>
+                ))}
+              </>
+            )}
+            {engine === 'v2' && v2Final && (
+              <span className={`px-2 py-0.5 uppercase tracking-widest border ${
+                v2Final.verdict === 'approve' ? 'border-ok text-ok'
+                  : v2Final.used_fallback ? 'border-warn text-warn'
+                    : 'border-line text-mute'
+              }`}>
+                {v2Final.verdict}{v2Final.used_fallback ? ' · fallback' : ''}
+                {v2Final.elapsed_ms ? ` · ${(v2Final.elapsed_ms / 1000).toFixed(1)}s` : ''}
+              </span>
+            )}
+          </div>
         </div>
         <div ref={scrollRef} className="bg-slate border border-line p-4 lg:p-6 mb-4 min-h-[300px] max-h-[60vh] overflow-y-auto lg:max-h-none lg:flex-1">
           {messages.length === 0 && (
@@ -1801,14 +1898,44 @@ function SettingsView({ apiKey, onLogout, health }) {
   const [pairCode, setPairCode] = useState('');
   const [pairExpiresAt, setPairExpiresAt] = useState(0);
   const [pairBusy, setPairBusy] = useState(false);
+  // Sprint 55 — v2 engine status + reflection
+  const [v2Stats, setV2Stats] = useState(null);
+  const [v2ReflectMsg, setV2ReflectMsg] = useState('');
+  const [v2ReflectBusy, setV2ReflectBusy] = useState(false);
 
   const load = useCallback(() => {
     setErr('');
     api('/api/stats').then(setStats).catch(e => setErr(e.message));
     api('/api/devices').then(d => setDevices(d.devices || [])).catch(() => {});
+    api('/api/v2/stats').then(setV2Stats).catch(() => setV2Stats(null));
   }, [api]);
 
   useEffect(load, [load]);
+
+  const runReflection = async () => {
+    setV2ReflectBusy(true); setV2ReflectMsg('');
+    try {
+      const r = await fetch(`${API_BASE}/api/v2/reflect`, {
+        method: 'POST',
+        headers: { 'x-api-key': apiKey },
+      });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const report = await r.json();
+      setV2ReflectMsg(
+        `Processed ${report.turns_processed} turn(s). ` +
+        `+${report.entities_created} entities, ` +
+        `+${report.relations_created} relations, ` +
+        `+${report.events_created} events. ` +
+        `${report.proposals_deferred} deferred.`
+      );
+      // Refresh stats so the kstore counts update.
+      api('/api/v2/stats').then(setV2Stats).catch(() => {});
+    } catch (e) {
+      setV2ReflectMsg(`Reflection failed: ${e.message}`);
+    } finally {
+      setV2ReflectBusy(false);
+    }
+  };
 
   const generatePairCode = async () => {
     setPairBusy(true); setErr('');
@@ -1880,6 +2007,51 @@ function SettingsView({ apiKey, onLogout, health }) {
               <div className="flex justify-between"><span className="text-mute">Total latency</span><span className="font-mono">{stats.last_interaction.total_latency_ms} ms</span></div>
             </div>
           ) : <div className="text-mute text-sm">No interactions yet.</div>}
+        </div>
+
+        {/* Sprint 55 — v2 engine status + reflection trigger */}
+        <div className="bg-slate border border-line p-4 lg:col-span-2">
+          <div className="section-number mb-3">v2 Engine (beta)</div>
+          <p className="text-xs text-mute mb-3 leading-relaxed">
+            v2 is the typed pipeline (kstore + perception + strategies + reviewer).
+            Toggle it from the chat header. Reflection processes recent v2 turns
+            into the knowledge store.
+          </p>
+          {v2Stats ? (
+            <div className="grid grid-cols-2 gap-4 text-sm mb-4">
+              <div>
+                <div className="text-mute text-[10px] uppercase tracking-widest mb-1">KStore</div>
+                <div className="text-paper">{v2Stats.kstore?.live_entities ?? '—'} entities</div>
+                <div className="text-paper">{v2Stats.kstore?.live_events ?? '—'} events</div>
+                <div className="text-paper">{v2Stats.kstore?.live_relations ?? '—'} relations</div>
+                {v2Stats.kstore?.legacy_beliefs > 0 && (
+                  <div className="text-mute text-xs">+ {v2Stats.kstore.legacy_beliefs} legacy beliefs</div>
+                )}
+              </div>
+              <div>
+                <div className="text-mute text-[10px] uppercase tracking-widest mb-1">Turns</div>
+                <div className="text-paper">{v2Stats.turns?.total ?? '—'} total</div>
+                <div className={v2Stats.turns?.unprocessed > 0 ? 'text-accent' : 'text-paper'}>
+                  {v2Stats.turns?.unprocessed ?? '—'} unprocessed
+                </div>
+                <div className="text-mute text-xs mt-1">
+                  backend: {v2Stats.backend_attached ? '✓ attached' : '✗ none'}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-mute text-sm mb-4">v2 stats unavailable — server may not have v2 enabled.</div>
+          )}
+          <button
+            onClick={runReflection}
+            disabled={v2ReflectBusy || !v2Stats}
+            className="text-xs font-semibold uppercase tracking-wider border border-line bg-ink text-paper hover:border-accent hover:text-accent transition px-3 py-2 disabled:opacity-40 min-h-[44px]"
+          >
+            {v2ReflectBusy ? 'Reflecting…' : '↻ Run reflection now'}
+          </button>
+          {v2ReflectMsg && (
+            <div className="text-mute text-xs mt-3">{v2ReflectMsg}</div>
+          )}
         </div>
 
         <div className="bg-slate border border-line p-4 lg:col-span-2">
