@@ -11621,7 +11621,7 @@ async def pwa_manifest():
 # briefly unreachable. Does NOT attempt to cache /api/* responses — those
 # are live and must always hit the server.
 _SERVICE_WORKER_JS = """\
-const CACHE = 'latticed-shell-v1';
+const CACHE = 'latticed-shell-v55';
 const SHELL = ['/', '/manifest.webmanifest'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
